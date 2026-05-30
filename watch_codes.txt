@@ -1,0 +1,12 @@
+# One symbol per line. US. prefix is optional for US stocks.
+# This file is the only stock watchlist used by the monitor.
+US.SLXN
+US.REPL
+US.OLOX
+US.ASTC
+US.VCIG
+US.CMND
+US.SPCE
+US.MX
+US.NTAP
+US.NTCL

@@ -1,0 +1,126 @@
+# Alpaca MA5 自动交易服务
+
+这个项目参考 `StockAPI` 的文件观察池思路：只读取 `watch_codes.txt` 里的股票，按你的规则盯盘，并通过 Alpaca API 下单。
+
+`.env` 里填 Paper key 就连接 Alpaca Paper，填 Live key 就连接 Alpaca Live；程序会自动识别。
+
+## 策略
+
+- 买入：当前价格 `<` 包含今日当前价的 MA5。
+  - 计算方式：`today_ma5 = (前 4 个已完成交易日收盘价之和 + 当前价) / 5`
+- 卖出：满足任一条件卖出全部。
+  - 美股常规盘临近收盘，默认 `15:55-16:00 ET`
+  - 持仓亏损 `15%`
+- 范围：只处理 `watch_codes.txt` 文件中的代码。
+
+## 文件
+
+- `watch_codes.txt`：唯一盯盘股票文件。
+- `run_monitor_once.py`：点击运行，只检查一轮。
+- `run_monitor_forever.py`：点击运行，持续轮询。
+- `run_test_order.py`：点击运行，提交一笔很小的 Alpaca 限价测试单，限价为当前价的 90%。
+- `run_self_tests.py`：点击运行本地测试。
+- `check_alpaca_connection.py`：点击检查 Alpaca API key 是否能连通。
+- `alpaca_ma5_service/config.py`：运行参数都在 `build_settings()` 里改，不用命令行参数。
+- `outputs/orders_YYYY-MM-DD.csv`：订单记录。
+
+## 第一次使用
+
+1. 打开 PowerShell：
+
+```powershell
+cd C:\Users\zzj\Desktop\alpaca_ma5_service
+py -3.14 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+2. 去 Alpaca 后台生成 API key：
+
+- API Key ID
+- Secret Key
+
+3. 复制 `.env.example` 为 `.env`，填写：
+
+```text
+APCA_API_KEY_ID=你的 API Key ID
+APCA_API_SECRET_KEY=你的 Secret Key
+```
+
+4. 检查 Alpaca 连接：
+
+```powershell
+.\.venv\Scripts\python.exe check_alpaca_connection.py
+```
+
+5. 编辑 `watch_codes.txt`，一行一个代码，例如：
+
+```text
+US.AAPL
+US.TSLA
+NVDA
+```
+
+6. 先跑测试：
+
+```powershell
+.\.venv\Scripts\python.exe run_self_tests.py
+```
+
+7. 检查一轮盯盘：
+
+```powershell
+.\.venv\Scripts\python.exe run_monitor_once.py
+```
+
+8. 持续盯盘：
+
+```powershell
+.\.venv\Scripts\python.exe run_monitor_forever.py
+```
+
+9. 测试下单：
+
+```powershell
+.\.venv\Scripts\python.exe run_test_order.py
+```
+
+默认会提交 `AAPL` 买入限价单，金额约 `$5`，限价为当前价 `* 0.9`。如果 `.env` 里是 live key，它就提交 live 限价单。
+测试下单参数在 `run_test_order.py` 最下面的 `run_test_limit_order(...)` 里改。
+
+## PyCharm 点箭头运行
+
+把解释器设成：
+
+```text
+C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
+```
+
+然后点这些函数左边的绿色箭头：
+
+- `run_monitor_once.py` 里的 `run_once_alpaca_auto`
+- `run_monitor_forever.py` 里的 `run_forever_alpaca_auto`
+- `run_test_order.py`
+- `run_self_tests.py` 里的 `test_run_all_local_tests`
+- `check_alpaca_connection.py` 里的 `check_alpaca_connection`
+
+## 盘前/盘后
+
+常规盘内使用 market order。盘前/盘后会自动改用 Alpaca extended-hours limit order：
+
+- `extended_hours=True`
+- `time_in_force=DAY`
+- 买入限价 = 当前价上浮 `0.3%`
+- 卖出限价 = 当前价下浮 `0.3%`
+
+这些参数在 `alpaca_ma5_service/config.py` 的 `build_settings()` 里改。
+
+## 切换 Paper / Live
+
+不用改代码。把 `.env` 换成 Paper key 就走 Paper，把 `.env` 换成 Live key 就走 Live。
+运行 `check_alpaca_connection.py` 会打印当前识别到的模式。
+
+官方文档：
+
+- Alpaca Trading API: https://docs.alpaca.markets/docs/trading-api
+- Alpaca Orders: https://docs.alpaca.markets/docs/working-with-orders
+- Alpaca extended-hours orders: https://docs.alpaca.markets/docs/orders-at-alpaca
