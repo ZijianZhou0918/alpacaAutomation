@@ -9,6 +9,7 @@ from .config import Settings
 from .errors import short_error
 from .market_time import is_regular_market_time, now_market_time
 from .models import OrderResult, Position
+from .order_guard import wait_for_fill_or_cancel
 from .state import append_order, load_positions, save_positions
 from .watchlist import normalize_symbol, to_alpaca_symbol
 
@@ -142,10 +143,17 @@ class AlpacaStockBroker:
         except Exception as exc:
             return OrderResult("", symbol, side, quantity, current_price, "REJECTED", short_error(exc))
 
-        order_id = str(getattr(raw, "id", "") or "")
-        status = str(getattr(raw, "status", "SUBMITTED") or "SUBMITTED").upper()
-        qty = float(getattr(raw, "qty", quantity) or quantity)
-        return OrderResult(order_id, symbol, side, qty, current_price, status, f"Alpaca {self.source_name()} order submitted")
+        return wait_for_fill_or_cancel(
+            self.client,
+            raw,
+            symbol,
+            side,
+            quantity,
+            current_price,
+            self.source_name(),
+            timeout_seconds=self.settings.order_cancel_after_seconds,
+            poll_seconds=self.settings.order_status_poll_seconds,
+        )
 
     def _buy_qty(self, notional_usd: float, current_price: float) -> float:
         """把买入金额换算成股数，按配置决定是否允许碎股。"""

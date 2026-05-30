@@ -6,11 +6,11 @@ from io import StringIO
 
 import unittest
 
-from alpaca_ma5_service.broker import DryRunStockBroker
+from alpaca_ma5_service.broker import AlpacaStockBroker, DryRunStockBroker
 from alpaca_ma5_service.config import Settings
 from alpaca_ma5_service.manual_order import discounted_limit_price, place_test_order, quantity_for_notional
 from alpaca_ma5_service.market_data import _SnapshotBar, _requires_realtime_price, _snapshot_inputs
-from alpaca_ma5_service.models import MarketSnapshot, Position
+from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position
 from alpaca_ma5_service.service import print_snapshot, run_forever_once, run_once
 from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell
 from alpaca_ma5_service.watchlist import read_watch_codes
@@ -31,11 +31,31 @@ class FakeAlpacaClient:
     def __init__(self):
         """测试用 Alpaca client，记录收到的订单请求。"""
         self.order_data = None
+        self.cancelled_order_id = None
 
     def submit_order(self, order_data):
         """模拟 Alpaca 接受订单。"""
         self.order_data = order_data
-        return type("RawOrder", (), {"id": "test-order-1", "status": "accepted", "qty": order_data.qty})()
+        return type("RawOrder", (), {"id": "test-order-1", "status": "filled", "qty": order_data.qty})()
+
+    def get_order_by_id(self, order_id):
+        """模拟订单已成交。"""
+        return type("RawOrder", (), {"id": order_id, "status": "filled", "qty": self.order_data.qty})()
+
+    def cancel_order_by_id(self, order_id):
+        """记录取消请求；已成交订单不会走到这里。"""
+        self.cancelled_order_id = order_id
+
+
+class PendingAlpacaClient(FakeAlpacaClient):
+    def submit_order(self, order_data):
+        """模拟订单提交成功但一直没有成交。"""
+        self.order_data = order_data
+        return type("RawOrder", (), {"id": "pending-order-1", "status": "accepted", "qty": order_data.qty, "filled_qty": "0"})()
+
+    def get_order_by_id(self, order_id):
+        """模拟订单仍在挂单状态。"""
+        return type("RawOrder", (), {"id": order_id, "status": "accepted", "qty": self.order_data.qty, "filled_qty": "0"})()
 
 
 class RejectingAlpacaClient:
@@ -52,6 +72,20 @@ class FailingPositionsBroker:
     def get_positions(self):
         """模拟查询持仓接口临时失败。"""
         raise Exception('{"code":50010000,"message":"temporary alpaca failure"}')
+
+
+class CancelingBuyBroker:
+    def source_name(self):
+        """模拟下单后超时撤单的真实 broker。"""
+        return "alpaca-paper"
+
+    def get_positions(self):
+        """没有持仓，触发买入判断。"""
+        return {}
+
+    def place_market_buy(self, symbol, notional_usd, current_price, reason):
+        """模拟买单未成交后已请求取消。"""
+        return OrderResult("order-1", symbol, "BUY", 1.0, current_price, "CANCEL_REQUESTED", "not filled; cancel requested")
 
 
 def make_snapshot(symbol="US.TEST", current=9.8, closes=None):
@@ -78,6 +112,8 @@ def make_settings(root: Path) -> Settings:
         allow_fractional_shares=False,
         extended_hours_orders_enabled=True,
         extended_hours_limit_buffer_pct=0.003,
+        order_cancel_after_seconds=0,
+        order_status_poll_seconds=1,
     )
 
 
@@ -150,6 +186,19 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["buy"], 1)
             self.assertIn("US.TEST", broker.get_positions())
 
+    def test_run_once_does_not_count_cancelled_buy_as_success(self):
+        """真实买单超时撤单时，不计入买入成功次数。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.8)})
+
+            summary = run_once(settings, market_data=market_data, broker=CancelingBuyBroker(), now=datetime(2026, 5, 28, 10, 0))
+
+            self.assertEqual(summary["buy"], 0)
+            self.assertEqual(summary["hold"], 1)
+
     def test_run_once_sells_watch_position_on_stop_loss(self):
         """单轮监控会对 watchlist 内持仓执行止损卖出。"""
         with TemporaryDirectory() as tmp:
@@ -184,10 +233,25 @@ class ServiceTests(unittest.TestCase):
 
             result = place_test_order(settings=settings, market_data=market_data, client=client)
 
-            self.assertEqual(result.status, "ACCEPTED")
+            self.assertEqual(result.status, "FILLED")
             self.assertEqual(result.price, 90.0)
             self.assertEqual(result.quantity, 0.055556)
             self.assertEqual(client.order_data.limit_price, 90.0)
+            self.assertIsNone(client.cancelled_order_id)
+
+    def test_manual_test_order_cancels_when_unfilled_after_timeout(self):
+        """测试下单超过等待时间仍未成交时，应请求取消订单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            market_data = FakeMarketData({"US.AAPL": make_snapshot("US.AAPL", current=100.0)})
+            client = PendingAlpacaClient()
+
+            result = place_test_order(settings=settings, market_data=market_data, client=client)
+
+            self.assertEqual(result.status, "CANCEL_REQUESTED")
+            self.assertEqual(result.order_id, "pending-order-1")
+            self.assertEqual(client.cancelled_order_id, "pending-order-1")
+            self.assertIn("Not filled within 0s", result.message)
 
     def test_manual_test_order_returns_rejected_on_alpaca_error(self):
         """Alpaca 拒单时返回 REJECTED，不抛 traceback。"""
@@ -200,6 +264,21 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(result.status, "REJECTED")
             self.assertIn("insufficient buying power", result.message)
             self.assertIn("buying_power=0", result.message)
+
+    def test_alpaca_broker_cancels_unfilled_order_after_timeout(self):
+        """真实 broker 链路提交后未成交，也会在超时后请求取消。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            client = PendingAlpacaClient()
+            broker = AlpacaStockBroker.__new__(AlpacaStockBroker)
+            broker.settings = settings
+            broker.client = client
+            broker.paper = True
+
+            result = broker._submit_order("US.AAPL", "BUY", 1.0, 100.0)
+
+            self.assertEqual(result.status, "CANCEL_REQUESTED")
+            self.assertEqual(client.cancelled_order_id, "pending-order-1")
 
     def test_run_forever_once_keeps_running_after_round_error(self):
         """forever 单轮失败时返回 None，让下一轮重建 broker 继续。"""

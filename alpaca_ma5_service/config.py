@@ -24,6 +24,8 @@ class Settings:
     allow_fractional_shares: bool
     extended_hours_orders_enabled: bool
     extended_hours_limit_buffer_pct: float
+    order_cancel_after_seconds: int
+    order_status_poll_seconds: int
 
 
 def build_settings() -> Settings:
@@ -47,4 +49,6 @@ def build_settings() -> Settings:
         allow_fractional_shares=True,
         extended_hours_orders_enabled=True,
         extended_hours_limit_buffer_pct=0.003,
+        order_cancel_after_seconds=60,
+        order_status_poll_seconds=5,
     )

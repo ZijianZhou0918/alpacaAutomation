@@ -55,7 +55,10 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
                 if signal.action == "SELL_ALL":
                     result = broker.place_market_sell(symbol, signal.quantity, snapshot.current_price, signal.reason)
                     print_order(result.status, result.message, symbol, result.quantity, result.price)
-                    summary["sell"] += 1
+                    if order_executed(result.status):
+                        summary["sell"] += 1
+                    else:
+                        summary["hold"] += 1
                 else:
                     summary["hold"] += 1
                 continue
@@ -70,7 +73,7 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
             if signal.action == "BUY":
                 result = broker.place_market_buy(symbol, settings.buy_notional_usd, snapshot.current_price, signal.reason)
                 print_order(result.status, result.message, symbol, result.quantity, result.price)
-                if result.status != "REJECTED":
+                if order_executed(result.status):
                     buys_used += 1
                     summary["buy"] += 1
                 else:
@@ -83,6 +86,11 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
 
     print(f"本轮完成：{summary}")
     return summary
+
+
+def order_executed(status: str) -> bool:
+    """只有真实成交或 dry-run 成功才计入买/卖成功，撤单不算成功。"""
+    return status.upper() in {"FILLED", "DRY_RUN"}
 
 
 def run_forever(settings: Settings | None = None) -> None:

@@ -5,6 +5,7 @@ from .config import Settings, build_settings
 from .errors import short_error
 from .market_data import AlpacaMarketData
 from .models import OrderResult
+from .order_guard import wait_for_fill_or_cancel
 from .state import append_order
 from .watchlist import normalize_symbol, to_alpaca_symbol
 
@@ -16,12 +17,16 @@ def place_test_order(
     settings: Settings | None = None,
     market_data=None,
     client=None,
+    cancel_after_seconds: int | None = None,
+    order_status_poll_seconds: int | None = None,
 ) -> OrderResult:
     """
     Submit one real Alpaca limit-buy test order from PyCharm.
     Edit the values below before running if you want a different symbol or size.
     """
     settings = settings or build_settings()
+    cancel_after_seconds = settings.order_cancel_after_seconds if cancel_after_seconds is None else cancel_after_seconds
+    order_status_poll_seconds = settings.order_status_poll_seconds if order_status_poll_seconds is None else order_status_poll_seconds
 
     symbol = normalize_symbol(symbol)
     # 测试下单也使用真实监控同一套 Alpaca 行情源，避免价格口径不一致。
@@ -34,7 +39,7 @@ def place_test_order(
     snapshot = market_data.get_snapshot(symbol)
     limit_price = discounted_limit_price(snapshot.current_price, limit_price_multiplier)
     quantity = quantity_for_notional(buy_notional_usd, limit_price)
-    reason = "manual test limit buy at 90% of current price"
+    reason = f"manual test limit buy at {limit_price_multiplier:.0%} of current price"
 
     print("=== Alpaca real test order ===", flush=True)
     print(f"Mode: {mode}", flush=True)
@@ -45,17 +50,19 @@ def place_test_order(
     print(f"Limit price: {limit_price:.2f}", flush=True)
     print(f"Quantity: {quantity}", flush=True)
 
-    # A buy limit at 90% of the current price submits a real order while avoiding an immediate fill.
+    # 折价买入限价单会真实提交，但通常不会马上成交；超时后自动撤单。
     try:
         raw = _submit_limit_buy(client, symbol, quantity, limit_price)
-        result = OrderResult(
-            order_id=str(getattr(raw, "id", "") or ""),
-            symbol=symbol,
-            side="BUY",
-            quantity=float(getattr(raw, "qty", quantity) or quantity),
-            price=limit_price,
-            status=str(getattr(raw, "status", "SUBMITTED") or "SUBMITTED").upper(),
-            message="Alpaca limit buy submitted at 90% of current price",
+        result = wait_for_fill_or_cancel(
+            client,
+            raw,
+            symbol,
+            "BUY",
+            quantity,
+            limit_price,
+            mode.lower(),
+            timeout_seconds=cancel_after_seconds,
+            poll_seconds=order_status_poll_seconds,
         )
     except Exception as exc:
         result = OrderResult("", symbol, "BUY", quantity, limit_price, "REJECTED", short_error(exc))
