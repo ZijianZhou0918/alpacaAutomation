@@ -9,7 +9,7 @@ from .config import Settings, build_settings
 from .errors import short_error
 from .market_data import AlpacaMarketData
 from .market_time import next_poll_seconds, now_market_time
-from .models import MarketSnapshot
+from .models import MarketSnapshot, is_executed_order_status
 from .state import count_today_buy_orders
 from .strategy import evaluate_buy, evaluate_sell
 from .watchlist import read_watch_codes
@@ -90,7 +90,7 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
 
 def order_executed(status: str) -> bool:
     """只有真实成交或 dry-run 成功才计入买/卖成功，撤单不算成功。"""
-    return status.upper() in {"FILLED", "DRY_RUN"}
+    return is_executed_order_status(status)
 
 
 def run_forever(settings: Settings | None = None) -> None:

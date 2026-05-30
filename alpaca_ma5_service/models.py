@@ -50,3 +50,9 @@ class OrderResult:
     price: float
     status: str
     message: str
+
+
+def is_executed_order_status(status: str) -> bool:
+    """判断订单是否至少有真实成交；撤单/拒单不算成功。"""
+    status = status.upper()
+    return status in {"FILLED", "DRY_RUN"} or status.startswith("PARTIALLY_FILLED")

@@ -6,7 +6,7 @@ from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 
-from .models import OrderResult, Position
+from .models import OrderResult, Position, is_executed_order_status
 
 
 def load_positions(path: Path) -> dict[str, Position]:
@@ -58,9 +58,13 @@ def append_order(output_dir: Path, result: OrderResult, reason: str) -> None:
 
 
 def count_today_buy_orders(output_dir: Path) -> int:
-    """统计当天已记录的买入次数，用于执行每日买入上限。"""
+    """统计当天已成交买入次数；撤单/拒单不占用每日买入上限。"""
     path = orders_file(output_dir)
     if not path.exists():
         return 0
     with path.open("r", newline="", encoding="utf-8-sig") as f:
-        return sum(1 for row in csv.DictReader(f) if row.get("side") == "BUY")
+        return sum(
+            1
+            for row in csv.DictReader(f)
+            if row.get("side") == "BUY" and is_executed_order_status(row.get("status", ""))
+        )

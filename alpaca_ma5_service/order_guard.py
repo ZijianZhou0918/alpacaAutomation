@@ -45,10 +45,23 @@ def wait_for_fill_or_cancel(
         return OrderResult(order_id, symbol, side, qty, price, status, f"Alpaca {source_name} order ended with status={status}")
 
     # 超过 1 分钟还没完全成交，马上取消剩余订单，避免挂单继续留在市场里。
-    filled_qty = getattr(raw_order, "filled_qty", None)
-    detail = f" filled_qty={filled_qty}" if filled_qty not in (None, "") else ""
+    filled_qty = filled_quantity(raw_order)
+    detail = f" filled_qty={filled_qty}" if filled_qty > 0 else ""
+    result_status = "PARTIALLY_FILLED_CANCEL_REQUESTED" if filled_qty > 0 else "CANCEL_REQUESTED"
+    result_quantity = filled_qty if filled_qty > 0 else qty
     reason = f"Not filled within {timeout_seconds}s"
-    return cancel_unfilled_order(client, order_id, symbol, side, qty, price, timeout_seconds, f"{reason}; cancel requested.{detail}", reason)
+    return cancel_unfilled_order(
+        client,
+        order_id,
+        symbol,
+        side,
+        result_quantity,
+        price,
+        timeout_seconds,
+        f"{reason}; cancel requested.{detail}",
+        reason,
+        success_status=result_status,
+    )
 
 
 def cancel_unfilled_order(
@@ -61,11 +74,12 @@ def cancel_unfilled_order(
     timeout_seconds: int,
     success_message: str,
     failure_prefix: str | None = None,
+    success_status: str = "CANCEL_REQUESTED",
 ) -> OrderResult:
     """向 Alpaca 请求取消未成交订单；取消失败也返回结果，不抛异常。"""
     try:
         client.cancel_order_by_id(order_id)
-        return OrderResult(order_id, symbol, side, quantity, price, "CANCEL_REQUESTED", success_message)
+        return OrderResult(order_id, symbol, side, quantity, price, success_status, success_message)
     except Exception as exc:
         failure_prefix = failure_prefix or f"Not filled within {timeout_seconds}s"
         return OrderResult(order_id, symbol, side, quantity, price, "CANCEL_FAILED", f"{failure_prefix}; cancel failed: {short_error(exc)}")
@@ -76,3 +90,11 @@ def normalize_order_status(raw_order) -> str:
     value = getattr(raw_order, "status", "") or ""
     value = getattr(value, "value", value)
     return str(value).split(".")[-1].upper()
+
+
+def filled_quantity(raw_order) -> float:
+    """读取已成交股数；没有部分成交信息时返回 0。"""
+    try:
+        return float(getattr(raw_order, "filled_qty", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0

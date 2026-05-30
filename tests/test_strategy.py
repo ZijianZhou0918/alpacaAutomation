@@ -12,6 +12,7 @@ from alpaca_ma5_service.manual_order import discounted_limit_price, place_test_o
 from alpaca_ma5_service.market_data import _SnapshotBar, _requires_realtime_price, _snapshot_inputs
 from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position
 from alpaca_ma5_service.service import print_snapshot, run_forever_once, run_once
+from alpaca_ma5_service.state import append_order, count_today_buy_orders
 from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell
 from alpaca_ma5_service.watchlist import read_watch_codes
 from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, request_end_datetime, screen_candidates, validate_candidates, write_watch_codes
@@ -56,6 +57,17 @@ class PendingAlpacaClient(FakeAlpacaClient):
     def get_order_by_id(self, order_id):
         """模拟订单仍在挂单状态。"""
         return type("RawOrder", (), {"id": order_id, "status": "accepted", "qty": self.order_data.qty, "filled_qty": "0"})()
+
+
+class PartialFillAlpacaClient(PendingAlpacaClient):
+    def submit_order(self, order_data):
+        """模拟订单提交后已经部分成交。"""
+        self.order_data = order_data
+        return type("RawOrder", (), {"id": "pending-order-1", "status": "partially_filled", "qty": order_data.qty, "filled_qty": "0.25"})()
+
+    def get_order_by_id(self, order_id):
+        """模拟订单只成交一部分，剩余仍未成交。"""
+        return type("RawOrder", (), {"id": order_id, "status": "partially_filled", "qty": self.order_data.qty, "filled_qty": "0.25"})()
 
 
 class RejectingAlpacaClient:
@@ -253,6 +265,19 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(client.cancelled_order_id, "pending-order-1")
             self.assertIn("Not filled within 0s", result.message)
 
+    def test_manual_test_order_marks_partial_fill_before_cancel(self):
+        """测试下单部分成交后超时撤单，应保留已成交数量。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            market_data = FakeMarketData({"US.AAPL": make_snapshot("US.AAPL", current=100.0)})
+            client = PartialFillAlpacaClient()
+
+            result = place_test_order(settings=settings, market_data=market_data, client=client)
+
+            self.assertEqual(result.status, "PARTIALLY_FILLED_CANCEL_REQUESTED")
+            self.assertEqual(result.quantity, 0.25)
+            self.assertEqual(client.cancelled_order_id, "pending-order-1")
+
     def test_manual_test_order_returns_rejected_on_alpaca_error(self):
         """Alpaca 拒单时返回 REJECTED，不抛 traceback。"""
         with TemporaryDirectory() as tmp:
@@ -279,6 +304,17 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(result.status, "CANCEL_REQUESTED")
             self.assertEqual(client.cancelled_order_id, "pending-order-1")
+
+    def test_daily_buy_count_ignores_unfilled_cancelled_orders(self):
+        """撤单/拒单不占用每日买入次数，真实成交和部分成交才计数。"""
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            append_order(output_dir, OrderResult("1", "US.AAPL", "BUY", 1, 10, "CANCEL_REQUESTED", "cancel"), "test")
+            append_order(output_dir, OrderResult("2", "US.AAPL", "BUY", 1, 10, "REJECTED", "reject"), "test")
+            append_order(output_dir, OrderResult("3", "US.AAPL", "BUY", 1, 10, "FILLED", "filled"), "test")
+            append_order(output_dir, OrderResult("4", "US.AAPL", "BUY", 0.25, 10, "PARTIALLY_FILLED_CANCEL_REQUESTED", "partial"), "test")
+
+            self.assertEqual(count_today_buy_orders(output_dir), 2)
 
     def test_run_forever_once_keeps_running_after_round_error(self):
         """forever 单轮失败时返回 None，让下一轮重建 broker 继续。"""
