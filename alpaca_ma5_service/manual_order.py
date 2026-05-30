@@ -3,10 +3,10 @@ from __future__ import annotations
 from .alpaca_connection import build_trading_connection
 from .config import Settings, build_settings
 from .errors import short_error
-from .market_data import YFinanceMarketData
+from .market_data import AlpacaMarketData
 from .models import OrderResult
 from .state import append_order
-from .watchlist import normalize_symbol, to_yfinance_symbol
+from .watchlist import normalize_symbol, to_alpaca_symbol
 
 
 def place_test_order(
@@ -24,7 +24,8 @@ def place_test_order(
     settings = settings or build_settings()
 
     symbol = normalize_symbol(symbol)
-    market_data = market_data or YFinanceMarketData(settings.market_timezone)
+    # 测试下单也使用真实监控同一套 Alpaca 行情源，避免价格口径不一致。
+    market_data = market_data or AlpacaMarketData(settings.market_timezone)
     mode = "CLIENT"
     if client is None:
         connection = build_trading_connection()
@@ -37,6 +38,7 @@ def place_test_order(
 
     print("=== Alpaca real test order ===", flush=True)
     print(f"Mode: {mode}", flush=True)
+    print("Price source: Alpaca Market Data", flush=True)
     print(f"Symbol: {symbol}", flush=True)
     print("Side: BUY", flush=True)
     print(f"Current price: {snapshot.current_price:.4f}", flush=True)
@@ -92,7 +94,7 @@ def _submit_limit_buy(client, symbol: str, quantity: float, limit_price: float):
     from alpaca.trading.requests import LimitOrderRequest
 
     request = LimitOrderRequest(
-        symbol=to_yfinance_symbol(symbol),
+        symbol=to_alpaca_symbol(symbol),
         qty=quantity,
         side=OrderSide.BUY,
         time_in_force=TimeInForce.DAY,

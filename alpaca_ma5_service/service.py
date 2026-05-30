@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 from .broker import AlpacaStockBroker
 from .config import Settings, build_settings
 from .errors import short_error
-from .market_data import YFinanceMarketData
+from .market_data import AlpacaMarketData
 from .market_time import next_poll_seconds, now_market_time
 from .models import MarketSnapshot
 from .state import count_today_buy_orders
@@ -20,10 +20,15 @@ def build_broker(settings: Settings):
     return AlpacaStockBroker(settings)
 
 
+def build_market_data(settings: Settings):
+    """构建默认 Alpaca 行情源；测试时可以传入 fake market_data 替代。"""
+    return AlpacaMarketData(settings.market_timezone)
+
+
 def run_once(settings: Settings | None = None, market_data=None, broker=None, now: datetime | None = None) -> dict[str, int]:
     """执行一轮盯盘：读取 watchlist、评估买卖信号、提交订单并汇总结果。"""
     settings = settings or build_settings()
-    market_data = market_data or YFinanceMarketData(settings.market_timezone)
+    market_data = market_data or build_market_data(settings)
     broker = broker or build_broker(settings)
     now_et = now or now_market_time(settings)
 
@@ -42,6 +47,7 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
     for symbol in watch_codes:
         try:
             snapshot: MarketSnapshot = market_data.get_snapshot(symbol)
+            print_snapshot(snapshot)
             position = positions.get(symbol)
             if position:
                 signal = evaluate_sell(position, snapshot, now_et, settings)
@@ -82,7 +88,7 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
 def run_forever(settings: Settings | None = None) -> None:
     """常驻盯盘入口；每轮出错只记录原因，然后继续下一轮。"""
     settings = settings or build_settings()
-    market_data = YFinanceMarketData(settings.market_timezone)
+    market_data = build_market_data(settings)
     broker = None
     while True:
         now_et = datetime.now(ZoneInfo(settings.market_timezone))
@@ -106,6 +112,12 @@ def run_forever_once(settings: Settings, market_data, broker, now_et: datetime):
 def print_signal(reason: str, symbol: str, snapshot: MarketSnapshot) -> None:
     """打印策略判断结果，方便 PyCharm 控制台直接查看。"""
     print(f"{symbol}: {reason} | current={snapshot.current_price:.4f} today_ma5={snapshot.today_ma5:.4f}")
+
+
+def print_snapshot(snapshot: MarketSnapshot) -> None:
+    """打印策略使用的行情原始数字，方便核对 MA5。"""
+    closes = ", ".join(f"{close:.4f}" for close in snapshot.previous_closes[-4:])
+    print(f"{snapshot.symbol}: current_price={snapshot.current_price:.4f} previous_4_closes=[{closes}] today_ma5={snapshot.today_ma5:.4f}")
 
 
 def print_order(status: str, message: str, symbol: str, quantity: float, price: float) -> None:

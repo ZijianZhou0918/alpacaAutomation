@@ -1,16 +1,20 @@
-from datetime import datetime, time
+from datetime import date, datetime, time
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from contextlib import redirect_stdout
+from io import StringIO
 
 import unittest
 
 from alpaca_ma5_service.broker import DryRunStockBroker
 from alpaca_ma5_service.config import Settings
 from alpaca_ma5_service.manual_order import discounted_limit_price, place_test_order, quantity_for_notional
+from alpaca_ma5_service.market_data import _SnapshotBar, _requires_realtime_price, _snapshot_inputs
 from alpaca_ma5_service.models import MarketSnapshot, Position
-from alpaca_ma5_service.service import run_forever_once, run_once
+from alpaca_ma5_service.service import print_snapshot, run_forever_once, run_once
 from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell
 from alpaca_ma5_service.watchlist import read_watch_codes
+from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, request_end_datetime, screen_candidates, validate_candidates, write_watch_codes
 
 
 class FakeMarketData:
@@ -75,6 +79,19 @@ def make_settings(root: Path) -> Settings:
         extended_hours_orders_enabled=True,
         extended_hours_limit_buffer_pct=0.003,
     )
+
+
+def make_screen_bars(symbol="TEST", signal_day=date(2026, 1, 20), passes=True):
+    """生成 watchlist 选股测试用的 20 根日线。"""
+    bars = []
+    for index in range(19):
+        bars.append(DailyBar(symbol, date(2026, 1, index + 1), float(index + 1), float(index + 1), float(index + 1), float(index + 1)))
+
+    if passes:
+        bars.append(DailyBar(symbol, signal_day, 24.0, 28.0, 23.0, 25.0))
+    else:
+        bars.append(DailyBar(symbol, signal_day, 20.0, 21.0, 19.0, 20.0))
+    return bars
 
 
 class StrategyTests(unittest.TestCase):
@@ -194,6 +211,102 @@ class ServiceTests(unittest.TestCase):
             broker = run_forever_once(settings, market_data, FailingPositionsBroker(), datetime(2026, 5, 28, 10, 0))
 
             self.assertIsNone(broker)
+
+    def test_print_snapshot_outputs_ma_inputs(self):
+        """监控输出应包含当前价、前 4 个收盘价和今日 MA5。"""
+        buffer = StringIO()
+
+        with redirect_stdout(buffer):
+            print_snapshot(make_snapshot("US.TEST", current=9.8, closes=[10.0, 10.0, 10.0, 11.0]))
+
+        output = buffer.getvalue()
+        self.assertIn("current_price=9.8000", output)
+        self.assertIn("previous_4_closes=[10.0000, 10.0000, 10.0000, 11.0000]", output)
+        self.assertIn("today_ma5=10.1600", output)
+
+    def test_alpaca_snapshot_uses_last_close_outside_regular_session(self):
+        """非交易时段使用最新日线收盘价，不用 latest trade。"""
+        bars = [
+            _SnapshotBar(date(2026, 5, 22), 4.91),
+            _SnapshotBar(date(2026, 5, 26), 4.60),
+            _SnapshotBar(date(2026, 5, 27), 4.70),
+            _SnapshotBar(date(2026, 5, 28), 4.68),
+            _SnapshotBar(date(2026, 5, 29), 8.69),
+        ]
+
+        current_price, previous_closes = _snapshot_inputs(bars, datetime(2026, 5, 30, 17, 0), latest_trade_price=8.70)
+
+        self.assertEqual(current_price, 8.69)
+        self.assertEqual(previous_closes[-4:], [4.91, 4.60, 4.70, 4.68])
+
+    def test_alpaca_snapshot_uses_latest_trade_during_regular_session(self):
+        """可交易时段使用 latest trade，并用之前 4 个完成日线收盘价算 MA5。"""
+        bars = [
+            _SnapshotBar(date(2026, 5, 22), 4.91),
+            _SnapshotBar(date(2026, 5, 26), 4.60),
+            _SnapshotBar(date(2026, 5, 27), 4.70),
+            _SnapshotBar(date(2026, 5, 28), 4.68),
+        ]
+
+        current_price, previous_closes = _snapshot_inputs(bars, datetime(2026, 5, 29, 10, 0), latest_trade_price=8.70)
+
+        self.assertEqual(current_price, 8.70)
+        self.assertEqual(previous_closes[-4:], [4.91, 4.60, 4.70, 4.68])
+
+    def test_alpaca_snapshot_requires_realtime_price_during_extended_hours(self):
+        """盘前/盘后也必须使用实时价，避免用日线 close 冒充当前价。"""
+        self.assertTrue(_requires_realtime_price(datetime(2026, 5, 29, 8, 0)))
+        self.assertTrue(_requires_realtime_price(datetime(2026, 5, 29, 19, 59)))
+        self.assertFalse(_requires_realtime_price(datetime(2026, 5, 30, 10, 0)))
+
+    def test_watchlist_generator_filters_strategy_rules(self):
+        """选股生成器使用涨幅、上影线、均线多头和 open>MA5 筛选股票。"""
+        now_et = datetime(2026, 1, 21, 10, 0)
+        candidates = screen_candidates(
+            {
+                "PASS": make_screen_bars("PASS", passes=True),
+                "FAIL": make_screen_bars("FAIL", passes=False),
+            },
+            now_et,
+        )
+
+        self.assertEqual([candidate.symbol for candidate in candidates], ["PASS"])
+        self.assertGreater(candidates[0].gain_pct, 0.20)
+        self.assertGreater(candidates[0].upper_shadow_pct, 0.05)
+        self.assertGreater(candidates[0].ma5, candidates[0].ma10)
+        self.assertGreater(candidates[0].ma10, candidates[0].ma20)
+
+    def test_watchlist_generator_uses_global_signal_date_and_writes_codes(self):
+        """所有股票共用最近已收盘 signal_date，并写成 US. 前缀 watchlist。"""
+        with TemporaryDirectory() as tmp:
+            now_et = datetime(2026, 1, 22, 10, 0)
+            candidates = screen_candidates(
+                {
+                    "OLD": make_screen_bars("OLD", signal_day=date(2026, 1, 20), passes=True),
+                    "NEW": make_screen_bars("NEW", signal_day=date(2026, 1, 21), passes=True),
+                },
+                now_et,
+            )
+            path = Path(tmp) / "watch_codes.txt"
+            write_watch_codes(path, candidates)
+
+            self.assertEqual([candidate.symbol for candidate in candidates], ["NEW"])
+            self.assertEqual(read_watch_codes(path), ["US.NEW"])
+
+    def test_watchlist_generator_rejects_invalid_ma_order_before_write(self):
+        """写入前再次强校验，MA5 不是最大时直接拒绝。"""
+        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 8.0, 9.0, 10.0, 12.0, 13.0, 12.5)
+
+        with self.assertRaisesRegex(RuntimeError, "MA5>MA10>MA20"):
+            validate_candidates([candidate])
+
+    def test_watchlist_generator_uses_daily_request_boundary(self):
+        """日线请求 end 使用日期边界，避免 SIP recent 限制。"""
+        saturday = datetime(2026, 5, 30, 17, 30)
+        friday_after_close = datetime(2026, 5, 29, 16, 30)
+
+        self.assertEqual(request_end_datetime(saturday).date(), date(2026, 5, 30))
+        self.assertEqual(request_end_datetime(friday_after_close).date(), date(2026, 5, 30))
 
 
 if __name__ == "__main__":

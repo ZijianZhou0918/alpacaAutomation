@@ -48,8 +48,8 @@ def _read_csv_watch_codes(path: Path) -> list[str]:
     return [normalize_symbol(row.get(field, "")) for row in rows if normalize_symbol(row.get(field, ""))]
 
 
-def to_yfinance_symbol(symbol: str) -> str:
-    """把内部 US.AAPL 形式转换成 yfinance/Alpaca 使用的 AAPL。"""
+def to_alpaca_symbol(symbol: str) -> str:
+    """把内部 US.AAPL 形式转换成 Alpaca API 使用的 AAPL。"""
     symbol = normalize_symbol(symbol)
     if symbol.startswith("US."):
         return symbol[3:]

@@ -10,7 +10,7 @@ from .errors import short_error
 from .market_time import is_regular_market_time, now_market_time
 from .models import OrderResult, Position
 from .state import append_order, load_positions, save_positions
-from .watchlist import normalize_symbol, to_yfinance_symbol
+from .watchlist import normalize_symbol, to_alpaca_symbol
 
 
 class DryRunStockBroker:
@@ -118,7 +118,7 @@ class AlpacaStockBroker:
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
 
-        alpaca_symbol = to_yfinance_symbol(symbol)
+        alpaca_symbol = to_alpaca_symbol(symbol)
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
         now_et = now_market_time(self.settings)
 

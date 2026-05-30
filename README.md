@@ -18,6 +18,7 @@
 - `watch_codes.txt`：唯一盯盘股票文件。
 - `run_monitor_once.py`：点击运行，只检查一轮。
 - `run_monitor_forever.py`：点击运行，持续轮询。
+- `run_generate_watch_codes.py`：点击运行，用 Alpaca 日线数据生成 `watch_codes.txt`。
 - `run_test_order.py`：点击运行，提交一笔很小的 Alpaca 限价测试单，限价为当前价的 90%。
 - `run_self_tests.py`：点击运行本地测试。
 - `check_alpaca_connection.py`：点击检查 Alpaca API key 是否能连通。
@@ -72,19 +73,34 @@ NVDA
 .\.venv\Scripts\python.exe run_monitor_once.py
 ```
 
-8. 持续盯盘：
+8. 生成 watchlist：
+
+```powershell
+.\.venv\Scripts\python.exe run_generate_watch_codes.py
+```
+
+只筛选 Alpaca `US_EQUITY` 美股股票，不读取期权、crypto 或其他资产。
+筛选规则：最近一个已收盘交易日涨幅 `>20%`，上影线幅度 `>5%`，`MA5 > MA10 > MA20`，且当天 `open > MA5`。
+默认全部使用 Alpaca `sip` 美股数据，避免 `iex` 局部成交导致均线失真。
+候选诊断会写入 `outputs/watch_candidates_YYYY-MM-DD.csv`。
+
+监控当前价和 MA5 也默认使用 Alpaca Market Data，不再依赖 yfinance。
+美股可交易时段内用 Alpaca `iex` 最新成交价作为当前价；日线 MA 数据继续使用 `sip`。
+
+9. 持续盯盘：
 
 ```powershell
 .\.venv\Scripts\python.exe run_monitor_forever.py
 ```
 
-9. 测试下单：
+10. 测试下单：
 
 ```powershell
 .\.venv\Scripts\python.exe run_test_order.py
 ```
 
 默认会提交 `AAPL` 买入限价单，金额约 `$5`，限价为当前价 `* 0.9`。如果 `.env` 里是 live key，它就提交 live 限价单。
+测试下单读取当前价时也使用 Alpaca Market Data，和真实监控链路保持一致。
 测试下单参数在 `run_test_order.py` 最下面的 `run_test_limit_order(...)` 里改。
 
 ## PyCharm 点箭头运行
@@ -99,6 +115,7 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 
 - `run_monitor_once.py` 里的 `run_once_alpaca_auto`
 - `run_monitor_forever.py` 里的 `run_forever_alpaca_auto`
+- `run_generate_watch_codes.py`
 - `run_test_order.py`
 - `run_self_tests.py` 里的 `test_run_all_local_tests`
 - `check_alpaca_connection.py` 里的 `check_alpaca_connection`
