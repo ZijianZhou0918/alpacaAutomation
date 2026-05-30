@@ -51,7 +51,7 @@ class DryRunStockBroker:
         save_positions(self.settings.state_file, positions)
 
         result = OrderResult(str(uuid.uuid4()), symbol, "BUY", quantity, current_price, "DRY_RUN", "模拟买入，未提交真实订单")
-        append_order(self.settings.output_dir, result, reason)
+        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
         return result
 
     def place_market_sell(self, symbol: str, quantity: float, current_price: float, reason: str) -> OrderResult:
@@ -70,7 +70,7 @@ class DryRunStockBroker:
         save_positions(self.settings.state_file, positions)
 
         result = OrderResult(str(uuid.uuid4()), symbol, "SELL", sell_qty, current_price, "DRY_RUN", "模拟卖出，未提交真实订单")
-        append_order(self.settings.output_dir, result, reason)
+        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
         return result
 
 
@@ -103,7 +103,7 @@ class AlpacaStockBroker:
         if qty <= 0:
             return OrderResult("", symbol, "BUY", 0, current_price, "REJECTED", "买入金额不足")
         result = self._submit_order(symbol, "BUY", qty, current_price)
-        append_order(self.settings.output_dir, result, reason)
+        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
         return result
 
     def place_market_sell(self, symbol: str, quantity: float, current_price: float, reason: str) -> OrderResult:
@@ -111,7 +111,7 @@ class AlpacaStockBroker:
         if quantity <= 0:
             return OrderResult("", symbol, "SELL", 0, current_price, "REJECTED", "没有可卖持仓")
         result = self._submit_order(symbol, "SELL", quantity, current_price)
-        append_order(self.settings.output_dir, result, reason)
+        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
         return result
 
     def _submit_order(self, symbol: str, side: str, quantity: float, current_price: float) -> OrderResult:

@@ -11,6 +11,7 @@ from alpaca_ma5_service.config import Settings
 from alpaca_ma5_service.manual_order import discounted_limit_price, place_test_order, quantity_for_notional
 from alpaca_ma5_service.market_data import _SnapshotBar, _requires_realtime_price, _snapshot_inputs
 from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position
+from alpaca_ma5_service.order_guard import wait_for_fill_or_cancel
 from alpaca_ma5_service.service import print_snapshot, run_forever_once, run_once
 from alpaca_ma5_service.state import append_order, count_today_buy_orders
 from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell
@@ -56,6 +57,8 @@ class PendingAlpacaClient(FakeAlpacaClient):
 
     def get_order_by_id(self, order_id):
         """模拟订单仍在挂单状态。"""
+        if self.cancelled_order_id == order_id:
+            return type("RawOrder", (), {"id": order_id, "status": "canceled", "qty": self.order_data.qty, "filled_qty": "0"})()
         return type("RawOrder", (), {"id": order_id, "status": "accepted", "qty": self.order_data.qty, "filled_qty": "0"})()
 
 
@@ -67,7 +70,15 @@ class PartialFillAlpacaClient(PendingAlpacaClient):
 
     def get_order_by_id(self, order_id):
         """模拟订单只成交一部分，剩余仍未成交。"""
+        if self.cancelled_order_id == order_id:
+            return type("RawOrder", (), {"id": order_id, "status": "canceled", "qty": self.order_data.qty, "filled_qty": "0.25"})()
         return type("RawOrder", (), {"id": order_id, "status": "partially_filled", "qty": self.order_data.qty, "filled_qty": "0.25"})()
+
+
+class UnconfirmedCancelAlpacaClient(PendingAlpacaClient):
+    def get_order_by_id(self, order_id):
+        """模拟撤单请求发出后，Alpaca 仍未确认最终取消。"""
+        return type("RawOrder", (), {"id": order_id, "status": "accepted", "qty": self.order_data.qty, "filled_qty": "0"})()
 
 
 class RejectingAlpacaClient:
@@ -87,6 +98,10 @@ class FailingPositionsBroker:
 
 
 class CancelingBuyBroker:
+    def __init__(self):
+        """记录买入尝试次数，确认未确认撤单不会继续买下一只。"""
+        self.buy_calls = 0
+
     def source_name(self):
         """模拟下单后超时撤单的真实 broker。"""
         return "alpaca-paper"
@@ -97,6 +112,7 @@ class CancelingBuyBroker:
 
     def place_market_buy(self, symbol, notional_usd, current_price, reason):
         """模拟买单未成交后已请求取消。"""
+        self.buy_calls += 1
         return OrderResult("order-1", symbol, "BUY", 1.0, current_price, "CANCEL_REQUESTED", "not filled; cancel requested")
 
 
@@ -198,18 +214,23 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["buy"], 1)
             self.assertIn("US.TEST", broker.get_positions())
 
-    def test_run_once_does_not_count_cancelled_buy_as_success(self):
-        """真实买单超时撤单时，不计入买入成功次数。"""
+    def test_run_once_blocks_more_buys_when_cancel_is_unconfirmed(self):
+        """买单撤单未确认时，不算买成功，但会阻止本轮继续买下一只。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
-            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
-            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.8)})
+            settings.watch_codes_file.write_text("US.TEST\nUS.NEXT\n", encoding="utf-8")
+            market_data = FakeMarketData({
+                "US.TEST": make_snapshot("US.TEST", current=9.8),
+                "US.NEXT": make_snapshot("US.NEXT", current=9.8),
+            })
+            broker = CancelingBuyBroker()
 
-            summary = run_once(settings, market_data=market_data, broker=CancelingBuyBroker(), now=datetime(2026, 5, 28, 10, 0))
+            summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 10, 0))
 
             self.assertEqual(summary["buy"], 0)
-            self.assertEqual(summary["hold"], 1)
+            self.assertEqual(summary["hold"], 2)
+            self.assertEqual(broker.buy_calls, 1)
 
     def test_run_once_sells_watch_position_on_stop_loss(self):
         """单轮监控会对 watchlist 内持仓执行止损卖出。"""
@@ -260,7 +281,7 @@ class ServiceTests(unittest.TestCase):
 
             result = place_test_order(settings=settings, market_data=market_data, client=client)
 
-            self.assertEqual(result.status, "CANCEL_REQUESTED")
+            self.assertEqual(result.status, "CANCELED")
             self.assertEqual(result.order_id, "pending-order-1")
             self.assertEqual(client.cancelled_order_id, "pending-order-1")
             self.assertIn("Not filled within 0s", result.message)
@@ -274,9 +295,32 @@ class ServiceTests(unittest.TestCase):
 
             result = place_test_order(settings=settings, market_data=market_data, client=client)
 
-            self.assertEqual(result.status, "PARTIALLY_FILLED_CANCEL_REQUESTED")
+            self.assertEqual(result.status, "PARTIALLY_FILLED_CANCELED")
             self.assertEqual(result.quantity, 0.25)
             self.assertEqual(client.cancelled_order_id, "pending-order-1")
+
+    def test_order_guard_preserves_partial_fill_on_final_cancel_status(self):
+        """如果 Alpaca 最终状态已取消但有成交数量，仍按部分成交处理。"""
+        client = FakeAlpacaClient()
+        raw_order = type("RawOrder", (), {"id": "order-1", "status": "canceled", "qty": 1.0, "filled_qty": "0.25"})()
+
+        result = wait_for_fill_or_cancel(client, raw_order, "US.AAPL", "BUY", 1.0, 100.0, "alpaca-paper", timeout_seconds=0)
+
+        self.assertEqual(result.status, "PARTIALLY_FILLED_CANCELED")
+        self.assertEqual(result.quantity, 0.25)
+        self.assertIsNone(client.cancelled_order_id)
+
+    def test_manual_test_order_marks_unconfirmed_cancel_as_risky(self):
+        """撤单请求未确认最终状态时，保留 CANCEL_REQUESTED 供买入名额风控使用。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            market_data = FakeMarketData({"US.AAPL": make_snapshot("US.AAPL", current=100.0)})
+            client = UnconfirmedCancelAlpacaClient()
+
+            result = place_test_order(settings=settings, market_data=market_data, client=client)
+
+            self.assertEqual(result.status, "CANCEL_REQUESTED")
+            self.assertIn("latest_status=ACCEPTED", result.message)
 
     def test_manual_test_order_returns_rejected_on_alpaca_error(self):
         """Alpaca 拒单时返回 REJECTED，不抛 traceback。"""
@@ -302,19 +346,36 @@ class ServiceTests(unittest.TestCase):
 
             result = broker._submit_order("US.AAPL", "BUY", 1.0, 100.0)
 
-            self.assertEqual(result.status, "CANCEL_REQUESTED")
+            self.assertEqual(result.status, "CANCELED")
             self.assertEqual(client.cancelled_order_id, "pending-order-1")
 
-    def test_daily_buy_count_ignores_unfilled_cancelled_orders(self):
-        """撤单/拒单不占用每日买入次数，真实成交和部分成交才计数。"""
+    def test_daily_buy_count_tracks_executed_and_risky_orders(self):
+        """确认取消/拒单不计数，已成交和未确认撤单会占用买入名额。"""
         with TemporaryDirectory() as tmp:
             output_dir = Path(tmp) / "outputs"
-            append_order(output_dir, OrderResult("1", "US.AAPL", "BUY", 1, 10, "CANCEL_REQUESTED", "cancel"), "test")
+            append_order(output_dir, OrderResult("1", "US.AAPL", "BUY", 1, 10, "CANCELED", "cancel"), "test")
             append_order(output_dir, OrderResult("2", "US.AAPL", "BUY", 1, 10, "REJECTED", "reject"), "test")
             append_order(output_dir, OrderResult("3", "US.AAPL", "BUY", 1, 10, "FILLED", "filled"), "test")
             append_order(output_dir, OrderResult("4", "US.AAPL", "BUY", 0.25, 10, "PARTIALLY_FILLED_CANCEL_REQUESTED", "partial"), "test")
+            append_order(output_dir, OrderResult("5", "US.AAPL", "BUY", 1, 10, "CANCEL_REQUESTED", "unconfirmed"), "test")
+            append_order(output_dir, OrderResult("6", "US.AAPL", "BUY", 1, 10, "CANCEL_FAILED", "risky"), "test")
 
-            self.assertEqual(count_today_buy_orders(output_dir), 2)
+            self.assertEqual(count_today_buy_orders(output_dir), 4)
+
+    def test_order_log_uses_market_day_when_provided(self):
+        """订单文件可按美东交易日写入，避免本地时区跨日导致买入次数错位。"""
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            append_order(
+                output_dir,
+                OrderResult("1", "US.AAPL", "BUY", 1, 10, "FILLED", "filled"),
+                "test",
+                day=date(2026, 5, 29),
+                created_at=datetime(2026, 5, 28, 21, 30),
+            )
+
+            self.assertEqual(count_today_buy_orders(output_dir, date(2026, 5, 29)), 1)
+            self.assertEqual(count_today_buy_orders(output_dir, date(2026, 5, 28)), 0)
 
     def test_run_forever_once_keeps_running_after_round_error(self):
         """forever 单轮失败时返回 None，让下一轮重建 broker 继续。"""

@@ -41,6 +41,9 @@ def wait_for_fill_or_cancel(
 
     if status == "FILLED":
         return OrderResult(order_id, symbol, side, qty, price, "FILLED", f"Alpaca {source_name} order filled")
+    filled_qty = filled_quantity(raw_order)
+    if filled_qty > 0 and status in FINAL_STATUSES:
+        return OrderResult(order_id, symbol, side, filled_qty, price, f"PARTIALLY_FILLED_{status}", f"Alpaca {source_name} order ended with partial fill: filled_qty={filled_qty} status={status}")
     if status in FINAL_STATUSES:
         return OrderResult(order_id, symbol, side, qty, price, status, f"Alpaca {source_name} order ended with status={status}")
 
@@ -79,10 +82,33 @@ def cancel_unfilled_order(
     """向 Alpaca 请求取消未成交订单；取消失败也返回结果，不抛异常。"""
     try:
         client.cancel_order_by_id(order_id)
-        return OrderResult(order_id, symbol, side, quantity, price, success_status, success_message)
     except Exception as exc:
         failure_prefix = failure_prefix or f"Not filled within {timeout_seconds}s"
         return OrderResult(order_id, symbol, side, quantity, price, "CANCEL_FAILED", f"{failure_prefix}; cancel failed: {short_error(exc)}")
+    return cancel_confirmation_result(client, order_id, symbol, side, quantity, price, success_status, success_message)
+
+
+def cancel_confirmation_result(client, order_id: str, symbol: str, side: str, quantity: float, price: float, fallback_status: str, fallback_message: str) -> OrderResult:
+    """撤单请求发出后再查一次状态；确认取消后才返回 CANCELED。"""
+    try:
+        raw_order = client.get_order_by_id(order_id)
+    except Exception as exc:
+        return OrderResult(order_id, symbol, side, quantity, price, fallback_status, f"{fallback_message} status not confirmed: {short_error(exc)}")
+
+    status = normalize_order_status(raw_order)
+    filled_qty = filled_quantity(raw_order)
+    qty = filled_qty if filled_qty > 0 else quantity
+    if status == "FILLED":
+        return OrderResult(order_id, symbol, side, qty, price, "FILLED", "Order filled while cancel was pending")
+    if filled_qty > 0:
+        result_status = "PARTIALLY_FILLED_CANCELED" if status in {"CANCELED", "CANCELLED"} else "PARTIALLY_FILLED_CANCEL_REQUESTED"
+        detail = "" if "filled_qty=" in fallback_message else f" filled_qty={filled_qty}"
+        return OrderResult(order_id, symbol, side, qty, price, result_status, f"{fallback_message}{detail} latest_status={status}")
+    if status in {"CANCELED", "CANCELLED"}:
+        return OrderResult(order_id, symbol, side, quantity, price, "CANCELED", f"{fallback_message} cancel confirmed")
+    if status in FINAL_STATUSES:
+        return OrderResult(order_id, symbol, side, quantity, price, status, f"{fallback_message} latest_status={status}")
+    return OrderResult(order_id, symbol, side, quantity, price, fallback_status, f"{fallback_message} latest_status={status}")
 
 
 def normalize_order_status(raw_order) -> str:

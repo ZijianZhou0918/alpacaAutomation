@@ -56,3 +56,18 @@ def is_executed_order_status(status: str) -> bool:
     """判断订单是否至少有真实成交；撤单/拒单不算成功。"""
     status = status.upper()
     return status in {"FILLED", "DRY_RUN"} or status.startswith("PARTIALLY_FILLED")
+
+
+def consumes_daily_buy_slot(status: str) -> bool:
+    """判断买单是否应占用每日买入名额；未确认撤单的订单按风险占用。"""
+    status = status.upper()
+    return is_executed_order_status(status) or status in {
+        "ACCEPTED",
+        "CANCEL_FAILED",
+        "CANCEL_REQUESTED",
+        "HELD",
+        "NEW",
+        "PENDING_CANCEL",
+        "PENDING_NEW",
+        "SUBMITTED",
+    }

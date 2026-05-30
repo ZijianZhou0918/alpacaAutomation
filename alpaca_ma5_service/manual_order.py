@@ -4,6 +4,7 @@ from .alpaca_connection import build_trading_connection
 from .config import Settings, build_settings
 from .errors import short_error
 from .market_data import AlpacaMarketData
+from .market_time import now_market_time
 from .models import OrderResult
 from .order_guard import wait_for_fill_or_cancel
 from .state import append_order
@@ -66,7 +67,7 @@ def place_test_order(
         )
     except Exception as exc:
         result = OrderResult("", symbol, "BUY", quantity, limit_price, "REJECTED", short_error(exc))
-    append_order(settings.output_dir, result, reason)
+    append_order(settings.output_dir, result, reason, day=now_market_time(settings).date())
 
     print(f"Order status: {result.status}", flush=True)
     print(f"Order id: {result.order_id}", flush=True)

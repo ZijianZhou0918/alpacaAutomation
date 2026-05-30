@@ -9,7 +9,7 @@ from .config import Settings, build_settings
 from .errors import short_error
 from .market_data import AlpacaMarketData
 from .market_time import next_poll_seconds, now_market_time
-from .models import MarketSnapshot, is_executed_order_status
+from .models import MarketSnapshot, consumes_daily_buy_slot, is_executed_order_status
 from .state import count_today_buy_orders
 from .strategy import evaluate_buy, evaluate_sell
 from .watchlist import read_watch_codes
@@ -40,7 +40,7 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
     # 用户要求只针对文件 watch code 盯盘，所以持仓也只检查当前文件里的代码。
     watch_set = set(watch_codes)
     positions = {symbol: pos for symbol, pos in broker.get_positions().items() if symbol in watch_set}
-    buys_used = count_today_buy_orders(settings.output_dir)
+    buys_used = count_today_buy_orders(settings.output_dir, now_et.date())
     summary = {"watch": len(watch_codes), "buy": 0, "sell": 0, "hold": 0, "errors": 0}
 
     print(f"[{now_et:%Y-%m-%d %H:%M:%S %Z}] 开始检查 watch_codes={watch_codes} | broker={broker.source_name()}")
@@ -77,6 +77,8 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
                     buys_used += 1
                     summary["buy"] += 1
                 else:
+                    if consumes_daily_buy_slot(result.status):
+                        buys_used += 1
                     summary["hold"] += 1
             else:
                 summary["hold"] += 1

@@ -101,7 +101,7 @@ NVDA
 
 默认会提交 `AAPL` 买入限价单，金额约 `$5`，限价为当前价 `* 0.9`。如果 `.env` 里是 live key，它就提交 live 限价单。
 测试下单读取当前价时也使用 Alpaca Market Data，和真实监控链路保持一致。
-订单提交后默认等待 `60` 秒，未完全成交就请求取消。测试下单参数在 `run_test_order.py` 最下面的 `run_test_limit_order(...)` 里改。
+订单提交后默认等待 `60` 秒，未完全成交就请求取消，并再查一次订单状态确认是否真的取消。测试下单参数在 `run_test_order.py` 最下面的 `run_test_limit_order(...)` 里改。
 
 ## PyCharm 点箭头运行
 
@@ -130,7 +130,7 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 - 卖出限价 = 当前价下浮 `0.3%`
 
 这些参数在 `alpaca_ma5_service/config.py` 的 `build_settings()` 里改。
-真实监控链路也会在订单提交后最多等待 `order_cancel_after_seconds=60` 秒；未完全成交时自动请求取消订单。
+真实监控链路也会在订单提交后最多等待 `order_cancel_after_seconds=60` 秒；未完全成交时自动请求取消订单。只有确认取消的订单不占用每日买入名额，未确认撤单或取消失败会按风险占用，防止继续重复买入。
 
 ## 切换 Paper / Live
 
