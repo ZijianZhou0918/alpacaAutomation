@@ -4,6 +4,7 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from .alpaca_connection import load_alpaca_credentials
+from .market_time import is_realtime_order_time
 from .models import MarketSnapshot
 from .watchlist import to_alpaca_symbol
 
@@ -103,4 +104,4 @@ def _snapshot_inputs(bars: list[_SnapshotBar], now: datetime, latest_trade_price
 
 def _requires_realtime_price(now: datetime) -> bool:
     """美股可交易时段必须使用实时成交价，不能用日线 close 冒充当前价。"""
-    return now.weekday() < 5 and time(4, 0) <= now.time() <= time(20, 0)
+    return is_realtime_order_time(now)

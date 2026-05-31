@@ -86,6 +86,7 @@ NVDA
 
 监控当前价和 MA5 也默认使用 Alpaca Market Data，不再依赖 yfinance。
 美股可交易时段内用 Alpaca `iex` 最新成交价作为当前价；日线 MA 数据继续使用 `sip`。
+真实监控只会在美东工作日 `04:00-20:00` 这个实时价窗口内提交订单；周末或深夜只打印判断，不会用日线 close 冒充当前价下单。
 
 9. 持续盯盘：
 
@@ -131,6 +132,7 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 
 这些参数在 `alpaca_ma5_service/config.py` 的 `build_settings()` 里改。
 真实监控链路也会在订单提交后最多等待 `order_cancel_after_seconds=60` 秒；未完全成交时自动请求取消订单。只有确认取消的订单不占用每日买入名额，未确认撤单或取消失败会按风险占用，防止继续重复买入。
+盘前/盘后也按 `regular_poll_seconds` 频率轮询；只有实时价窗口之外才使用 `idle_poll_seconds`。
 
 ## 切换 Paper / Live
 

@@ -3,6 +3,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from contextlib import redirect_stdout
 from io import StringIO
+from unittest.mock import patch
 
 import unittest
 
@@ -10,6 +11,7 @@ from alpaca_ma5_service.broker import AlpacaStockBroker, DryRunStockBroker
 from alpaca_ma5_service.config import Settings
 from alpaca_ma5_service.manual_order import discounted_limit_price, place_test_order, quantity_for_notional
 from alpaca_ma5_service.market_data import _SnapshotBar, _requires_realtime_price, _snapshot_inputs
+from alpaca_ma5_service.market_time import is_realtime_order_time, next_poll_seconds
 from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position
 from alpaca_ma5_service.order_guard import wait_for_fill_or_cancel
 from alpaca_ma5_service.service import print_snapshot, run_forever_once, run_once
@@ -114,6 +116,13 @@ class CancelingBuyBroker:
         """模拟买单未成交后已请求取消。"""
         self.buy_calls += 1
         return OrderResult("order-1", symbol, "BUY", 1.0, current_price, "CANCEL_REQUESTED", "not filled; cancel requested")
+
+
+class RecordingBuyBroker(CancelingBuyBroker):
+    def place_market_buy(self, symbol, notional_usd, current_price, reason):
+        """只记录买入尝试，不返回成交。"""
+        self.buy_calls += 1
+        return OrderResult("order-1", symbol, "BUY", 1.0, current_price, "FILLED", "filled")
 
 
 def make_snapshot(symbol="US.TEST", current=9.8, closes=None):
@@ -232,6 +241,21 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["hold"], 2)
             self.assertEqual(broker.buy_calls, 1)
 
+    def test_run_once_skips_orders_outside_realtime_price_window(self):
+        """周末/深夜只打印判断，不用日线收盘价提交真实订单。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.8)})
+            broker = RecordingBuyBroker()
+
+            summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 30, 10, 0))
+
+            self.assertEqual(summary["buy"], 0)
+            self.assertEqual(summary["hold"], 1)
+            self.assertEqual(broker.buy_calls, 0)
+
     def test_run_once_sells_watch_position_on_stop_loss(self):
         """单轮监控会对 watchlist 内持仓执行止损卖出。"""
         with TemporaryDirectory() as tmp:
@@ -344,10 +368,27 @@ class ServiceTests(unittest.TestCase):
             broker.client = client
             broker.paper = True
 
-            result = broker._submit_order("US.AAPL", "BUY", 1.0, 100.0)
+            with patch("alpaca_ma5_service.broker.now_market_time", return_value=datetime(2026, 5, 29, 10, 0)):
+                result = broker._submit_order("US.AAPL", "BUY", 1.0, 100.0)
 
             self.assertEqual(result.status, "CANCELED")
             self.assertEqual(client.cancelled_order_id, "pending-order-1")
+
+    def test_alpaca_broker_rejects_orders_outside_realtime_window(self):
+        """broker 自身也保护非实时价时段，避免绕过 service 后下单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            client = PendingAlpacaClient()
+            broker = AlpacaStockBroker.__new__(AlpacaStockBroker)
+            broker.settings = settings
+            broker.client = client
+            broker.paper = True
+
+            with patch("alpaca_ma5_service.broker.now_market_time", return_value=datetime(2026, 5, 30, 10, 0)):
+                result = broker._submit_order("US.AAPL", "BUY", 1.0, 100.0)
+
+            self.assertEqual(result.status, "REJECTED")
+            self.assertIsNone(client.order_data)
 
     def test_daily_buy_count_tracks_executed_and_risky_orders(self):
         """确认取消/拒单不计数，已成交和未确认撤单会占用买入名额。"""
@@ -434,6 +475,14 @@ class ServiceTests(unittest.TestCase):
         self.assertTrue(_requires_realtime_price(datetime(2026, 5, 29, 8, 0)))
         self.assertTrue(_requires_realtime_price(datetime(2026, 5, 29, 19, 59)))
         self.assertFalse(_requires_realtime_price(datetime(2026, 5, 30, 10, 0)))
+
+    def test_market_time_polling_uses_realtime_order_window(self):
+        """盘前/盘后也用常规轮询频率；周末使用空闲轮询频率。"""
+        settings = make_settings(Path("."))
+
+        self.assertTrue(is_realtime_order_time(datetime(2026, 5, 29, 8, 0)))
+        self.assertEqual(next_poll_seconds(settings, datetime(2026, 5, 29, 8, 0)), settings.regular_poll_seconds)
+        self.assertEqual(next_poll_seconds(settings, datetime(2026, 5, 30, 10, 0)), settings.idle_poll_seconds)
 
     def test_watchlist_generator_filters_strategy_rules(self):
         """选股生成器使用涨幅、上影线、均线多头和 open>MA5 筛选股票。"""

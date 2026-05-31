@@ -8,7 +8,7 @@ from .broker import AlpacaStockBroker
 from .config import Settings, build_settings
 from .errors import short_error
 from .market_data import AlpacaMarketData
-from .market_time import next_poll_seconds, now_market_time
+from .market_time import is_realtime_order_time, next_poll_seconds, now_market_time
 from .models import MarketSnapshot, consumes_daily_buy_slot, is_executed_order_status
 from .state import count_today_buy_orders
 from .strategy import evaluate_buy, evaluate_sell
@@ -42,6 +42,7 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
     positions = {symbol: pos for symbol, pos in broker.get_positions().items() if symbol in watch_set}
     buys_used = count_today_buy_orders(settings.output_dir, now_et.date())
     summary = {"watch": len(watch_codes), "buy": 0, "sell": 0, "hold": 0, "errors": 0}
+    can_order_now = is_realtime_order_time(now_et)
 
     print(f"[{now_et:%Y-%m-%d %H:%M:%S %Z}] 开始检查 watch_codes={watch_codes} | broker={broker.source_name()}")
     for symbol in watch_codes:
@@ -53,6 +54,10 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
                 signal = evaluate_sell(position, snapshot, now_et, settings)
                 print_signal(signal.reason, symbol, snapshot)
                 if signal.action == "SELL_ALL":
+                    if not can_order_now:
+                        print(f"{symbol}: 当前不在实时价下单时段，跳过真实卖单")
+                        summary["hold"] += 1
+                        continue
                     result = broker.place_market_sell(symbol, signal.quantity, snapshot.current_price, signal.reason)
                     print_order(result.status, result.message, symbol, result.quantity, result.price)
                     if order_executed(result.status):
@@ -71,6 +76,10 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
             signal = evaluate_buy(snapshot)
             print_signal(signal.reason, symbol, snapshot)
             if signal.action == "BUY":
+                if not can_order_now:
+                    print(f"{symbol}: 当前不在实时价下单时段，跳过真实买单")
+                    summary["hold"] += 1
+                    continue
                 result = broker.place_market_buy(symbol, settings.buy_notional_usd, snapshot.current_price, signal.reason)
                 print_order(result.status, result.message, symbol, result.quantity, result.price)
                 if order_executed(result.status):

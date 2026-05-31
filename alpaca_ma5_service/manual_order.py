@@ -67,7 +67,8 @@ def place_test_order(
         )
     except Exception as exc:
         result = OrderResult("", symbol, "BUY", quantity, limit_price, "REJECTED", short_error(exc))
-    append_order(settings.output_dir, result, reason, day=now_market_time(settings).date())
+    order_time = now_market_time(settings)
+    append_order(settings.output_dir, result, reason, day=order_time.date(), created_at=order_time)
 
     print(f"Order status: {result.status}", flush=True)
     print(f"Order id: {result.order_id}", flush=True)

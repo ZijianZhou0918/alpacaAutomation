@@ -7,7 +7,7 @@ from datetime import datetime
 from .alpaca_connection import build_trading_connection
 from .config import Settings
 from .errors import short_error
-from .market_time import is_regular_market_time, now_market_time
+from .market_time import is_realtime_order_time, is_regular_market_time, now_market_time
 from .models import OrderResult, Position
 from .order_guard import wait_for_fill_or_cancel
 from .state import append_order, load_positions, save_positions
@@ -51,7 +51,8 @@ class DryRunStockBroker:
         save_positions(self.settings.state_file, positions)
 
         result = OrderResult(str(uuid.uuid4()), symbol, "BUY", quantity, current_price, "DRY_RUN", "模拟买入，未提交真实订单")
-        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
+        order_time = now_market_time(self.settings)
+        append_order(self.settings.output_dir, result, reason, day=order_time.date(), created_at=order_time)
         return result
 
     def place_market_sell(self, symbol: str, quantity: float, current_price: float, reason: str) -> OrderResult:
@@ -70,7 +71,8 @@ class DryRunStockBroker:
         save_positions(self.settings.state_file, positions)
 
         result = OrderResult(str(uuid.uuid4()), symbol, "SELL", sell_qty, current_price, "DRY_RUN", "模拟卖出，未提交真实订单")
-        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
+        order_time = now_market_time(self.settings)
+        append_order(self.settings.output_dir, result, reason, day=order_time.date(), created_at=order_time)
         return result
 
 
@@ -103,7 +105,8 @@ class AlpacaStockBroker:
         if qty <= 0:
             return OrderResult("", symbol, "BUY", 0, current_price, "REJECTED", "买入金额不足")
         result = self._submit_order(symbol, "BUY", qty, current_price)
-        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
+        order_time = now_market_time(self.settings)
+        append_order(self.settings.output_dir, result, reason, day=order_time.date(), created_at=order_time)
         return result
 
     def place_market_sell(self, symbol: str, quantity: float, current_price: float, reason: str) -> OrderResult:
@@ -111,7 +114,8 @@ class AlpacaStockBroker:
         if quantity <= 0:
             return OrderResult("", symbol, "SELL", 0, current_price, "REJECTED", "没有可卖持仓")
         result = self._submit_order(symbol, "SELL", quantity, current_price)
-        append_order(self.settings.output_dir, result, reason, day=now_market_time(self.settings).date())
+        order_time = now_market_time(self.settings)
+        append_order(self.settings.output_dir, result, reason, day=order_time.date(), created_at=order_time)
         return result
 
     def _submit_order(self, symbol: str, side: str, quantity: float, current_price: float) -> OrderResult:
@@ -122,6 +126,8 @@ class AlpacaStockBroker:
         alpaca_symbol = to_alpaca_symbol(symbol)
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
         now_et = now_market_time(self.settings)
+        if not is_realtime_order_time(now_et):
+            return OrderResult("", symbol, side, quantity, current_price, "REJECTED", "当前不在实时价下单时段，已跳过真实下单")
 
         # 盘前/盘后必须使用 extended-hours limit order，常规盘用 market order。
         if is_regular_market_time(now_et):
