@@ -11,6 +11,7 @@ from .market_time import is_realtime_order_time, is_regular_market_time, now_mar
 from .models import OrderResult, Position
 from .order_guard import wait_for_fill_or_cancel
 from .state import append_order, load_positions, save_positions
+from .trade_notifications import notify_trade_order_event
 from .watchlist import normalize_symbol, to_alpaca_symbol
 
 
@@ -107,6 +108,7 @@ class AlpacaStockBroker:
         result = self._submit_order(symbol, "BUY", qty, current_price)
         order_time = now_market_time(self.settings)
         append_order(self.settings.output_dir, result, reason, day=order_time.date(), created_at=order_time)
+        self._notify_order(result, reason)
         return result
 
     def place_market_sell(self, symbol: str, quantity: float, current_price: float, reason: str) -> OrderResult:
@@ -116,6 +118,7 @@ class AlpacaStockBroker:
         result = self._submit_order(symbol, "SELL", quantity, current_price)
         order_time = now_market_time(self.settings)
         append_order(self.settings.output_dir, result, reason, day=order_time.date(), created_at=order_time)
+        self._notify_order(result, reason)
         return result
 
     def _submit_order(self, symbol: str, side: str, quantity: float, current_price: float) -> OrderResult:
@@ -180,3 +183,10 @@ class AlpacaStockBroker:
     def source_name(self) -> str:
         """返回日志中显示的 Alpaca paper/live 名称。"""
         return "alpaca-paper" if self.paper else "alpaca-live"
+
+    def _notify_order(self, result: OrderResult, reason: str) -> None:
+        """订单记录写入后发送通知；通知失败不影响交易结果。"""
+        try:
+            notify_trade_order_event(self.settings, result, reason, broker_name=self.source_name())
+        except Exception as exc:
+            print(f"OpenClaw 通知失败，不影响主流程 {result.side} {result.symbol}：{type(exc).__name__}: {exc}")

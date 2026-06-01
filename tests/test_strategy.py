@@ -1,5 +1,6 @@
 from datetime import date, datetime, time
 from pathlib import Path
+from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from contextlib import redirect_stdout
 from io import StringIO
@@ -7,6 +8,7 @@ from unittest.mock import patch
 
 import unittest
 
+from alpaca_ma5_service import openclaw_notify
 from alpaca_ma5_service.broker import AlpacaStockBroker, DryRunStockBroker
 from alpaca_ma5_service.config import Settings
 from alpaca_ma5_service.manual_order import discounted_limit_price, place_test_order, quantity_for_notional
@@ -17,6 +19,7 @@ from alpaca_ma5_service.order_guard import wait_for_fill_or_cancel
 from alpaca_ma5_service.service import print_snapshot, run_forever_once, run_once
 from alpaca_ma5_service.state import append_order, count_today_buy_orders
 from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell
+from alpaca_ma5_service.trade_notifications import render_trade_order_messages
 from alpaca_ma5_service.watchlist import read_watch_codes
 from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, request_end_datetime, screen_candidates, validate_candidates, write_watch_codes
 
@@ -151,6 +154,9 @@ def make_settings(root: Path) -> Settings:
         extended_hours_limit_buffer_pct=0.003,
         order_cancel_after_seconds=0,
         order_status_poll_seconds=1,
+        trade_notify_openclaw_enabled=False,
+        openclaw_telegram_target="",
+        openclaw_gateway_port=18789,
     )
 
 
@@ -389,6 +395,89 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(result.status, "REJECTED")
             self.assertIsNone(client.order_data)
+
+    def test_alpaca_broker_notifies_after_order_log(self):
+        """真实买入链路先写本地订单记录，再通过 OpenClaw 通知。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings = Settings(**{**settings.__dict__, "trade_notify_openclaw_enabled": True, "openclaw_telegram_target": "123456"})
+            client = FakeAlpacaClient()
+            broker = AlpacaStockBroker.__new__(AlpacaStockBroker)
+            broker.settings = settings
+            broker.client = client
+            broker.paper = True
+            events = []
+
+            def fake_notify(settings_arg, result, reason, *, broker_name):
+                events.append(("notify", result.status, count_today_buy_orders(settings.output_dir, date(2026, 5, 29)), broker_name, reason))
+
+            with patch("alpaca_ma5_service.broker.now_market_time", return_value=datetime(2026, 5, 29, 10, 0)):
+                with patch("alpaca_ma5_service.broker.notify_trade_order_event", side_effect=fake_notify):
+                    result = broker.place_market_buy("US.AAPL", 100.0, 100.0, "unit-test buy")
+
+            self.assertEqual(result.status, "FILLED")
+            self.assertEqual(events, [("notify", "FILLED", 1, "alpaca-paper", "unit-test buy")])
+
+    def test_alpaca_broker_ignores_notification_failure(self):
+        """OpenClaw 发送失败只打印，不影响下单结果返回。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings = Settings(**{**settings.__dict__, "trade_notify_openclaw_enabled": True, "openclaw_telegram_target": "123456"})
+            client = FakeAlpacaClient()
+            broker = AlpacaStockBroker.__new__(AlpacaStockBroker)
+            broker.settings = settings
+            broker.client = client
+            broker.paper = True
+
+            with patch("alpaca_ma5_service.broker.now_market_time", return_value=datetime(2026, 5, 29, 10, 0)):
+                with patch("alpaca_ma5_service.broker.notify_trade_order_event", side_effect=RuntimeError("boom")):
+                    with redirect_stdout(StringIO()):
+                        result = broker.place_market_buy("US.AAPL", 100.0, 100.0, "unit-test buy")
+
+            self.assertEqual(result.status, "FILLED")
+
+    def test_trade_notification_message_includes_sell_status(self):
+        """卖出通知消息包含方向、状态、数量和原因。"""
+        result = OrderResult("order-1", "US.AAPL", "SELL", 0.25, 100.0, "FILLED", "filled")
+
+        messages = render_trade_order_messages(result, "止损卖出", broker_name="alpaca-live")
+
+        self.assertIn("Alpaca交易卖出已成交: US.AAPL", messages)
+        self.assertTrue(any("状态: FILLED" in message for message in messages))
+        self.assertTrue(any("数量: 0.25" in message for message in messages))
+        self.assertTrue(any("原因: 止损卖出" in message for message in messages))
+
+    def test_openclaw_send_starts_gateway_before_message(self):
+        """本机 OpenClaw gateway 未就绪时，先启动 gateway 再发送消息。"""
+        settings = Settings(**{**make_settings(Path(".")).__dict__, "trade_notify_openclaw_enabled": True, "openclaw_telegram_target": "123456"})
+        calls = []
+        results = iter(
+            [
+                CompletedProcess(["probe"], 1, "", "down"),
+                CompletedProcess(["start"], 0, '{"ok":true}', ""),
+                CompletedProcess(["probe"], 0, '{"ok":true}', ""),
+                CompletedProcess(["message"], 0, '{"ok":true}', ""),
+            ]
+        )
+
+        def fake_run(args, **kwargs):
+            calls.append(args[1:])
+            return next(results)
+
+        with patch.object(openclaw_notify, "_OPENCLAW_GATEWAY_READY", False):
+            with patch.object(openclaw_notify.shutil, "which", lambda name: "openclaw.cmd" if name == "openclaw.cmd" else None):
+                with patch.object(openclaw_notify.subprocess, "run", fake_run):
+                    openclaw_notify.send_openclaw_telegram_message(settings, "hello")
+
+        self.assertEqual(
+            calls,
+            [
+                ["gateway", "probe", "--json"],
+                ["gateway", "start", "--json"],
+                ["gateway", "probe", "--json"],
+                ["message", "send", "--channel", "telegram", "--target", "123456", "--message", "hello", "--json"],
+            ],
+        )
 
     def test_daily_buy_count_tracks_executed_and_risky_orders(self):
         """确认取消/拒单不计数，已成交和未确认撤单会占用买入名额。"""

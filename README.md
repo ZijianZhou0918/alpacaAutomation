@@ -25,6 +25,8 @@
 - `alpaca_ma5_service/config.py`：运行参数都在 `build_settings()` 里改，不用命令行参数。
 - `outputs/orders_YYYY-MM-DD.csv`：订单记录。
 
+真实 Alpaca 买入/卖出订单会先写入本地 CSV，再通过本机 OpenClaw 发送 Telegram 通知；通知失败只打印错误，不会中断监控或下单流程。
+
 ## 第一次使用
 
 1. 打开 PowerShell：
@@ -45,6 +47,8 @@ py -3.14 -m venv .venv
 ```text
 APCA_API_KEY_ID=你的 API Key ID
 APCA_API_SECRET_KEY=你的 Secret Key
+TRADE_NOTIFY_OPENCLAW_ENABLED=true
+OPENCLAW_TELEGRAM_TARGET=你的 Telegram target
 ```
 
 4. 检查 Alpaca 连接：
