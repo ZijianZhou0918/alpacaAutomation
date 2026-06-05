@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 def normalize_symbol(raw: str) -> str:
-    """把用户输入的股票代码标准化成内部使用的 US.AAPL 形式。"""
+    """把 AAPL / US.AAPL 统一成内部使用的 US.AAPL。"""
     symbol = str(raw).strip().upper()
     if not symbol:
         return ""
@@ -15,7 +15,7 @@ def normalize_symbol(raw: str) -> str:
 
 
 def read_watch_codes(path: Path) -> list[str]:
-    """读取唯一盯盘文件；支持 txt/csv，返回去重后的标准代码。"""
+    """读取唯一观察池文件，返回去重后的标准代码。"""
     if not path.exists():
         return []
     if path.suffix.lower() == ".csv":
@@ -24,7 +24,7 @@ def read_watch_codes(path: Path) -> list[str]:
 
 
 def _read_text_watch_codes(path: Path) -> list[str]:
-    """读取一行一个代码的文本 watchlist，忽略空行和 # 注释。"""
+    """读取文本 watchlist，忽略空行、注释和逗号后的备注。"""
     seen: set[str] = set()
     out: list[str] = []
     for line in path.read_text(encoding="utf-8-sig").splitlines():
@@ -39,7 +39,7 @@ def _read_text_watch_codes(path: Path) -> list[str]:
 
 
 def _read_csv_watch_codes(path: Path) -> list[str]:
-    """读取 csv watchlist，优先使用 code 列，否则使用第一列。"""
+    """读取 CSV watchlist，优先使用 code 列，否则使用第一列。"""
     with path.open("r", newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
     if not rows:
@@ -49,7 +49,7 @@ def _read_csv_watch_codes(path: Path) -> list[str]:
 
 
 def to_alpaca_symbol(symbol: str) -> str:
-    """把内部 US.AAPL 形式转换成 Alpaca API 使用的 AAPL。"""
+    """把内部 US.AAPL 转成 Alpaca API 需要的 AAPL。"""
     symbol = normalize_symbol(symbol)
     if symbol.startswith("US."):
         return symbol[3:]

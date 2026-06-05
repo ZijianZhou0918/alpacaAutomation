@@ -12,7 +12,7 @@ def run_test_limit_order(
     cancel_after_seconds: int,
     order_status_poll_seconds: int,
 ) -> None:
-    """点击运行用；提交一笔真实 Alpaca BUY LIMIT 测试单。"""
+    """提交真实 Alpaca BUY LIMIT 测试单，用来验证下单和自动撤单链路。"""
     place_test_order(
         symbol=symbol,
         buy_notional_usd=buy_notional_usd,
@@ -23,11 +23,11 @@ def run_test_limit_order(
 
 
 if __name__ == "__main__":
-    # 在这里改测试下单参数；订单超时未成交会自动撤单，不用 parser.add_argument。
+    # 点箭头运行只改这里：金额很小，超时未成交会自动撤单。
     run_test_limit_order(
         symbol="NTAP",
         buy_notional_usd=5.0,
         limit_price_multiplier=0.9,
-        cancel_after_seconds=60,
+        cancel_after_seconds=300,
         order_status_poll_seconds=5,
     )

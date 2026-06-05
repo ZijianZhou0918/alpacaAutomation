@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
+from math import ceil
 from zoneinfo import ZoneInfo
 
 from .config import Settings
@@ -18,15 +19,51 @@ def now_market_time(settings: Settings) -> datetime:
 
 
 def is_regular_market_time(now_et: datetime) -> bool:
-    """判断当前美东时间是否在美股常规交易时段。"""
-    return now_et.weekday() < 5 and REGULAR_OPEN <= now_et.time() <= REGULAR_CLOSE
+    """判断是否处于美股常规盘：09:30 <= t < 16:00 ET。"""
+    return now_et.weekday() < 5 and REGULAR_OPEN <= now_et.time() < REGULAR_CLOSE
 
 
 def is_realtime_order_time(now_et: datetime) -> bool:
-    """判断当前是否有实时价可支撑监控下单；本项目不使用日线 close 去下单。"""
-    return now_et.weekday() < 5 and REALTIME_ORDER_OPEN <= now_et.time() <= REALTIME_ORDER_CLOSE
+    """判断是否处于允许使用实时价下单的窗口：04:00 <= t < 20:00 ET。"""
+    return now_et.weekday() < 5 and REALTIME_ORDER_OPEN <= now_et.time() < REALTIME_ORDER_CLOSE
+
+
+def is_premarket_time(now_et: datetime) -> bool:
+    """判断是否为盘前；本策略盘前不买入。"""
+    return now_et.weekday() < 5 and REALTIME_ORDER_OPEN <= now_et.time() < REGULAR_OPEN
+
+
+def regular_open_has_started(now_et: datetime) -> bool:
+    """常规盘开盘后，今日开盘价才有稳定含义。"""
+    return now_et.weekday() < 5 and now_et.time() >= REGULAR_OPEN
+
+
+def is_buy_order_time(now_et: datetime) -> bool:
+    """真实买入窗口：实时价窗口内，但排除盘前。"""
+    return is_realtime_order_time(now_et) and not is_premarket_time(now_et)
 
 
 def next_poll_seconds(settings: Settings, now_et: datetime) -> int:
-    """根据是否处在可下单观察时段决定下一轮轮询等待多久。"""
-    return settings.regular_poll_seconds if is_realtime_order_time(now_et) else settings.idle_poll_seconds
+    """常规盘快速轮询；其他时间动态靠近下一次 9:30 开盘。"""
+    if is_regular_market_time(now_et):
+        return settings.regular_poll_seconds
+
+    seconds_to_open = seconds_until_next_regular_market_open(now_et)
+    return max(1, min(settings.idle_poll_seconds, seconds_to_open))
+
+
+def seconds_until_next_regular_market_open(now_et: datetime) -> int:
+    """计算距离下一个工作日 09:30 ET 的秒数。"""
+    return max(0, ceil((next_regular_market_open(now_et) - now_et).total_seconds()))
+
+
+def next_regular_market_open(now_et: datetime) -> datetime:
+    """返回下一个工作日 09:30 ET。"""
+    day = now_et.date()
+    if now_et.weekday() < 5 and now_et.time() < REGULAR_OPEN:
+        return datetime.combine(day, REGULAR_OPEN, tzinfo=now_et.tzinfo)
+
+    day += timedelta(days=1)
+    while day.weekday() >= 5:
+        day += timedelta(days=1)
+    return datetime.combine(day, REGULAR_OPEN, tzinfo=now_et.tzinfo)

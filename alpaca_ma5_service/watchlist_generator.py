@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -9,11 +10,13 @@ from zoneinfo import ZoneInfo
 from .alpaca_connection import build_trading_connection, load_alpaca_credentials
 from .config import Settings, build_settings
 from .errors import short_error
+from .watchlist import read_watch_codes, to_alpaca_symbol
+from .watchlist_charts import ensure_watchlist_chart_server_running, watchlist_chart_http_url, write_watchlist_chart_page
 
 
 @dataclass(frozen=True)
 class DailyBar:
-    """策略筛选只需要的日线字段。"""
+    """选股筛选需要的最小日线字段。"""
 
     symbol: str
     date: date
@@ -25,7 +28,7 @@ class DailyBar:
 
 @dataclass(frozen=True)
 class WatchCandidate:
-    """满足选股规则后写入 watch_codes 的候选股票。"""
+    """满足选股规则并准备写入 watch_codes 的候选股票。"""
 
     symbol: str
     signal_date: date
@@ -47,7 +50,7 @@ def generate_watch_codes(
     batch_size: int = 100,
     feed: str = "sip",
 ) -> list[WatchCandidate]:
-    """只用 Alpaca 美股股票日线数据按策略生成 watch_codes.txt。"""
+    """按当前选股策略生成 watch_codes.txt，并同步刷新图表页。"""
     settings = settings or build_settings()
     now_et = datetime.now(ZoneInfo(settings.market_timezone))
     symbol_pool = symbols or load_tradable_symbols(max_symbols=max_symbols)
@@ -60,25 +63,63 @@ def generate_watch_codes(
     validate_candidates(candidates)
     write_watch_codes(settings.watch_codes_file, candidates)
     write_candidate_report(settings.output_dir, candidates)
+    chart_path = write_watchlist_chart_page(settings, candidates, bars_by_symbol)
+    ensure_watchlist_chart_server_running(settings)
+    chart_url = watchlist_chart_http_url(settings)
     print(f"生成完成：{len(candidates)} 个候选，已写入 {settings.watch_codes_file}", flush=True)
+    print(f"Watchlist chart page: {chart_path}", flush=True)
+    print(f"Watchlist chart HTTP URL: {chart_url}", flush=True)
     return candidates
 
 
 def load_tradable_symbols(max_symbols: int | None = None) -> list[str]:
-    """从 Alpaca assets 只读取 active/tradable 的美股股票池，不包含期权/crypto。"""
+    """从 Alpaca assets 中构建 active/tradable 普通股股票池。"""
     from alpaca.trading.enums import AssetClass, AssetStatus
     from alpaca.trading.requests import GetAssetsRequest
 
     client = build_trading_connection().client
-    # 明确限定 US_EQUITY，避免期权、crypto 或其他资产混入选股池。
+    # US_EQUITY 仍包含权证、单位、ETF 等，需要按资产名称再过滤一次。
     request = GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
     assets = client.get_all_assets(request)
     symbols = sorted(
         str(getattr(asset, "symbol", "")).upper()
         for asset in assets
-        if getattr(asset, "tradable", False) and getattr(asset, "symbol", "")
+        if is_common_stock_asset(asset)
     )
     return symbols[:max_symbols] if max_symbols is not None else symbols
+
+
+def refresh_watchlist_chart_from_watch_codes(
+    settings: Settings | None = None,
+    lookback_days: int = 60,
+    batch_size: int = 100,
+    feed: str = "sip",
+):
+    """以当前 watch_codes.txt 为唯一基准刷新 latest 图表页面。"""
+    settings = settings or build_settings()
+    watch_codes = read_watch_codes(settings.watch_codes_file)
+    now_et = datetime.now(ZoneInfo(settings.market_timezone))
+    symbols = [to_alpaca_symbol(code) for code in watch_codes]
+    print(f"按 watch_codes.txt 刷新图表：codes={len(watch_codes)} feed={feed}", flush=True)
+    bars_by_symbol = fetch_daily_bars(symbols, now_et, lookback_days, batch_size, feed) if symbols else {}
+    chart_path = write_watchlist_chart_page(settings, [], bars_by_symbol)
+    print(f"图表已按 watch_codes.txt 刷新：{chart_path}", flush=True)
+    return chart_path
+
+
+def is_common_stock_asset(asset) -> bool:
+    """识别普通股，排除权证、单位、优先股、ETF/基金、ADR/ADS 等。"""
+    symbol = str(getattr(asset, "symbol", "") or "").upper().strip()
+    name = str(getattr(asset, "name", "") or "").lower()
+    if not symbol or not getattr(asset, "tradable", False):
+        return False
+
+    blocked_pattern = r"\b(warrants?|rights?|units?|preferred|preference|depositary|adr|ads|etfs?|etns?|funds?|trust|notes?|bonds?|debentures?)\b"
+    if re.search(blocked_pattern, name):
+        return False
+
+    common_keywords = ("common stock", "ordinary share", "ordinary shares", "common share", "common shares")
+    return any(keyword in name for keyword in common_keywords)
 
 
 def fetch_daily_bars(
@@ -88,7 +129,7 @@ def fetch_daily_bars(
     batch_size: int,
     feed: str,
 ) -> dict[str, list[DailyBar]]:
-    """分批读取 Alpaca 美股日线 bar，失败批次打印原因后继续。"""
+    """分批读取 Alpaca 日线；单批失败只跳过该批，避免整体中断。"""
     from alpaca.data.enums import Adjustment, DataFeed
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
@@ -96,27 +137,29 @@ def fetch_daily_bars(
 
     api_key, secret_key = load_alpaca_credentials()
     client = StockHistoricalDataClient(api_key, secret_key)
-    end = request_end_datetime(now_et)
+    end = request_end_datetime(now_et, feed)
     start = end - timedelta(days=lookback_days)
     bars_by_symbol: dict[str, list[DailyBar]] = {}
 
     for batch in batched(symbols, batch_size):
         try:
-            request = StockBarsRequest(
-                symbol_or_symbols=batch,
-                timeframe=TimeFrame.Day,
-                start=start,
-                end=end,
-                limit=batch_size * lookback_days,
-                # 使用拆股调整后的日线，避免合股/拆股股票的均线和常见图表严重不一致。
-                adjustment=Adjustment.SPLIT,
-                # 全部使用 SIP 全市场日线，避免 IEX 局部成交导致均线失真。
-                feed=DataFeed(feed),
-            )
-            raw_bars = client.get_stock_bars(request).data
+            raw_bars = client.get_stock_bars(
+                _bars_request(StockBarsRequest, TimeFrame, Adjustment, DataFeed, batch, start, end, lookback_days, feed)
+            ).data
         except Exception as exc:
-            print(f"日线读取失败，跳过 {batch[0]}...{batch[-1]}：{short_error(exc)}", flush=True)
-            continue
+            if feed.lower() == "iex":
+                print(f"日线读取失败，跳过 {batch[0]}...{batch[-1]}：{short_error(exc)}", flush=True)
+                continue
+            print(f"{feed.upper()} 日线读取失败，{batch[0]}...{batch[-1]} 改用 IEX：{short_error(exc)}", flush=True)
+            fallback_end = request_end_datetime(now_et, "iex")
+            fallback_start = fallback_end - timedelta(days=lookback_days)
+            try:
+                raw_bars = client.get_stock_bars(
+                    _bars_request(StockBarsRequest, TimeFrame, Adjustment, DataFeed, batch, fallback_start, fallback_end, lookback_days, "iex")
+                ).data
+            except Exception as fallback_exc:
+                print(f"IEX 日线读取失败，跳过 {batch[0]}...{batch[-1]}：{short_error(fallback_exc)}", flush=True)
+                continue
 
         for symbol, bars in raw_bars.items():
             bars_by_symbol[symbol.upper()] = [daily_bar_from_alpaca(symbol.upper(), bar, now_et) for bar in bars]
@@ -124,8 +167,22 @@ def fetch_daily_bars(
     return bars_by_symbol
 
 
+def _bars_request(StockBarsRequest, TimeFrame, Adjustment, DataFeed, batch, start, end, lookback_days: int, feed: str):
+    """创建 Alpaca 日线请求，调用方负责 SIP 失败后的 IEX 降级。"""
+    return StockBarsRequest(
+        symbol_or_symbols=batch,
+        timeframe=TimeFrame.Day,
+        start=start,
+        end=end,
+        limit=len(batch) * lookback_days,
+        # 使用拆股调整日线，避免合股/拆股造成 MA 和图表严重失真。
+        adjustment=Adjustment.SPLIT,
+        feed=DataFeed(feed.lower()),
+    )
+
+
 def screen_candidates(bars_by_symbol: dict[str, list[DailyBar]], now_et: datetime) -> list[WatchCandidate]:
-    """对每个股票使用最近已收盘交易日作为 signal_date 做策略筛选。"""
+    """所有股票共用最近已收盘交易日作为 signal_date。"""
     signal_date = latest_completed_signal_date(bars_by_symbol, now_et)
     if signal_date is None:
         return []
@@ -139,7 +196,7 @@ def screen_candidates(bars_by_symbol: dict[str, list[DailyBar]], now_et: datetim
 
 
 def latest_completed_signal_date(bars_by_symbol: dict[str, list[DailyBar]], now_et: datetime) -> date | None:
-    """从全部日线里找最近一个已收盘交易日，作为统一 signal_date。"""
+    """从所有股票日线中找统一的最近已收盘交易日。"""
     dates = [
         bar.date
         for bars in bars_by_symbol.values()
@@ -150,7 +207,7 @@ def latest_completed_signal_date(bars_by_symbol: dict[str, list[DailyBar]], now_
 
 
 def evaluate_watch_candidate(symbol: str, bars: list[DailyBar], now_et: datetime, signal_date: date) -> WatchCandidate | None:
-    """检查单个股票是否满足涨幅、上影线、均线多头和 open>MA5。"""
+    """检查单股是否满足涨幅、MA5>MA10>MA20、open>MA5。"""
     completed = [bar for bar in sorted(bars, key=lambda item: item.date) if is_completed_bar(bar, now_et)]
     signal_index = next((index for index, bar in enumerate(completed) if bar.date == signal_date), None)
     if signal_index is None or signal_index < 19:
@@ -167,12 +224,10 @@ def evaluate_watch_candidate(symbol: str, bars: list[DailyBar], now_et: datetime
     ma20 = average(closes20)
     gain_pct = signal.close / previous.close - 1.0
 
-    # 上影线用前一日收盘价作分母，和当天涨幅口径保持一致。
+    # 上影线只保留为诊断/排序字段，不再作为入选条件。
     upper_shadow_pct = (signal.high - max(signal.open, signal.close)) / previous.close
 
     if gain_pct <= 0.20:
-        return None
-    if upper_shadow_pct <= 0.05:
         return None
     if not (ma5 > ma10 > ma20):
         return None
@@ -183,7 +238,7 @@ def evaluate_watch_candidate(symbol: str, bars: list[DailyBar], now_et: datetime
 
 
 def validate_candidates(candidates: list[WatchCandidate]) -> None:
-    """写入 watch_codes 前强制校验，防止不满足规则的股票进入监控列表。"""
+    """写入前再次校验，防止异常数据进入真实监控列表。"""
     for candidate in candidates:
         if not (candidate.ma5 > candidate.ma10 > candidate.ma20):
             raise RuntimeError(f"{candidate.symbol} 均线不满足 MA5>MA10>MA20")
@@ -191,12 +246,10 @@ def validate_candidates(candidates: list[WatchCandidate]) -> None:
             raise RuntimeError(f"{candidate.symbol} 开盘价不满足 open>MA5")
         if candidate.gain_pct <= 0.20:
             raise RuntimeError(f"{candidate.symbol} 涨幅不满足 >20%")
-        if candidate.upper_shadow_pct <= 0.05:
-            raise RuntimeError(f"{candidate.symbol} 上影线不满足 >5%")
 
 
 def is_completed_bar(bar: DailyBar, now_et: datetime) -> bool:
-    """判断日线是否已经收盘；盘后 16:15 ET 以后允许使用当天 bar。"""
+    """判断日线是否已完成；16:15 ET 后才允许使用当天日线。"""
     if bar.date < now_et.date():
         return True
     after_close_buffer = now_et.hour > 16 or (now_et.hour == 16 and now_et.minute >= 15)
@@ -204,30 +257,43 @@ def is_completed_bar(bar: DailyBar, now_et: datetime) -> bool:
 
 
 def average(values: list[float]) -> float:
-    """计算简单平均值。"""
+    """计算简单移动平均。"""
     return sum(values) / len(values)
 
 
 def daily_bar_from_alpaca(symbol: str, bar, now_et: datetime) -> DailyBar:
-    """把 alpaca-py Bar 对象转换成内部 DailyBar。"""
+    """把 alpaca-py Bar 转成内部 DailyBar。"""
     bar_date = bar.timestamp.astimezone(now_et.tzinfo).date()
     return DailyBar(symbol, bar_date, float(bar.open), float(bar.high), float(bar.low), float(bar.close))
 
 
-def request_end_datetime(now_et: datetime) -> datetime:
-    """日线请求使用日期边界，避免 SIP recent 查询限制。"""
+def request_end_datetime(now_et: datetime, feed: str = "sip") -> datetime:
+    """计算日线请求 end；SIP 需要避开 recent data 权限窗口。"""
     if now_et.weekday() < 5 and (now_et.hour > 16 or (now_et.hour == 16 and now_et.minute >= 15)):
         end_date = now_et.date() + timedelta(days=1)
     else:
         end_date = now_et.date()
-    return datetime.combine(end_date, time.min, tzinfo=now_et.tzinfo)
+    boundary = datetime.combine(end_date, time.min, tzinfo=now_et.tzinfo)
+    return stale_sip_end(now_et, boundary) if feed.lower() == "sip" else boundary
+
+
+def stale_sip_end(now_et: datetime, boundary: datetime) -> datetime:
+    """把 SIP 请求时间压到 20 分钟前，避免免费权限错误。"""
+    stale_cutoff = now_et - timedelta(minutes=20)
+    if boundary <= stale_cutoff:
+        return boundary
+    close_ready = datetime.combine(now_et.date(), time(16, 15), tzinfo=now_et.tzinfo)
+    if stale_cutoff.date() == now_et.date() and stale_cutoff < close_ready:
+        return datetime.combine(now_et.date(), time.min, tzinfo=now_et.tzinfo)
+    return stale_cutoff
 
 
 def write_watch_codes(path: Path, candidates: list[WatchCandidate]) -> None:
-    """把候选股票写成监控程序可直接读取的 watch_codes.txt。"""
+    """写出监控直接读取的 watch_codes.txt。"""
     lines = [
         "# Auto-generated by run_generate_watch_codes.py",
-        "# Rules: gain>20%, upper_shadow>5%, MA5>MA10>MA20, open>MA5",
+        "# Pool: Alpaca active/tradable common stocks only",
+        "# Rules: gain>20%, MA5>MA10>MA20, open>MA5",
     ]
     if candidates:
         lines.append(f"# signal_date={candidates[0].signal_date}")
@@ -236,7 +302,7 @@ def write_watch_codes(path: Path, candidates: list[WatchCandidate]) -> None:
 
 
 def write_candidate_report(output_dir: Path, candidates: list[WatchCandidate]) -> None:
-    """把候选股票的诊断数据写到 outputs，方便复盘为什么入选。"""
+    """写出候选诊断 CSV，方便复盘入选原因。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     day = candidates[0].signal_date if candidates else datetime.now().date()
     path = output_dir / f"watch_candidates_{day}.csv"
@@ -251,6 +317,6 @@ def write_candidate_report(output_dir: Path, candidates: list[WatchCandidate]) -
 
 
 def batched(values: list[str], size: int):
-    """把股票列表切成 API 请求批次。"""
+    """把股票列表切成 Alpaca API 批次。"""
     for start in range(0, len(values), size):
         yield values[start : start + size]

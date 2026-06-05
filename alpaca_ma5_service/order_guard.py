@@ -21,7 +21,7 @@ def wait_for_fill_or_cancel(
     poll_seconds: int = 5,
     sleep=time.sleep,
 ) -> OrderResult:
-    """提交后最多等 timeout_seconds；没完全成交就向 Alpaca 请求取消。"""
+    """提交后等待成交；超过 timeout_seconds 未完全成交就请求撤单。"""
     order_id = str(getattr(raw_order, "id", "") or "")
     status = normalize_order_status(raw_order)
     qty = float(getattr(raw_order, "qty", quantity) or quantity)
@@ -47,7 +47,7 @@ def wait_for_fill_or_cancel(
     if status in FINAL_STATUSES:
         return OrderResult(order_id, symbol, side, qty, price, status, f"Alpaca {source_name} order ended with status={status}")
 
-    # 超过 1 分钟还没完全成交，马上取消剩余订单，避免挂单继续留在市场里。
+    # 超过配置等待时间仍未完全成交，取消剩余挂单以减少市场暴露。
     filled_qty = filled_quantity(raw_order)
     detail = f" filled_qty={filled_qty}" if filled_qty > 0 else ""
     result_status = "PARTIALLY_FILLED_CANCEL_REQUESTED" if filled_qty > 0 else "CANCEL_REQUESTED"
@@ -79,7 +79,7 @@ def cancel_unfilled_order(
     failure_prefix: str | None = None,
     success_status: str = "CANCEL_REQUESTED",
 ) -> OrderResult:
-    """向 Alpaca 请求取消未成交订单；取消失败也返回结果，不抛异常。"""
+    """请求取消未成交订单；取消失败返回 CANCEL_FAILED，不中断主流程。"""
     try:
         client.cancel_order_by_id(order_id)
     except Exception as exc:
@@ -89,7 +89,7 @@ def cancel_unfilled_order(
 
 
 def cancel_confirmation_result(client, order_id: str, symbol: str, side: str, quantity: float, price: float, fallback_status: str, fallback_message: str) -> OrderResult:
-    """撤单请求发出后再查一次状态；确认取消后才返回 CANCELED。"""
+    """撤单后再查一次最终状态，区分已取消、已成交和未确认撤单。"""
     try:
         raw_order = client.get_order_by_id(order_id)
     except Exception as exc:
@@ -112,14 +112,14 @@ def cancel_confirmation_result(client, order_id: str, symbol: str, side: str, qu
 
 
 def normalize_order_status(raw_order) -> str:
-    """把 alpaca-py enum 或普通字符串统一成 FILLED/ACCEPTED 这种状态。"""
+    """把 alpaca-py enum 或字符串统一成大写状态。"""
     value = getattr(raw_order, "status", "") or ""
     value = getattr(value, "value", value)
     return str(value).split(".")[-1].upper()
 
 
 def filled_quantity(raw_order) -> float:
-    """读取已成交股数；没有部分成交信息时返回 0。"""
+    """读取已成交股数；没有字段或格式异常时返回 0。"""
     try:
         return float(getattr(raw_order, "filled_qty", 0) or 0)
     except (TypeError, ValueError):

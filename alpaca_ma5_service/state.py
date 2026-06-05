@@ -6,11 +6,12 @@ from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 
-from .models import OrderResult, Position, consumes_daily_buy_slot
+from .models import OrderResult, Position, consumes_daily_buy_slot, is_order_error_status
+from .watchlist import normalize_symbol
 
 
 def load_positions(path: Path) -> dict[str, Position]:
-    """读取本地 dry-run 持仓状态；没有文件时表示无持仓。"""
+    """读取 dry-run 本地持仓；文件不存在表示无持仓。"""
     if not path.exists():
         return {}
     data = json.loads(path.read_text(encoding="utf-8"))
@@ -18,20 +19,20 @@ def load_positions(path: Path) -> dict[str, Position]:
 
 
 def save_positions(path: Path, positions: dict[str, Position]) -> None:
-    """保存本地 dry-run 持仓状态，供下一轮测试继续使用。"""
+    """保存 dry-run 本地持仓，供下一轮继续使用。"""
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {"positions": {symbol: asdict(position) for symbol, position in positions.items()}}
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
 def orders_file(output_dir: Path, day: date | None = None) -> Path:
-    """返回某一天的订单记录 CSV 路径。"""
+    """返回指定交易日的订单记录 CSV 路径。"""
     day = day or datetime.now().date()
     return output_dir / f"orders_{day:%Y-%m-%d}.csv"
 
 
 def append_order(output_dir: Path, result: OrderResult, reason: str, day: date | None = None, created_at: datetime | None = None) -> None:
-    """把每次提交/拒单结果追加到 outputs/orders_YYYY-MM-DD.csv。"""
+    """把一次订单结果追加到 outputs/orders_YYYY-MM-DD.csv。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     created_at = created_at or datetime.now()
     path = orders_file(output_dir, day or created_at.date())
@@ -59,7 +60,7 @@ def append_order(output_dir: Path, result: OrderResult, reason: str, day: date |
 
 
 def count_today_buy_orders(output_dir: Path, day: date | None = None) -> int:
-    """统计当天占用买入名额的订单；未确认撤单也会占用，防止重复下单。"""
+    """统计占用每日买入名额的买单；拒单不占，未确认撤单占。"""
     path = orders_file(output_dir, day)
     if not path.exists():
         return 0
@@ -68,4 +69,18 @@ def count_today_buy_orders(output_dir: Path, day: date | None = None) -> int:
             1
             for row in csv.DictReader(f)
             if row.get("side") == "BUY" and consumes_daily_buy_slot(row.get("status", ""))
+        )
+
+
+def count_today_symbol_order_errors(output_dir: Path, symbol: str, day: date | None = None) -> int:
+    """统计单股当天拒单次数，用于三次后停止继续买入。"""
+    path = orders_file(output_dir, day)
+    if not path.exists():
+        return 0
+    target = normalize_symbol(symbol)
+    with path.open("r", newline="", encoding="utf-8-sig") as f:
+        return sum(
+            1
+            for row in csv.DictReader(f)
+            if normalize_symbol(row.get("symbol", "")) == target and is_order_error_status(row.get("status", ""))
         )

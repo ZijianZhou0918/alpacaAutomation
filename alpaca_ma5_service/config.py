@@ -18,6 +18,7 @@ class Settings:
     state_file: Path
     buy_notional_usd: float
     max_daily_buys: int
+    max_symbol_order_errors: int
     stop_loss_pct: float
     close_liquidation_start: time
     close_liquidation_end: time
@@ -29,9 +30,18 @@ class Settings:
     extended_hours_limit_buffer_pct: float
     order_cancel_after_seconds: int
     order_status_poll_seconds: int
+    realtime_price_source: str
+    moomoo_host: str
+    moomoo_port: int
+    moomoo_security_firm: str
+    moomoo_connect_timeout: float
+    moomoo_opend_exe_path: str
+    moomoo_opend_startup_timeout: float
     trade_notify_openclaw_enabled: bool
     openclaw_telegram_target: str
     openclaw_gateway_port: int
+    watchlist_chart_lan_host: str
+    watchlist_chart_lan_port: int
 
 
 def build_settings() -> Settings:
@@ -45,22 +55,32 @@ def build_settings() -> Settings:
         watch_codes_file=BASE_DIR / "watch_codes.txt",
         output_dir=output_dir,
         state_file=output_dir / "state.json",
-        buy_notional_usd=300.0,
+        buy_notional_usd=3500.0,
         max_daily_buys=1,
-        stop_loss_pct=-0.15,
+        max_symbol_order_errors=3,
+        stop_loss_pct=-0.10,
         close_liquidation_start=time(15, 55),
         close_liquidation_end=time(16, 0),
-        regular_poll_seconds=60,
+        regular_poll_seconds=10,
         idle_poll_seconds=300,
         market_timezone="America/New_York",
         allow_fractional_shares=True,
         extended_hours_orders_enabled=True,
         extended_hours_limit_buffer_pct=0.003,
-        order_cancel_after_seconds=60,
+        order_cancel_after_seconds=600,
         order_status_poll_seconds=5,
+        realtime_price_source=env_value(env, "REALTIME_PRICE_SOURCE") or "moomoo",
+        moomoo_host=env_value(env, "MOOMOO_HOST") or "127.0.0.1",
+        moomoo_port=int(env_value(env, "MOOMOO_PORT") or "11111"),
+        moomoo_security_firm=(env_value(env, "MOOMOO_SECURITY_FIRM") or "FUTUINC").upper(),
+        moomoo_connect_timeout=float(env_value(env, "MOOMOO_CONNECT_TIMEOUT") or "3"),
+        moomoo_opend_exe_path=env_value(env, "MOOMOO_OPEND_EXE_PATH") or r"%APPDATA%\moomoo_OpenD\moomoo_OpenD.exe",
+        moomoo_opend_startup_timeout=float(env_value(env, "MOOMOO_OPEND_STARTUP_TIMEOUT") or "30"),
         trade_notify_openclaw_enabled=env_bool(env, "TRADE_NOTIFY_OPENCLAW_ENABLED", True),
         openclaw_telegram_target=env_value(env, "OPENCLAW_TELEGRAM_TARGET") or env_value(env, "WATCHLIST_TELEGRAM_TARGET"),
         openclaw_gateway_port=int(env_value(env, "OPENCLAW_GATEWAY_PORT") or "18789"),
+        watchlist_chart_lan_host=env_value(env, "WATCHLIST_CHART_LAN_HOST"),
+        watchlist_chart_lan_port=int(env_value(env, "WATCHLIST_CHART_LAN_PORT") or "8766"),
     )
 
 

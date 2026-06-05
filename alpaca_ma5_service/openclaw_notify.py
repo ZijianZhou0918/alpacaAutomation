@@ -13,7 +13,7 @@ _OPENCLAW_GATEWAY_READY = False
 
 
 def send_openclaw_telegram_message(settings: Settings, message: str) -> None:
-    """通过本机 OpenClaw 发送一条 Telegram 消息。"""
+    """通过本机 OpenClaw gateway 发送一条 Telegram 消息。"""
     target = settings.openclaw_telegram_target.strip()
     if not target:
         raise ValueError("OPENCLAW_TELEGRAM_TARGET is empty")
@@ -45,26 +45,27 @@ def send_openclaw_telegram_message(settings: Settings, message: str) -> None:
 
 
 def safe_send_openclaw_messages(settings: Settings, messages: list[str], *, context: str) -> None:
-    """通知失败只打印，不影响下单/监控主流程。"""
+    """逐条发送通知；失败只打印，不能影响交易主流程。"""
     if not settings.trade_notify_openclaw_enabled:
         return
     try:
         for message in messages:
             send_openclaw_telegram_message(settings, message)
+        print(f"OpenClaw 通知已发送: {context}", flush=True)
     except Exception as exc:
         print(f"OpenClaw 通知失败，不影响主流程 {context}：{type(exc).__name__}: {exc}")
 
 
 def openclaw_executable() -> str:
     """定位 openclaw 命令行程序。"""
-    openclaw = shutil.which("openclaw.cmd") or shutil.which("openclaw")
+    openclaw = shutil.which("openclaw.cmd") or shutil.which("openclaw") or shutil.which("openclaw-cn.cmd") or shutil.which("openclaw-cn")
     if openclaw is None:
         raise FileNotFoundError("openclaw command not found in PATH")
     return openclaw
 
 
 def ensure_openclaw_gateway_running(settings: Settings, openclaw: str) -> None:
-    """确保 OpenClaw gateway 已启动，复用 StockAPI 的启动顺序。"""
+    """确保 OpenClaw gateway 可用；沿用 StockAPI 的 probe/start 顺序。"""
     global _OPENCLAW_GATEWAY_READY
     if _OPENCLAW_GATEWAY_READY:
         return
@@ -85,7 +86,7 @@ def ensure_openclaw_gateway_running(settings: Settings, openclaw: str) -> None:
 
 
 def openclaw_gateway_is_running(openclaw: str) -> bool:
-    """调用 openclaw gateway probe 检查本机网关是否就绪。"""
+    """用 gateway probe 判断本机网关是否 ready。"""
     result = subprocess.run(
         [openclaw, "gateway", "probe", "--json"],
         capture_output=True,
@@ -114,7 +115,7 @@ def wait_for_openclaw_gateway(openclaw: str, *, timeout_seconds: float) -> bool:
 
 
 def start_openclaw_gateway_service(openclaw: str) -> None:
-    """优先使用 OpenClaw 自带 gateway start。"""
+    """优先使用 OpenClaw 自带的 gateway start。"""
     result = subprocess.run(
         [openclaw, "gateway", "start", "--json"],
         capture_output=True,
@@ -129,7 +130,7 @@ def start_openclaw_gateway_service(openclaw: str) -> None:
 
 
 def start_openclaw_gateway_process(settings: Settings, openclaw: str) -> None:
-    """gateway start 失败时，后台拉起 gateway run。"""
+    """gateway start 失败时，后台拉起 gateway run 兜底。"""
     log_dir = settings.output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout = (log_dir / "openclaw_gateway.out.log").open("ab")
