@@ -41,6 +41,7 @@ class AlpacaMarketData:
         bars = self._daily_bars(alpaca_symbol, now)
         latest_trade_price, current_price_source, today_open, today_open_source = self._current_price(normalized_symbol, alpaca_symbol, now)
         current_price, completed_closes = _snapshot_inputs(bars, now, latest_trade_price)
+        completed_opens = _snapshot_previous_opens(bars, now)
         if not current_price_source:
             current_price_source = f"alpaca_daily_close:{self._last_daily_feed}"
         today_open, today_open_source = _usable_today_open(now, today_open, today_open_source)
@@ -58,6 +59,7 @@ class AlpacaMarketData:
             current_price_source=current_price_source,
             today_open=today_open,
             today_open_source=today_open_source,
+            previous_opens=completed_opens[-4:],
         )
 
     def _current_price(self, normalized_symbol: str, alpaca_symbol: str, now: datetime) -> tuple[float, str, float, str]:
@@ -166,6 +168,11 @@ def _snapshot_inputs(bars: list[_SnapshotBar], now: datetime, latest_trade_price
     current_bar = bars[-1]
     previous_closes = [bar.close for bar in bars if bar.date < current_bar.date and bar.close > 0]
     return current_bar.close, previous_closes
+
+
+def _snapshot_previous_opens(bars: list[_SnapshotBar], now: datetime) -> list[float]:
+    """取今日开盘 MA5 需要的前 4 个完成日开盘价。"""
+    return [bar.open for bar in bars if bar.date < now.date() and bar.open > 0]
 
 
 def _snapshot_today_open(bars: list[_SnapshotBar], now: datetime, source: str) -> tuple[float, str]:

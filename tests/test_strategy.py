@@ -6,6 +6,7 @@ from tempfile import TemporaryDirectory
 from contextlib import redirect_stdout
 from io import StringIO
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 import unittest
 
@@ -13,13 +14,13 @@ from alpaca_ma5_service import openclaw_notify
 from alpaca_ma5_service.broker import AlpacaStockBroker, DryRunStockBroker
 from alpaca_ma5_service.config import Settings
 from alpaca_ma5_service.manual_order import build_test_order_preview, discounted_limit_price, place_test_order, quantity_for_notional
-from alpaca_ma5_service.market_data import AlpacaMarketData, build_realtime_price_source, _SnapshotBar, _daily_request_end, _requires_realtime_price, _snapshot_inputs, _snapshot_today_open, _usable_today_open
+from alpaca_ma5_service.market_data import AlpacaMarketData, build_realtime_price_source, _SnapshotBar, _daily_request_end, _requires_realtime_price, _snapshot_inputs, _snapshot_previous_opens, _snapshot_today_open, _usable_today_open
 from alpaca_ma5_service.market_time import is_buy_order_time, is_premarket_time, is_realtime_order_time, is_regular_market_time, next_poll_seconds, regular_open_has_started
 from alpaca_ma5_service.moomoo_market_data import MoomooRealtimePriceSource, snapshot_open_from_row, snapshot_price_from_row
 from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position
 from alpaca_ma5_service.openclaw_trade_control import execute_trade_command, parse_trade_command, render_trade_command_response
 from alpaca_ma5_service.order_guard import wait_for_fill_or_cancel
-from alpaca_ma5_service.service import print_snapshot, run_forever_once, run_once
+from alpaca_ma5_service.service import _format_snapshot_time, print_snapshot, run_forever_once, run_once
 from alpaca_ma5_service.state import append_order, count_today_buy_orders, count_today_symbol_order_errors
 from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell
 from alpaca_ma5_service.trade_notifications import render_order_submitted_message, render_trade_order_messages
@@ -221,10 +222,11 @@ class FakeOpenClawCommandBroker:
         return OrderResult(order_id, "US.AAPL", "BUY", 1.0, 211.0, "CANCELED", "cancel requested")
 
 
-def make_snapshot(symbol="US.TEST", current=9.8, closes=None, source="unit-test", today_open=0.0, today_open_source=""):
+def make_snapshot(symbol="US.TEST", current=9.8, closes=None, source="unit-test", today_open=0.0, today_open_source="", opens=None):
     """快速生成策略测试用行情快照。"""
     closes = closes or [10.0, 10.0, 10.0, 13.0]
-    return MarketSnapshot(symbol, current, closes, datetime(2026, 5, 28, 10, 0), source, today_open, today_open_source)
+    opens = opens or []
+    return MarketSnapshot(symbol, current, closes, datetime(2026, 5, 28, 10, 0), source, today_open, today_open_source, opens)
 
 
 def make_settings(root: Path) -> Settings:
@@ -335,6 +337,15 @@ class StrategyTests(unittest.TestCase):
         self.assertEqual(signal.action, "BUY")
         self.assertGreater(signal.diagnostics["today_open_gain_pct"], 0.15)
         self.assertAlmostEqual(signal.diagnostics["open_bonus_pct"], 0.02)
+
+    def test_hold_all_day_when_today_open_is_ten_percent_below_open_ma5(self):
+        """今日开盘价低于开盘MA5 10% 时，整天不买这只股票。"""
+        signal = evaluate_buy(make_snapshot(current=10.7, today_open=8.7, opens=[10.0, 10.0, 10.0, 10.0]))
+
+        self.assertEqual(signal.action, "HOLD")
+        self.assertIn("当天不买入", signal.reason)
+        self.assertLessEqual(signal.diagnostics["today_open_vs_open_ma5_pct"], -0.10)
+        self.assertAlmostEqual(signal.diagnostics["today_open_ma5"], 9.74)
 
     def test_missing_today_open_uses_base_buy_point_only(self):
         """拿不到今日开盘价时，只使用基础买点。"""
@@ -548,6 +559,23 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["buy"], 1)
             self.assertEqual(broker.buy_calls, 1)
             self.assertAlmostEqual(broker.last_limit_price, 10.8339)
+
+    def test_run_once_skips_buy_when_today_open_breaks_open_ma5_limit(self):
+        """今日开盘价低于开盘MA5 10% 时，完整监控链路不提交买单。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            market_data = FakeMarketData({
+                "US.TEST": make_snapshot("US.TEST", current=9.8, today_open=8.7, opens=[10.0, 10.0, 10.0, 10.0]),
+            })
+            broker = RecordingBuyBroker()
+
+            summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 10, 0))
+
+            self.assertEqual(summary["buy"], 0)
+            self.assertEqual(summary["hold"], 1)
+            self.assertEqual(broker.buy_calls, 0)
 
     def test_run_once_blocks_more_buys_when_cancel_is_unconfirmed(self):
         """买单撤单未确认时，不算买成功，但会阻止本轮继续买下一只。"""
@@ -1198,16 +1226,26 @@ class ServiceTests(unittest.TestCase):
         buffer = StringIO()
 
         with redirect_stdout(buffer):
-            print_snapshot(make_snapshot("US.TEST", current=9.8, closes=[10.0, 10.0, 10.0, 11.0]))
+            print_snapshot(make_snapshot("US.TEST", current=9.8, closes=[10.0, 10.0, 10.0, 11.0], today_open=9.9, opens=[10.0, 10.0, 10.0, 10.0]))
 
         output = buffer.getvalue()
+        self.assertIn("[2026-05-28 10:00:00 PDT] US.TEST", output)
         self.assertIn("US.TEST", output)
         self.assertIn("当前价 9.8000（来源：unit-test）", output)
-        self.assertIn("今日开盘 未知（来源：未知）", output)
+        self.assertIn("今日开盘 9.9000（来源：未知）", output)
         self.assertIn("前4日收盘 [10.0000, 10.0000, 10.0000, 11.0000]", output)
         self.assertIn("今日动态MA5 10.1600", output)
+        self.assertIn("前4日开盘 [10.0000, 10.0000, 10.0000, 10.0000]", output)
+        self.assertIn("开盘MA5 9.9800", output)
+        self.assertIn("开盘偏离 -0.80%", output)
         self.assertIn("信号日涨幅 10.00%", output)
-        self.assertIn("当天开盘涨幅 未知", output)
+        self.assertIn("当天开盘涨幅 -10.00%", output)
+
+    def test_snapshot_time_displays_pacific_time(self):
+        """行情块标题时间统一显示为美西时间。"""
+        eastern = datetime(2026, 5, 28, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        self.assertEqual(_format_snapshot_time(eastern), "2026-05-28 07:00:00 PDT")
 
     def test_alpaca_snapshot_uses_last_close_when_realtime_price_missing(self):
         """没有实时价时使用最新日线收盘价。"""
@@ -1252,6 +1290,19 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(current_price, 8.70)
         self.assertEqual(previous_closes[-4:], [4.91, 4.60, 4.70, 4.68])
+
+    def test_snapshot_previous_opens_uses_completed_days_only(self):
+        """开盘MA5 只取今日之前的完成日开盘价。"""
+        bars = [
+            _SnapshotBar(date(2026, 5, 26), 4.60, 4.50),
+            _SnapshotBar(date(2026, 5, 27), 4.70, 4.55),
+            _SnapshotBar(date(2026, 5, 28), 4.68, 4.62),
+            _SnapshotBar(date(2026, 5, 29), 8.69, 8.00),
+        ]
+
+        previous_opens = _snapshot_previous_opens(bars, datetime(2026, 5, 29, 10, 0))
+
+        self.assertEqual(previous_opens, [4.50, 4.55, 4.62])
 
     def test_today_open_is_unknown_before_regular_open(self):
         """盘前还没有今日常规盘开盘价，不能使用 snapshot/open bar 的 open。"""

@@ -12,6 +12,7 @@ HIGH_SIGNAL_DAY_GAIN_PCT = 1.00
 MID_OPEN_GAIN_PCT = 0.05
 HIGH_OPEN_GAIN_PCT = 0.15
 BUY_TRIGGER_DISTANCE_PCT = 0.02
+MIN_TODAY_OPEN_VS_OPEN_MA5_PCT = -0.10
 STOP_LOSS_COMPARE_EPS = 1e-9
 
 
@@ -24,6 +25,8 @@ def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
 
     today_ma5 = snapshot.today_ma5
     signal_day_gain_pct = snapshot.signal_day_gain_pct
+    today_open_ma5 = snapshot.today_open_ma5
+    today_open_vs_open_ma5_pct = snapshot.today_open_vs_open_ma5_pct
     base_buy_point_pct = signal_day_buy_point_pct(signal_day_gain_pct)
     today_open_gain_pct = snapshot.today_open_gain_pct
     open_bonus_pct = open_gain_bonus_pct(today_open_gain_pct) if snapshot.today_open > 0 else 0.0
@@ -36,6 +39,10 @@ def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
         "current_price": snapshot.current_price,
         "today_ma5": today_ma5,
         "today_open": snapshot.today_open,
+        "today_open_ma5": today_open_ma5,
+        "today_open_vs_open_ma5_pct": today_open_vs_open_ma5_pct,
+        "min_today_open_vs_open_ma5_pct": MIN_TODAY_OPEN_VS_OPEN_MA5_PCT,
+        "prev4_open_sum": sum(snapshot.previous_opens[-4:]),
         "prev4_close_sum": sum(snapshot.previous_closes[-4:]),
         "signal_day_gain_pct": signal_day_gain_pct,
         "today_open_gain_pct": today_open_gain_pct,
@@ -47,6 +54,17 @@ def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
         "buy_trigger_price": buy_trigger_price,
         "current_vs_buy_point_pct": current_vs_buy_point_pct,
     }
+
+    # 今日开盘显著低于开盘 MA5 时，整天不买这只，避免低开破位后反复触发买点。
+    if today_open_ma5 > 0 and today_open_vs_open_ma5_pct <= MIN_TODAY_OPEN_VS_OPEN_MA5_PCT:
+        return Signal(
+            snapshot.symbol,
+            "HOLD",
+            f"今日开盘价低于开盘MA5 {_format_pct(abs(MIN_TODAY_OPEN_VS_OPEN_MA5_PCT))}，当天不买入；"
+            f"今日开盘 {snapshot.today_open:.4f}，开盘MA5 {today_open_ma5:.4f}，偏离 {_format_pct(today_open_vs_open_ma5_pct)}",
+            snapshot.current_price,
+            diagnostics=diagnostics,
+        )
 
     if base_buy_point_pct is None:
         return Signal(

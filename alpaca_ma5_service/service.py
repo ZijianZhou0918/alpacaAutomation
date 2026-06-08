@@ -15,6 +15,9 @@ from .strategy import evaluate_buy, evaluate_sell
 from .watchlist import read_watch_codes
 
 
+DISPLAY_TIMEZONE = ZoneInfo("America/Los_Angeles")
+
+
 def build_broker(settings: Settings):
     """创建真实交易通道；单测会传入 fake broker 避免触碰 Alpaca。"""
     return AlpacaStockBroker(settings)
@@ -106,7 +109,7 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
                     summary["hold"] += 1
             except Exception as exc:
                 summary["errors"] += 1
-                print(f"\n{symbol}")
+                print(f"\n[{_format_snapshot_time(now_et)}] {symbol}")
                 print(f"  错误：检查失败，已跳过。{type(exc).__name__}: {exc}")
     finally:
         if created_market_data and hasattr(market_data, "close"):
@@ -136,7 +139,7 @@ def should_skip_symbol_after_order_errors(settings: Settings, symbol: str, now_e
     error_count = count_today_symbol_order_errors(settings.output_dir, symbol, now_et.date())
     if error_count < settings.max_symbol_order_errors:
         return False
-    print(f"\n{symbol}")
+    print(f"\n[{_format_snapshot_time(now_et)}] {symbol}")
     print(f"  跳过：今日下单错误已达 {error_count}/{settings.max_symbol_order_errors} 次，不再提交该股票订单")
     return True
 
@@ -191,6 +194,8 @@ def print_signal(reason: str, symbol: str, snapshot: MarketSnapshot) -> None:
         "  判断："
         f"{reason} | 当前价 {_format_price(snapshot.current_price)} | "
         f"今日开盘 {_format_price(snapshot.today_open)} | "
+        f"开盘MA5 {_format_price(snapshot.today_open_ma5)} | "
+        f"开盘偏离 {_format_pct(snapshot.today_open_vs_open_ma5_pct) if snapshot.today_open_ma5 > 0 else '未知'} | "
         f"今日动态MA5 {_format_price(snapshot.today_ma5)} | "
         f"信号日涨幅 {_format_pct(snapshot.signal_day_gain_pct)} | "
         f"开盘涨幅 {_format_pct(snapshot.today_open_gain_pct) if snapshot.today_open > 0 else '未知'}"
@@ -200,7 +205,8 @@ def print_signal(reason: str, symbol: str, snapshot: MarketSnapshot) -> None:
 def print_snapshot(snapshot: MarketSnapshot) -> None:
     """打印参与 MA5 计算的原始行情数字。"""
     closes = ", ".join(f"{close:.4f}" for close in snapshot.previous_closes[-4:])
-    print(f"\n{snapshot.symbol}")
+    opens = ", ".join(f"{open_price:.4f}" for open_price in snapshot.previous_opens[-4:]) or "不足4日"
+    print(f"\n[{_format_snapshot_time(snapshot.as_of)}] {snapshot.symbol}")
     print(
         "  行情："
         f"当前价 {_format_price(snapshot.current_price)}（来源：{_format_source(snapshot.current_price_source)}） | "
@@ -210,6 +216,12 @@ def print_snapshot(snapshot: MarketSnapshot) -> None:
         "  均线："
         f"前4日收盘 [{closes}] + 当前价 {_format_price(snapshot.current_price)} "
         f"=> 今日动态MA5 {_format_price(snapshot.today_ma5)}"
+    )
+    print(
+        "  开盘："
+        f"前4日开盘 [{opens}] + 今日开盘 {_format_price(snapshot.today_open)} "
+        f"=> 开盘MA5 {_format_price(snapshot.today_open_ma5)} | "
+        f"开盘偏离 {_format_pct(snapshot.today_open_vs_open_ma5_pct) if snapshot.today_open_ma5 > 0 else '未知'}"
     )
     print(
         "  买点输入："
@@ -229,6 +241,11 @@ def _format_price(value: float) -> str:
 
 def _format_source(source: str) -> str:
     return source or "未知"
+
+
+def _format_snapshot_time(value: datetime) -> str:
+    display_time = value.astimezone(DISPLAY_TIMEZONE) if value.tzinfo else value.replace(tzinfo=DISPLAY_TIMEZONE)
+    return f"{display_time:%Y-%m-%d %H:%M:%S} {display_time.tzname()}"
 
 
 def _format_pct(value: float) -> str:

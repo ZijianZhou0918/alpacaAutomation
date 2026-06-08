@@ -13,6 +13,7 @@ class MarketSnapshot:
     current_price_source: str = ""
     today_open: float = 0.0
     today_open_source: str = ""
+    previous_opens: list[float] = field(default_factory=list)
 
     @property
     def today_ma5(self) -> float:
@@ -39,6 +40,21 @@ class MarketSnapshot:
         if signal_close <= 0:
             return 0.0
         return self.today_open / signal_close - 1.0
+
+    @property
+    def today_open_ma5(self) -> float:
+        """开盘 MA5 = 前 4 个完成日开盘价 + 今日常规盘开盘价。"""
+        if self.today_open <= 0 or len(self.previous_opens) < 4:
+            return 0.0
+        return (sum(self.previous_opens[-4:]) + self.today_open) / 5.0
+
+    @property
+    def today_open_vs_open_ma5_pct(self) -> float:
+        """今日开盘价相对开盘 MA5 的偏离。"""
+        today_open_ma5 = self.today_open_ma5
+        if today_open_ma5 <= 0:
+            return 0.0
+        return self.today_open / today_open_ma5 - 1.0
 
 
 @dataclass
