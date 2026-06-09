@@ -6,7 +6,7 @@ from dataclasses import asdict
 from datetime import date, datetime
 from pathlib import Path
 
-from .models import OrderResult, Position, consumes_daily_buy_slot, is_order_error_status
+from .models import OrderResult, Position, consumes_daily_buy_slot, is_executed_order_status, is_order_error_status
 from .watchlist import normalize_symbol
 
 
@@ -83,4 +83,21 @@ def count_today_symbol_order_errors(output_dir: Path, symbol: str, day: date | N
             1
             for row in csv.DictReader(f)
             if normalize_symbol(row.get("symbol", "")) == target and is_order_error_status(row.get("status", ""))
+        )
+
+
+def count_today_symbol_take_profit_half_sells(output_dir: Path, symbol: str, day: date | None = None) -> int:
+    """统计单股当天已成交的 10% 半仓止盈卖单，避免每轮重复卖一半。"""
+    path = orders_file(output_dir, day)
+    if not path.exists():
+        return 0
+    target = normalize_symbol(symbol)
+    with path.open("r", newline="", encoding="utf-8-sig") as f:
+        return sum(
+            1
+            for row in csv.DictReader(f)
+            if normalize_symbol(row.get("symbol", "")) == target
+            and row.get("side") == "SELL"
+            and "止盈一半" in row.get("reason", "")
+            and is_executed_order_status(row.get("status", ""))
         )

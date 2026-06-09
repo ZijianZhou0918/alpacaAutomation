@@ -56,6 +56,14 @@ class MarketSnapshot:
             return 0.0
         return self.today_open / today_open_ma5 - 1.0
 
+    @property
+    def today_open_vs_today_ma5_pct(self) -> float:
+        """今日开盘价相对当前动态 MA5 的偏离。"""
+        today_ma5 = self.today_ma5
+        if self.today_open <= 0 or today_ma5 <= 0:
+            return 0.0
+        return self.today_open / today_ma5 - 1.0
+
 
 @dataclass
 class Position:
@@ -78,7 +86,7 @@ class Signal:
     @property
     def should_order(self) -> bool:
         """判断该信号是否需要触发订单动作。"""
-        return self.action in {"BUY", "SELL_ALL"}
+        return self.action in {"BUY", "SELL_ALL", "SELL_HALF"}
 
 
 @dataclass(frozen=True)

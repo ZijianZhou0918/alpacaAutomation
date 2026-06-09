@@ -20,6 +20,7 @@ class Settings:
     max_daily_buys: int
     max_symbol_order_errors: int
     stop_loss_pct: float
+    take_profit_half_pct: float
     close_liquidation_start: time
     close_liquidation_end: time
     regular_poll_seconds: int
@@ -59,6 +60,7 @@ def build_settings() -> Settings:
         max_daily_buys=1,
         max_symbol_order_errors=3,
         stop_loss_pct=-0.10,
+        take_profit_half_pct=0.10,
         close_liquidation_start=time(15, 55),
         close_liquidation_end=time(16, 0),
         regular_poll_seconds=10,

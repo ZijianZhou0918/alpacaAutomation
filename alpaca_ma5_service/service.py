@@ -10,7 +10,7 @@ from .errors import short_error
 from .market_data import build_market_data as build_default_market_data
 from .market_time import is_buy_order_time, is_premarket_time, is_realtime_order_time, next_poll_seconds, now_market_time
 from .models import MarketSnapshot, Signal, consumes_daily_buy_slot, is_executed_order_status
-from .state import count_today_buy_orders, count_today_symbol_order_errors
+from .state import count_today_buy_orders, count_today_symbol_order_errors, count_today_symbol_take_profit_half_sells
 from .strategy import evaluate_buy, evaluate_sell
 from .watchlist import read_watch_codes
 
@@ -61,8 +61,16 @@ def run_once(settings: Settings | None = None, market_data=None, broker=None, no
                 print_snapshot(snapshot)
                 if position:
                     signal = evaluate_sell(position, snapshot, now_et, settings)
+                    if signal.action == "SELL_HALF" and take_profit_half_already_done(settings, symbol, now_et):
+                        signal = Signal(
+                            symbol,
+                            "HOLD",
+                            f"今日已执行过 {_format_pct(settings.take_profit_half_pct)} 半仓止盈，不重复卖出",
+                            snapshot.current_price,
+                            diagnostics=signal.diagnostics,
+                        )
                     print_signal(signal.reason, symbol, snapshot)
-                    if signal.action == "SELL_ALL":
+                    if signal.action in {"SELL_ALL", "SELL_HALF"}:
                         if not can_order_now:
                             print("  跳过：当前不在实时价下单时段，不提交真实卖单")
                             summary["hold"] += 1
@@ -142,6 +150,11 @@ def should_skip_symbol_after_order_errors(settings: Settings, symbol: str, now_e
     print(f"\n[{_format_snapshot_time(now_et)}] {symbol}")
     print(f"  跳过：今日下单错误已达 {error_count}/{settings.max_symbol_order_errors} 次，不再提交该股票订单")
     return True
+
+
+def take_profit_half_already_done(settings: Settings, symbol: str, now_et: datetime) -> bool:
+    """同一股票当天只执行一次 10% 半仓止盈。"""
+    return count_today_symbol_take_profit_half_sells(settings.output_dir, symbol, now_et.date()) > 0
 
 
 def run_forever(settings: Settings | None = None) -> None:

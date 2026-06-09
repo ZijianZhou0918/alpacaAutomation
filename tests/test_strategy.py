@@ -21,7 +21,7 @@ from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position
 from alpaca_ma5_service.openclaw_trade_control import execute_trade_command, parse_trade_command, render_trade_command_response
 from alpaca_ma5_service.order_guard import wait_for_fill_or_cancel
 from alpaca_ma5_service.service import _format_snapshot_time, print_snapshot, run_forever_once, run_once
-from alpaca_ma5_service.state import append_order, count_today_buy_orders, count_today_symbol_order_errors
+from alpaca_ma5_service.state import append_order, count_today_buy_orders, count_today_symbol_order_errors, count_today_symbol_take_profit_half_sells
 from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell
 from alpaca_ma5_service.trade_notifications import render_order_submitted_message, render_trade_order_messages
 from alpaca_ma5_service.watchlist import read_watch_codes
@@ -240,6 +240,7 @@ def make_settings(root: Path) -> Settings:
         max_daily_buys=1,
         max_symbol_order_errors=3,
         stop_loss_pct=-0.10,
+        take_profit_half_pct=0.10,
         close_liquidation_start=time(15, 55),
         close_liquidation_end=time(16, 0),
         regular_poll_seconds=10,
@@ -279,26 +280,26 @@ def make_screen_bars(symbol="TEST", signal_day=date(2026, 1, 20), passes=True):
 
 
 class StrategyTests(unittest.TestCase):
-    def test_buy_when_signal_gain_20_to_40_adds_half_percent(self):
-        """信号日涨幅 20%~40% 时，基础买点为 MA5+0.5%。"""
+    def test_buy_when_signal_gain_20_to_40_adds_one_and_half_percent(self):
+        """信号日涨幅 20%~40% 时，基础买点为 MA5+1.5%。"""
         signal = evaluate_buy(make_snapshot(current=10.7, closes=[10.0, 10.0, 10.0, 13.0]))
         self.assertEqual(signal.action, "BUY")
         self.assertAlmostEqual(signal.diagnostics["today_ma5"], 10.74)
         self.assertAlmostEqual(signal.diagnostics["signal_day_gain_pct"], 0.30)
-        self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.005)
-        self.assertAlmostEqual(signal.diagnostics["final_buy_point_pct"], 0.005)
-        self.assertAlmostEqual(signal.diagnostics["final_buy_point"], 10.7937)
+        self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.015)
+        self.assertAlmostEqual(signal.diagnostics["final_buy_point_pct"], 0.015)
+        self.assertAlmostEqual(signal.diagnostics["final_buy_point"], 10.9011)
 
     def test_hold_when_signal_gain_20_to_40_price_is_above_trigger_band(self):
         """信号日涨幅 20%~40% 时，当前价超过买点上方 2% 才不买。"""
-        signal = evaluate_buy(make_snapshot(current=11.1, closes=[10.0, 10.0, 10.0, 13.0]))
+        signal = evaluate_buy(make_snapshot(current=11.3, closes=[10.0, 10.0, 10.0, 13.0]))
 
         self.assertEqual(signal.action, "HOLD")
         self.assertIn("超过分段买点上方 2%", signal.reason)
 
     def test_buy_when_current_price_is_within_two_percent_above_buy_point(self):
         """当前价在买点上方 2% 内时触发买入，供服务层用买点价挂单。"""
-        signal = evaluate_buy(make_snapshot(current=10.9, closes=[10.0, 10.0, 10.0, 13.0]))
+        signal = evaluate_buy(make_snapshot(current=11.1, closes=[10.0, 10.0, 10.0, 13.0]))
 
         self.assertEqual(signal.action, "BUY")
         self.assertGreater(signal.diagnostics["current_vs_buy_point_pct"], 0)
@@ -306,21 +307,21 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(signal.diagnostics["buy_trigger_distance_pct"], 0.02)
         self.assertIn("上方 2% 内", signal.reason)
 
-    def test_buy_when_signal_gain_40_to_100_adds_two_percent(self):
-        """信号日涨幅 40%~100% 时，基础买点为 MA5+2%。"""
+    def test_buy_when_signal_gain_40_to_100_adds_three_percent(self):
+        """信号日涨幅 40%~100% 时，基础买点为 MA5+3%。"""
         signal = evaluate_buy(make_snapshot(current=11.5, closes=[10.0, 10.0, 10.0, 15.0]))
 
         self.assertEqual(signal.action, "BUY")
-        self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.02)
-        self.assertAlmostEqual(signal.diagnostics["final_buy_point_pct"], 0.02)
-        self.assertAlmostEqual(signal.diagnostics["final_buy_point"], 11.526, places=3)
+        self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.03)
+        self.assertAlmostEqual(signal.diagnostics["final_buy_point_pct"], 0.03)
+        self.assertAlmostEqual(signal.diagnostics["final_buy_point"], 11.639, places=3)
 
-    def test_buy_when_signal_gain_above_100_adds_three_percent(self):
-        """信号日涨幅大于 100% 时，基础买点为 MA5+3%。"""
+    def test_buy_when_signal_gain_above_100_adds_four_percent(self):
+        """信号日涨幅大于 100% 时，基础买点为 MA5+4%。"""
         signal = evaluate_buy(make_snapshot(current=13.4, closes=[10.0, 10.0, 10.0, 22.0]))
 
         self.assertEqual(signal.action, "BUY")
-        self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.03)
+        self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.04)
 
     def test_open_gain_5_to_15_adds_one_percent(self):
         """当天开盘涨幅 5%~15% 时，最终买点再加 1%。"""
@@ -347,9 +348,25 @@ class StrategyTests(unittest.TestCase):
         self.assertLessEqual(signal.diagnostics["today_open_vs_open_ma5_pct"], -0.10)
         self.assertAlmostEqual(signal.diagnostics["today_open_ma5"], 9.74)
 
+    def test_hold_when_today_open_drops_forty_percent(self):
+        """今日开盘价相对信号日收盘跌幅达到 40% 时不下单。"""
+        signal = evaluate_buy(make_snapshot(current=10.7, today_open=7.7))
+
+        self.assertEqual(signal.action, "HOLD")
+        self.assertIn("开盘跌幅", signal.reason)
+        self.assertLessEqual(signal.diagnostics["today_open_gain_pct"], -0.40)
+
+    def test_hold_when_today_open_is_below_dynamic_ma5(self):
+        """今日开盘价低于当前动态MA5 时不下单。"""
+        signal = evaluate_buy(make_snapshot(current=10.7, today_open=10.6, opens=[10.0, 10.0, 10.0, 10.0]))
+
+        self.assertEqual(signal.action, "HOLD")
+        self.assertIn("低于当前动态MA5", signal.reason)
+        self.assertLess(signal.diagnostics["today_open_vs_today_ma5_pct"], 0)
+
     def test_missing_today_open_uses_base_buy_point_only(self):
         """拿不到今日开盘价时，只使用基础买点。"""
-        signal = evaluate_buy(make_snapshot(current=11.1, closes=[10.0, 10.0, 10.0, 13.0], today_open=0.0))
+        signal = evaluate_buy(make_snapshot(current=11.3, closes=[10.0, 10.0, 10.0, 13.0], today_open=0.0))
 
         self.assertEqual(signal.action, "HOLD")
         self.assertAlmostEqual(signal.diagnostics["open_bonus_pct"], 0.0)
@@ -382,6 +399,17 @@ class StrategyTests(unittest.TestCase):
         settings = make_settings(Path("."))
         signal = evaluate_sell(position, make_snapshot(current=9.1), now, settings)
         self.assertEqual(signal.action, "HOLD")
+
+    def test_sell_half_on_10_percent_gain(self):
+        """持仓收益达到 10% 时应止盈一半。"""
+        position = Position("US.TEST", 11, 10.0, "2026-05-28T09:35:00")
+        now = datetime(2026, 5, 28, 12, 0)
+        settings = make_settings(Path("."))
+        signal = evaluate_sell(position, make_snapshot(current=11.0), now, settings)
+
+        self.assertEqual(signal.action, "SELL_HALF")
+        self.assertEqual(signal.quantity, 5.5)
+        self.assertIn("止盈一半", signal.reason)
 
     def test_sell_near_regular_close(self):
         """临近常规盘收盘时应卖出全部。"""
@@ -558,7 +586,7 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(summary["buy"], 1)
             self.assertEqual(broker.buy_calls, 1)
-            self.assertAlmostEqual(broker.last_limit_price, 10.8339)
+            self.assertAlmostEqual(broker.last_limit_price, 10.9417)
 
     def test_run_once_skips_buy_when_today_open_breaks_open_ma5_limit(self):
         """今日开盘价低于开盘MA5 10% 时，完整监控链路不提交买单。"""
@@ -568,6 +596,40 @@ class ServiceTests(unittest.TestCase):
             settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
             market_data = FakeMarketData({
                 "US.TEST": make_snapshot("US.TEST", current=9.8, today_open=8.7, opens=[10.0, 10.0, 10.0, 10.0]),
+            })
+            broker = RecordingBuyBroker()
+
+            summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 10, 0))
+
+            self.assertEqual(summary["buy"], 0)
+            self.assertEqual(summary["hold"], 1)
+            self.assertEqual(broker.buy_calls, 0)
+
+    def test_run_once_skips_buy_when_today_open_is_below_dynamic_ma5(self):
+        """今日开盘价低于当前动态MA5 时，完整监控链路不提交买单。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            market_data = FakeMarketData({
+                "US.TEST": make_snapshot("US.TEST", current=9.8, today_open=10.0, opens=[10.0, 10.0, 10.0, 10.0]),
+            })
+            broker = RecordingBuyBroker()
+
+            summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 10, 0))
+
+            self.assertEqual(summary["buy"], 0)
+            self.assertEqual(summary["hold"], 1)
+            self.assertEqual(broker.buy_calls, 0)
+
+    def test_run_once_skips_buy_when_today_open_drops_forty_percent(self):
+        """今日开盘价相对信号日收盘跌幅达到 40% 时，完整监控链路不提交买单。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            market_data = FakeMarketData({
+                "US.TEST": make_snapshot("US.TEST", current=9.8, today_open=7.7),
             })
             broker = RecordingBuyBroker()
 
@@ -712,6 +774,45 @@ class ServiceTests(unittest.TestCase):
 
             self.assertEqual(summary["sell"], 1)
             self.assertNotIn("US.TEST", broker.get_positions())
+
+    def test_run_once_sells_half_watch_position_on_take_profit(self):
+        """单轮监控会对 watchlist 内收益达到 10% 的持仓卖出一半。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            broker = DryRunStockBroker(settings)
+            broker.place_market_buy("US.TEST", 300.0, 10.0, "seed")
+            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=11.0)})
+
+            summary = run_once(
+                settings,
+                market_data=market_data,
+                broker=broker,
+                now=datetime(2026, 5, 28, 12, 0),
+            )
+
+            self.assertEqual(summary["sell"], 1)
+            self.assertAlmostEqual(broker.get_positions()["US.TEST"].quantity, 15.0)
+
+    def test_run_once_sells_half_only_once_per_day_on_take_profit(self):
+        """10% 半仓止盈当天已成交后，后续轮询不重复卖一半。"""
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            broker = DryRunStockBroker(settings)
+            broker.place_market_buy("US.TEST", 300.0, 10.0, "seed")
+            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=11.0)})
+
+            with patch("alpaca_ma5_service.broker.now_market_time", return_value=datetime(2026, 5, 28, 12, 0)):
+                first = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 12, 0))
+                second = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 12, 1))
+
+            self.assertEqual(first["sell"], 1)
+            self.assertEqual(second["sell"], 0)
+            self.assertEqual(second["hold"], 1)
+            self.assertAlmostEqual(broker.get_positions()["US.TEST"].quantity, 15.0)
 
     def test_discounted_limit_helpers(self):
         """测试下单限价和股数计算保持稳定。"""
@@ -1194,6 +1295,18 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(count_today_symbol_order_errors(output_dir, "AAPL", day), 1)
             self.assertEqual(count_today_symbol_order_errors(output_dir, "US.TSLA", day), 1)
             self.assertEqual(count_today_symbol_order_errors(output_dir, "US.AAPL", date(2026, 5, 28)), 1)
+
+    def test_take_profit_half_sell_count_tracks_executed_today_only(self):
+        """半仓止盈去重只统计当天已成交的止盈卖单。"""
+        with TemporaryDirectory() as tmp:
+            output_dir = Path(tmp) / "outputs"
+            day = date(2026, 5, 29)
+            append_order(output_dir, OrderResult("1", "US.AAPL", "SELL", 5, 11, "DRY_RUN", "sell"), "持仓收益达到 10.00%，止盈一半", day=day)
+            append_order(output_dir, OrderResult("2", "US.AAPL", "SELL", 5, 11, "REJECTED", "reject"), "持仓收益达到 10.00%，止盈一半", day=day)
+            append_order(output_dir, OrderResult("3", "US.AAPL", "SELL", 5, 11, "DRY_RUN", "sell"), "普通卖出", day=day)
+            append_order(output_dir, OrderResult("4", "US.AAPL", "SELL", 5, 11, "DRY_RUN", "old"), "持仓收益达到 10.00%，止盈一半", day=date(2026, 5, 28))
+
+            self.assertEqual(count_today_symbol_take_profit_half_sells(output_dir, "AAPL", day), 1)
 
     def test_order_log_uses_market_day_when_provided(self):
         """订单文件可按美东交易日写入，避免本地时区跨日导致买入次数错位。"""
