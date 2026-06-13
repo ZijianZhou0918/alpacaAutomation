@@ -100,10 +100,10 @@ def refresh_watchlist_chart_from_watch_codes(
     watch_codes = read_watch_codes(settings.watch_codes_file)
     now_et = datetime.now(ZoneInfo(settings.market_timezone))
     symbols = [to_alpaca_symbol(code) for code in watch_codes]
-    print(f"按 watch_codes.txt 刷新图表：codes={len(watch_codes)} feed={feed}", flush=True)
+    print(f"按 {settings.watch_codes_file.name} 刷新图表：codes={len(watch_codes)} feed={feed}", flush=True)
     bars_by_symbol = fetch_daily_bars(symbols, now_et, lookback_days, batch_size, feed) if symbols else {}
     chart_path = write_watchlist_chart_page(settings, [], bars_by_symbol)
-    print(f"图表已按 watch_codes.txt 刷新：{chart_path}", flush=True)
+    print(f"图表已按 {settings.watch_codes_file.name} 刷新：{chart_path}", flush=True)
     return chart_path
 
 

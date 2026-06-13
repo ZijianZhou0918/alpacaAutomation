@@ -56,7 +56,7 @@ def build_settings() -> Settings:
         watch_codes_file=BASE_DIR / "watch_codes.txt",
         output_dir=output_dir,
         state_file=output_dir / "state.json",
-        buy_notional_usd=3500.0,
+        buy_notional_usd=3400.0,
         max_daily_buys=1,
         max_symbol_order_errors=3,
         stop_loss_pct=-0.10,

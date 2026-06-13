@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import sys
 import urllib.parse
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from entrypoint import ensure_local_venv
 
@@ -19,9 +22,9 @@ from alpaca_ma5_service.watchlist_charts import (
 from alpaca_ma5_service.watchlist_generator import refresh_watchlist_chart_from_watch_codes
 
 
-def serve_watchlist_charts() -> None:
-    """按 watch_codes.txt 刷新并服务图表页面，同时提供 StockAPI 风格删除 API。"""
-    settings = build_settings()
+def serve_watchlist_charts(file_name: str = "watch_codes.txt") -> None:
+    """按指定观察池文件刷新并服务图表页面，同时提供 StockAPI 风格删除 API。"""
+    settings = settings_for_watch_file(build_settings(), file_name)
     chart_dir = (settings.output_dir / "watchlist_charts").resolve()
     chart_path = chart_dir / CHART_FILE
     refresh_chart_page(settings, require_existing=False)
@@ -98,6 +101,7 @@ def serve_watchlist_charts() -> None:
         allow_reuse_address = True
 
     server = ReusableThreadingHTTPServer(("0.0.0.0", port), WatchlistChartHandler)
+    print(f"Using watch codes file: {settings.watch_codes_file}", flush=True)
     print(f"Serving chart directory: {chart_dir}", flush=True)
     print(f"Local PC URL: http://127.0.0.1:{port}/{CHART_FILE}", flush=True)
     for ip in local_lan_ips():
@@ -106,7 +110,7 @@ def serve_watchlist_charts() -> None:
 
 
 def refresh_chart_page(settings, *, require_existing: bool, result: dict | None = None) -> None:
-    """服务启动和删除后都按 watch_codes.txt 刷新；失败时不影响已有页面继续访问。"""
+    """服务启动和删除后都按指定观察池文件刷新；失败时不影响已有页面继续访问。"""
     try:
         refresh_watchlist_chart_from_watch_codes(settings)
         if result is not None:
@@ -116,11 +120,21 @@ def refresh_chart_page(settings, *, require_existing: bool, result: dict | None 
         if not require_existing and not chart_path.exists():
             raise
         message = short_error(exc)
-        print(f"图表按 watch_codes.txt 刷新失败，继续使用现有页面：{message}", flush=True)
+        print(f"图表按 {settings.watch_codes_file.name} 刷新失败，继续使用现有页面：{message}", flush=True)
         if result is not None:
             result["chart_refreshed"] = False
             result["chart_refresh_error"] = message
 
 
+def settings_for_watch_file(settings, file_name: str):
+    """把 watch_codes_file 切到项目根目录下的指定文件名。"""
+    name = (file_name or "watch_codes.txt").strip()
+    path = Path(name)
+    if path.name != name or path.is_absolute():
+        raise ValueError(f"file_name 只能是项目根目录下的文件名：{file_name}")
+    return replace(settings, watch_codes_file=settings.watch_codes_file.with_name(name))
+
+
 if __name__ == "__main__":
-    serve_watchlist_charts()
+    serve_watchlist_charts("watch_codes.txt")
+    # watch_code_afterhours.txt

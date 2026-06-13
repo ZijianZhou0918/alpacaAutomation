@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 from entrypoint import ensure_local_venv
 
 ensure_local_venv()

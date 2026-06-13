@@ -11,12 +11,29 @@ from zoneinfo import ZoneInfo
 import unittest
 
 from alpaca_ma5_service import openclaw_notify
+from alpaca_ma5_service.afterhours_high_low import (
+    AfterHoursCandidate,
+    MinuteBar,
+    disable_afterhours_openclaw_output,
+    is_afterhours_buy_time,
+    is_regular_session,
+    latest_trade_price_quote,
+    load_afterhours_sell_state,
+    manage_afterhours_sells,
+    run_afterhours_high_low_strategy,
+    scan_afterhours_candidates,
+    screen_afterhours_candidates,
+    simulate_afterhours_fill,
+    submit_afterhours_limit_buys,
+    write_afterhours_candidates,
+    write_afterhours_watch_codes,
+)
 from alpaca_ma5_service.broker import AlpacaStockBroker, DryRunStockBroker
 from alpaca_ma5_service.config import Settings
 from alpaca_ma5_service.manual_order import build_test_order_preview, discounted_limit_price, place_test_order, quantity_for_notional
 from alpaca_ma5_service.market_data import AlpacaMarketData, build_realtime_price_source, _SnapshotBar, _daily_request_end, _requires_realtime_price, _snapshot_inputs, _snapshot_previous_opens, _snapshot_today_open, _usable_today_open
 from alpaca_ma5_service.market_time import is_buy_order_time, is_premarket_time, is_realtime_order_time, is_regular_market_time, next_poll_seconds, regular_open_has_started
-from alpaca_ma5_service.moomoo_market_data import MoomooRealtimePriceSource, snapshot_open_from_row, snapshot_price_from_row
+from alpaca_ma5_service.moomoo_market_data import MoomooRealtimePriceSource, snapshot_open_from_row, snapshot_price_from_row, snapshot_update_time_from_row
 from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position
 from alpaca_ma5_service.openclaw_trade_control import execute_trade_command, parse_trade_command, render_trade_command_response
 from alpaca_ma5_service.order_guard import wait_for_fill_or_cancel
@@ -27,6 +44,8 @@ from alpaca_ma5_service.trade_notifications import render_order_submitted_messag
 from alpaca_ma5_service.watchlist import read_watch_codes
 from alpaca_ma5_service.watchlist_charts import delete_watch_codes_from_watchlist, write_watchlist_chart_page
 from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, generate_watch_codes, is_common_stock_asset, refresh_watchlist_chart_from_watch_codes, request_end_datetime, screen_candidates, validate_candidates, write_watch_codes
+from run_afterhours_buy import load_afterhours_bought_symbols, run_afterhours_high_low_buyer
+from serve_watchlist_charts_lan import settings_for_watch_file
 
 
 class FakeMarketData:
@@ -39,6 +58,20 @@ class FakeMarketData:
         """模拟真实行情源的 get_snapshot 接口。"""
         self.calls.append(symbol)
         return self.snapshots[symbol]
+
+
+class FakeRealtimePriceSource:
+    def __init__(self, price=16.2, source="moomoo_snapshot:last_price", as_of=None):
+        """测试用实时价源，模拟 Moomoo OpenD 快照返回。"""
+        self.price = price
+        self.source = source
+        self.as_of = as_of
+        self.symbols = []
+
+    def latest_price_quote(self, symbol):
+        """记录查询代码，并返回带来源的价格。"""
+        self.symbols.append(symbol)
+        return type("Quote", (), {"price": self.price, "source": self.source, "as_of": self.as_of})()
 
 
 class FakeAlpacaClient:
@@ -64,6 +97,32 @@ class FakeAlpacaClient:
     def get_asset(self, symbol):
         """模拟 Alpaca asset 元数据。"""
         return type("RawAsset", (), {"symbol": symbol, "fractionable": self.fractionable})()
+
+
+class ExistingPositionAlpacaClient(FakeAlpacaClient):
+    def get_all_positions(self):
+        """模拟 Alpaca 账户里已经持有该股票。"""
+        return [type("RawPosition", (), {"symbol": "AAA", "qty": "1", "avg_entry_price": "16"})()]
+
+    def get_orders(self, filter=None):
+        """没有开放买单。"""
+        return []
+
+
+class OpenBuyOrderAlpacaClient(FakeAlpacaClient):
+    def get_all_positions(self):
+        """没有持仓。"""
+        return []
+
+    def get_orders(self, filter=None):
+        """模拟 Alpaca 里已经有同股开放买单。"""
+        return [type("RawOrder", (), {"symbol": "AAA", "side": "buy"})()]
+
+
+class FailingExposureAlpacaClient(FakeAlpacaClient):
+    def get_all_positions(self):
+        """模拟风控检查持仓失败。"""
+        raise Exception("temporary positions failure")
 
 
 class PendingAlpacaClient(FakeAlpacaClient):
@@ -236,7 +295,7 @@ def make_settings(root: Path) -> Settings:
         watch_codes_file=root / "watch_codes.txt",
         output_dir=output_dir,
         state_file=output_dir / "state.json",
-        buy_notional_usd=3500.0,
+        buy_notional_usd=3400.0,
         max_daily_buys=1,
         max_symbol_order_errors=3,
         stop_loss_pct=-0.10,
@@ -277,6 +336,12 @@ def make_screen_bars(symbol="TEST", signal_day=date(2026, 1, 20), passes=True):
     else:
         bars.append(DailyBar(symbol, signal_day, 20.0, 21.0, 19.0, 20.0))
     return bars
+
+
+def make_minute_bar(symbol="TEST", hour=9, minute=30, open=10.0, high=10.0, low=10.0, close=10.0):
+    """生成盘后策略测试用 1m bar。"""
+    timestamp = datetime(2026, 5, 28, hour, minute, tzinfo=ZoneInfo("America/New_York"))
+    return MinuteBar(symbol, timestamp, open, high, low, close)
 
 
 class StrategyTests(unittest.TestCase):
@@ -1510,10 +1575,11 @@ class ServiceTests(unittest.TestCase):
 
     def test_moomoo_snapshot_price_uses_stockapi_field_priority(self):
         """Moomoo 快照价格字段优先级沿用 StockAPI 的 last/盘前/盘后/买卖价路径。"""
-        row = {"last_price": 0, "nominal_price": 0, "pre_price": 9.62, "bid_price": 9.50, "ask_price": 9.70, "open_price": 9.10}
+        row = {"last_price": 0, "nominal_price": 0, "pre_price": 9.62, "bid_price": 9.50, "ask_price": 9.70, "open_price": 9.10, "update_time": "2026-05-28 20:15:01.123"}
 
         self.assertEqual(snapshot_price_from_row(row), 9.62)
         self.assertEqual(snapshot_open_from_row(row), 9.10)
+        self.assertEqual(snapshot_update_time_from_row(row), datetime(2026, 5, 28, 20, 15, 1, 123000))
 
     def test_moomoo_realtime_price_source_reads_snapshot(self):
         """确认 Moomoo 实时价源调用 get_market_snapshot，并读取有效价格。"""
@@ -1528,7 +1594,7 @@ class ServiceTests(unittest.TestCase):
 
             def get_market_snapshot(self, codes):
                 self.codes = codes
-                return 0, pd.DataFrame([{"code": codes[0], "last_price": 12.34, "open_price": 11.11}])
+                return 0, pd.DataFrame([{"code": codes[0], "last_price": 12.34, "open_price": 11.11, "update_time": "2026-05-28 20:15:01.123"}])
 
         source = MoomooRealtimePriceSource()
         source.mm = FakeMM()
@@ -1539,6 +1605,7 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(quote.source, "moomoo_snapshot:last_price")
         self.assertEqual(quote.today_open, 11.11)
         self.assertEqual(quote.today_open_source, "moomoo_snapshot:open_price")
+        self.assertEqual(quote.as_of, datetime(2026, 5, 28, 20, 15, 1, 123000))
         self.assertEqual(source.quote_ctx.codes, ["US.AAPL"])
 
     def test_watchlist_generator_uses_global_signal_date_and_writes_codes(self):
@@ -1606,6 +1673,29 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("US.AAA", html)
             self.assertIn("US.BBB", html)
 
+    def test_refresh_watchlist_chart_can_use_named_watch_file(self):
+        """图表服务可按文件名切换到盘后观察池。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.watch_codes_file.write_text("# signal_date=2026-01-20\nUS.DEFAULT\n", encoding="utf-8")
+            afterhours_file = settings.watch_codes_file.with_name("watch_code_afterhours.txt")
+            afterhours_file.write_text("# signal_date=2026-06-09\nUS.PAVS\nUS.MTEN\n", encoding="utf-8")
+            chart_settings = settings_for_watch_file(settings, "watch_code_afterhours.txt")
+
+            with patch(
+                "alpaca_ma5_service.watchlist_generator.fetch_daily_bars",
+                return_value={"PAVS": make_screen_bars("PAVS"), "MTEN": make_screen_bars("MTEN")},
+            ) as fake_fetch:
+                refresh_watchlist_chart_from_watch_codes(settings=chart_settings, lookback_days=60, batch_size=50, feed="sip")
+
+            args = fake_fetch.call_args.args
+            self.assertEqual(args[0], ["PAVS", "MTEN"])
+            latest = chart_settings.output_dir / "watchlist_charts" / "watch_code_daily_kline_latest.html"
+            html = latest.read_text(encoding="utf-8")
+            self.assertIn("US.PAVS", html)
+            self.assertIn("US.MTEN", html)
+            self.assertNotIn("US.DEFAULT", html)
+
     def test_watchlist_chart_delete_updates_watch_codes_file(self):
         """图表页删除按钮应复用同一个 watch_codes.txt 删除逻辑。"""
         with TemporaryDirectory() as tmp:
@@ -1659,6 +1749,562 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(request_end_datetime(friday_after_close, "iex"), datetime(2026, 5, 30, 0, 0))
         self.assertEqual(request_end_datetime(friday_ready, "sip"), datetime(2026, 5, 29, 16, 20))
         self.assertEqual(_daily_request_end(friday_ready, "sip"), datetime(2026, 5, 29, 16, 20))
+
+
+class AfterHoursHighLowTests(unittest.TestCase):
+    def test_afterhours_time_windows_block_regular_session_buy(self):
+        """盘中只能管理卖出，不允许触发盘后买入策略。"""
+        regular = datetime(2026, 5, 28, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+        afterhours = datetime(2026, 5, 28, 16, 1, tzinfo=ZoneInfo("America/New_York"))
+        late_evening = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+
+        self.assertTrue(is_regular_session(regular))
+        self.assertFalse(is_afterhours_buy_time(regular))
+        self.assertTrue(is_afterhours_buy_time(afterhours))
+        self.assertTrue(is_afterhours_buy_time(late_evening))
+
+    def test_afterhours_screen_uses_regular_high_low_ratio(self):
+        """常规盘 high/low > 2.5 才进入盘后候选，并按 close*0.8 算买入价。"""
+        bars_by_symbol = {
+            "AAA": [
+                make_minute_bar("AAA", 9, 30, open=10.0, high=12.0, low=10.0, close=11.0),
+                make_minute_bar("AAA", 15, 59, open=19.0, high=26.0, low=18.0, close=20.0),
+            ],
+            "BBB": [
+                make_minute_bar("BBB", 9, 30, open=10.0, high=12.0, low=10.0, close=11.0),
+                make_minute_bar("BBB", 15, 59, open=15.0, high=24.0, low=15.0, close=18.0),
+            ],
+        }
+
+        candidates = screen_afterhours_candidates(bars_by_symbol, date(2026, 5, 28))
+
+        self.assertEqual([candidate.symbol for candidate in candidates], ["AAA"])
+        self.assertEqual(candidates[0].regular_high, 26.0)
+        self.assertEqual(candidates[0].regular_low, 10.0)
+        self.assertEqual(candidates[0].buy_limit, 16.0)
+        self.assertEqual(candidates[0].target_sell_price, 17.6)
+
+    def test_afterhours_fill_prefers_open_then_limit(self):
+        """盘后 1m bar 成交：open 先触发用 open，否则 low 触发用限价。"""
+        candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 21.0, 10.0, 20.0, 2.1, 16.0, 17.6)
+
+        open_fill = simulate_afterhours_fill(candidate, [make_minute_bar("AAA", 16, 1, open=15.5, high=16.5, low=15.0, close=16.0)])
+        limit_fill = simulate_afterhours_fill(candidate, [make_minute_bar("AAA", 16, 2, open=16.8, high=17.0, low=15.8, close=16.2)])
+        no_fill = simulate_afterhours_fill(candidate, [make_minute_bar("AAA", 16, 3, open=16.8, high=17.0, low=16.1, close=16.5)])
+
+        self.assertEqual(open_fill.status, "FILLED_OPEN")
+        self.assertEqual(open_fill.fill_price, 15.5)
+        self.assertEqual(limit_fill.status, "FILLED_LIMIT")
+        self.assertEqual(limit_fill.fill_price, 16.0)
+        self.assertEqual(no_fill.status, "NOT_TOUCHED")
+
+    def test_afterhours_candidate_file_includes_signal_date(self):
+        """候选文件名和内容都带交易日期，方便复盘当天筛选结果。"""
+        with TemporaryDirectory() as tmp:
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 21.0, 10.0, 20.0, 2.1, 16.0, 17.6)
+
+            path = write_afterhours_candidates(Path(tmp), [candidate], candidate.signal_date)
+
+            self.assertEqual(path.name, "afterhours_candidates_2026-05-28.csv")
+            content = path.read_text(encoding="utf-8-sig")
+            self.assertIn("signal_date", content)
+            self.assertIn("2026-05-28", content)
+            self.assertIn("AAA", content)
+
+    def test_afterhours_watch_code_file_uses_us_prefix(self):
+        """盘后观察池写到项目根目录专用 txt，并沿用 US. 前缀。"""
+        with TemporaryDirectory() as tmp:
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 21.0, 10.0, 20.0, 2.1, 16.0, 17.6)
+
+            path = write_afterhours_watch_codes(Path(tmp) / "watch_code_afterhours.txt", [candidate], candidate.signal_date)
+
+            self.assertEqual(path.name, "watch_code_afterhours.txt")
+            self.assertEqual(read_watch_codes(path), ["US.AAA"])
+            self.assertIn("signal_date=2026-05-28", path.read_text(encoding="utf-8"))
+
+    def test_afterhours_scan_reuses_latest_watch_file_and_candidate_csv(self):
+        """当天 txt 和候选 CSV 都有效时，直接复用缓存，不重新拉常规盘分钟线。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 5, 28)
+            now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+            candidate = AfterHoursCandidate("AAA", signal_day, 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            write_afterhours_candidates(settings.output_dir, [candidate], signal_day)
+            write_afterhours_watch_codes(settings.watch_codes_file.with_name("watch_code_afterhours.txt"), [candidate], signal_day, 2.5)
+
+            with patch("alpaca_ma5_service.afterhours_high_low.load_afterhours_symbol_pool") as fake_pool:
+                with patch("alpaca_ma5_service.afterhours_high_low.fetch_minute_bars") as fake_fetch:
+                    cached = scan_afterhours_candidates(settings, now_et, range_ratio_threshold=2.5)
+
+            self.assertEqual(len(cached), 1)
+            self.assertEqual(cached[0].symbol, "US.AAA")
+            self.assertEqual(cached[0].signal_date, signal_day)
+            self.assertEqual(cached[0].buy_limit, 16.0)
+            fake_pool.assert_not_called()
+            fake_fetch.assert_not_called()
+
+    def test_afterhours_scan_regenerates_when_watch_file_is_stale(self):
+        """txt 不是当天时不能复用旧缓存，需要重新扫描当天常规盘分钟线。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            old_day = date(2026, 5, 27)
+            signal_day = date(2026, 5, 28)
+            now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+            old_candidate = AfterHoursCandidate("AAA", old_day, 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            write_afterhours_candidates(settings.output_dir, [old_candidate], old_day)
+            write_afterhours_watch_codes(settings.watch_codes_file.with_name("watch_code_afterhours.txt"), [old_candidate], old_day, 2.5)
+            bars = {
+                "AAA": [
+                    make_minute_bar("AAA", 9, 30, open=10.0, high=12.0, low=10.0, close=11.0),
+                    make_minute_bar("AAA", 15, 59, open=19.0, high=26.0, low=18.0, close=20.0),
+                ]
+            }
+
+            with patch("alpaca_ma5_service.afterhours_high_low.load_afterhours_symbol_pool", return_value=["AAA"]) as fake_pool:
+                with patch("alpaca_ma5_service.afterhours_high_low.fetch_minute_bars", return_value=bars) as fake_fetch:
+                    candidates = scan_afterhours_candidates(settings, now_et, range_ratio_threshold=2.5)
+
+            self.assertEqual([candidate.symbol for candidate in candidates], ["AAA"])
+            fake_pool.assert_called_once()
+            fake_fetch.assert_called_once()
+            self.assertTrue((settings.output_dir / "afterhours_candidates_2026-05-28.csv").exists())
+
+    def test_afterhours_scan_ignores_cache_for_custom_symbols(self):
+        """手动传入股票列表时不复用全量缓存，避免调试扫描被旧 txt 干扰。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 5, 28)
+            now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+            cached_candidate = AfterHoursCandidate("AAA", signal_day, 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            write_afterhours_candidates(settings.output_dir, [cached_candidate], signal_day)
+            write_afterhours_watch_codes(settings.watch_codes_file.with_name("watch_code_afterhours.txt"), [cached_candidate], signal_day, 2.5)
+            bars = {
+                "BBB": [
+                    make_minute_bar("BBB", 9, 30, open=10.0, high=12.0, low=10.0, close=11.0),
+                    make_minute_bar("BBB", 15, 59, open=19.0, high=26.0, low=18.0, close=20.0),
+                ]
+            }
+
+            with patch("alpaca_ma5_service.afterhours_high_low.fetch_minute_bars", return_value=bars) as fake_fetch:
+                candidates = scan_afterhours_candidates(settings, now_et, symbols=["BBB"], range_ratio_threshold=2.5)
+
+            self.assertEqual([candidate.symbol for candidate in candidates], ["BBB"])
+            fake_fetch.assert_called_once()
+
+    def test_afterhours_real_orders_require_paper_by_default(self):
+        """盘后真实下单默认必须是 Paper 账户，防止误用 live key。"""
+        candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+
+        class FakeConnection:
+            paper = False
+            client = object()
+
+        with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=FakeConnection()):
+            with self.assertRaisesRegex(RuntimeError, "只允许 Paper"):
+                submit_afterhours_limit_buys(
+                    make_settings(Path(".")),
+                    [candidate],
+                    3400.0,
+                    datetime(2026, 5, 28, 16, 1, tzinfo=ZoneInfo("America/New_York")),
+                    require_paper=True,
+                )
+
+    def test_afterhours_order_price_uses_moomoo_source(self):
+        """盘后订单判断默认用 Moomoo OpenD 实时价，并保留具体价格来源。"""
+        settings = make_settings(Path("."))
+        price_source = FakeRealtimePriceSource(price=16.2)
+
+        price, source = latest_trade_price_quote("AAA", settings, price_source=price_source)
+
+        self.assertEqual(price, 16.2)
+        self.assertEqual(source, "moomoo_snapshot:last_price")
+        self.assertEqual(price_source.symbols, ["US.AAA"])
+
+    def test_afterhours_order_waits_for_drop_signal_before_submit(self):
+        """当前跌幅未超过 18% 时不提交订单，只等待下一次信号。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            client = FakeAlpacaClient()
+            connection = type("FakeConnection", (), {"paper": True, "client": client})()
+            output = StringIO()
+
+            with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=connection):
+                with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote", return_value=(16.6, "moomoo_snapshot:last_price")):
+                    with patch("alpaca_ma5_service.afterhours_high_low.append_order") as fake_append:
+                        with redirect_stdout(output):
+                            results = submit_afterhours_limit_buys(
+                                settings,
+                                [candidate],
+                                3400.0,
+                                datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                            )
+
+            self.assertEqual(results[0].status, "NO_SIGNAL")
+            self.assertIsNone(client.order_data)
+            self.assertIn("股票", output.getvalue())
+            self.assertIn("US.AAA", output.getvalue())
+            self.assertIn("等待信号", output.getvalue())
+            self.assertNotIn("[等待信号] US.AAA", output.getvalue())
+            fake_append.assert_not_called()
+
+    def test_afterhours_order_skips_previous_day_moomoo_quote(self):
+        """Moomoo 快照日期不是当前交易日时，即使价格触发也不提交订单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            client = FakeAlpacaClient()
+            connection = type("FakeConnection", (), {"paper": True, "client": client})()
+            price_source = FakeRealtimePriceSource(price=16.0, as_of=datetime(2026, 5, 27, 20, 15))
+
+            with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=connection):
+                with patch("alpaca_ma5_service.afterhours_high_low.build_afterhours_price_source", return_value=price_source):
+                    with patch("alpaca_ma5_service.afterhours_high_low.append_order") as fake_append:
+                        results = submit_afterhours_limit_buys(
+                            settings,
+                            [candidate],
+                            3400.0,
+                            datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                        )
+
+            self.assertEqual(results[0].status, "NO_SIGNAL")
+            self.assertIsNone(client.order_data)
+            fake_append.assert_not_called()
+
+    def test_afterhours_order_cancels_after_five_minutes_when_not_filled(self):
+        """当前跌幅超过 18% 时才提交订单，并使用 300 秒未成交撤单保护。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            client = FakeAlpacaClient(fractionable=False)
+            expected = OrderResult("order-1", "US.AAA", "BUY", 212.0, 16.0, "CANCELED", "not filled; cancel requested")
+            connection = type("FakeConnection", (), {"paper": True, "client": client})()
+
+            with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=connection):
+                with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote", return_value=(16.2, "moomoo_snapshot:last_price")):
+                    with patch("alpaca_ma5_service.afterhours_high_low.wait_for_fill_or_cancel", return_value=expected) as fake_wait:
+                        with patch("alpaca_ma5_service.afterhours_high_low.append_order") as fake_append:
+                            with patch("alpaca_ma5_service.trade_notifications.safe_send_openclaw_messages") as fake_openclaw:
+                                results = submit_afterhours_limit_buys(
+                                    settings,
+                                    [candidate],
+                                    3400.0,
+                                    datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                                    timeout_seconds=300,
+                                    poll_seconds=5,
+                                )
+
+            self.assertEqual(results, [expected])
+            self.assertEqual(float(client.order_data.limit_price), 16.0)
+            self.assertEqual(float(client.order_data.qty), 212.0)
+            self.assertEqual(fake_wait.call_args.kwargs["timeout_seconds"], 300)
+            self.assertEqual(fake_wait.call_args.kwargs["poll_seconds"], 5)
+            self.assertEqual(fake_append.call_count, 2)
+            fake_openclaw.assert_not_called()
+
+    def test_afterhours_order_skips_when_local_buy_already_filled_today(self):
+        """本地订单记录显示今天已经买成时，即使重启或手动调用也不重复下单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 5, 28)
+            candidate = AfterHoursCandidate("AAA", signal_day, 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            client = FakeAlpacaClient()
+            connection = type("FakeConnection", (), {"paper": True, "client": client})()
+            append_order(
+                settings.output_dir,
+                OrderResult("fill-1", "US.AAA", "BUY", 1.0, 16.0, "FILLED", "filled"),
+                "盘后 high/low>2.5 买入；range=2.6",
+                day=signal_day,
+            )
+
+            with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=connection):
+                with patch("alpaca_ma5_service.afterhours_high_low.build_afterhours_price_source", side_effect=AssertionError("price source should not start")):
+                    with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote") as fake_price:
+                        results = submit_afterhours_limit_buys(
+                            settings,
+                            [candidate],
+                            3400.0,
+                            datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                        )
+
+            self.assertEqual(results[0].status, "ALREADY_BOUGHT_TODAY")
+            self.assertIsNone(client.order_data)
+            fake_price.assert_not_called()
+
+    def test_afterhours_order_skips_when_alpaca_position_exists(self):
+        """Alpaca 当前已有持仓时跳过买入，防止脚本多开或本地记录丢失后重复买。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            client = ExistingPositionAlpacaClient()
+            connection = type("FakeConnection", (), {"paper": True, "client": client})()
+
+            with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=connection):
+                with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote") as fake_price:
+                    results = submit_afterhours_limit_buys(
+                        settings,
+                        [candidate],
+                        3400.0,
+                        datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                    )
+
+            self.assertEqual(results[0].status, "EXISTING_POSITION")
+            self.assertIsNone(client.order_data)
+            fake_price.assert_not_called()
+
+    def test_afterhours_order_skips_when_open_buy_order_exists(self):
+        """Alpaca 当前已有开放买单时跳过买入，避免同一股票挂出多个买单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            client = OpenBuyOrderAlpacaClient()
+            connection = type("FakeConnection", (), {"paper": True, "client": client})()
+
+            with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=connection):
+                with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote") as fake_price:
+                    results = submit_afterhours_limit_buys(
+                        settings,
+                        [candidate],
+                        3400.0,
+                        datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                    )
+
+            self.assertEqual(results[0].status, "OPEN_BUY_ORDER")
+            self.assertIsNone(client.order_data)
+            fake_price.assert_not_called()
+
+    def test_afterhours_order_blocks_when_exposure_check_fails(self):
+        """无法确认 Alpaca 持仓/开放买单时，本轮暂停买入而不是冒险提交订单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            client = FailingExposureAlpacaClient()
+            connection = type("FakeConnection", (), {"paper": True, "client": client})()
+
+            with patch("alpaca_ma5_service.afterhours_high_low.build_trading_connection", return_value=connection):
+                with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote") as fake_price:
+                    results = submit_afterhours_limit_buys(
+                        settings,
+                        [candidate],
+                        3400.0,
+                        datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                    )
+
+            self.assertEqual(results[0].status, "RISK_BLOCKED")
+            self.assertIsNone(client.order_data)
+            fake_price.assert_not_called()
+
+    def test_afterhours_settings_disable_openclaw_output(self):
+        """盘后策略内部关闭 OpenClaw 输出，但不修改原始 settings。"""
+        settings = make_settings(Path("."))
+        settings = Settings(**{**settings.__dict__, "trade_notify_openclaw_enabled": True})
+
+        afterhours_settings = disable_afterhours_openclaw_output(settings)
+
+        self.assertTrue(settings.trade_notify_openclaw_enabled)
+        self.assertFalse(afterhours_settings.trade_notify_openclaw_enabled)
+
+    def test_afterhours_entry_accepts_require_paper_parameter(self):
+        """入口函数把是否强制 Paper 下单放在参数里。"""
+        settings = make_settings(Path("."))
+        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+
+        with patch("run_afterhours_buy.build_settings", return_value=settings):
+            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
+                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]):
+                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[]) as fake_submit:
+                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]):
+                            run_afterhours_high_low_buyer(require_paper=False, max_loops=1, sleep=lambda seconds: None, now_provider=lambda: now_et)
+
+        self.assertFalse(fake_submit.call_args.kwargs["require_paper"])
+        self.assertEqual(fake_submit.call_args.args[2], 3400.0)
+        self.assertEqual(fake_submit.call_args.kwargs["drop_signal_threshold"], 0.18)
+        self.assertEqual(fake_submit.call_args.kwargs["timeout_seconds"], 300)
+
+    def test_afterhours_entry_keeps_monitoring_after_daily_scan(self):
+        """入口默认是持续监控：当天只扫一次池，下一轮复用候选池检查买入信号。"""
+        settings = make_settings(Path("."))
+        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+        result = OrderResult("", "US.AAA", "BUY", 0, 16.0, "NO_SIGNAL", "waiting")
+
+        with patch("run_afterhours_buy.build_settings", return_value=settings):
+            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
+                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]) as fake_scan:
+                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[result]) as fake_submit:
+                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]) as fake_sells:
+                            run_afterhours_high_low_buyer(require_paper=True, max_loops=2, sleep=lambda seconds: None, now_provider=lambda: now_et)
+
+        fake_scan.assert_called_once()
+        self.assertEqual(fake_submit.call_count, 2)
+        self.assertEqual(fake_submit.call_args.args[1], [candidate])
+        self.assertEqual(fake_sells.call_count, 2)
+
+    def test_afterhours_monitor_keeps_watching_after_canceled_order(self):
+        """撤单不算买入次数，下一轮继续等待同一只股票的新信号。"""
+        settings = make_settings(Path("."))
+        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+        canceled = OrderResult("order-1", "US.AAA", "BUY", 218.0, 16.0, "CANCELED", "not filled; cancel requested")
+
+        with patch("run_afterhours_buy.build_settings", return_value=settings):
+            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
+                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]):
+                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[canceled]) as fake_submit:
+                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]):
+                            run_afterhours_high_low_buyer(require_paper=True, max_loops=2, sleep=lambda seconds: None, now_provider=lambda: now_et)
+
+        self.assertEqual(fake_submit.call_count, 2)
+
+    def test_afterhours_monitor_skips_symbol_after_filled_buy(self):
+        """每只股票盘后最多买成一次；成交后不再重复买同一只。"""
+        settings = make_settings(Path("."))
+        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+        filled = OrderResult("order-1", "US.AAA", "BUY", 218.0, 16.0, "FILLED", "filled")
+
+        with patch("run_afterhours_buy.build_settings", return_value=settings):
+            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
+                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]):
+                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[filled]) as fake_submit:
+                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]):
+                            run_afterhours_high_low_buyer(require_paper=True, max_loops=2, sleep=lambda seconds: None, now_provider=lambda: now_et)
+
+        fake_submit.assert_called_once()
+
+    def test_afterhours_restore_bought_symbols_ignores_canceled_orders(self):
+        """重启恢复时撤单不算；只有实际成交的盘后买单会跳过。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 5, 28)
+            append_order(
+                settings.output_dir,
+                OrderResult("cancel-1", "US.AAA", "BUY", 1.0, 16.0, "CANCELED", "not filled"),
+                "盘后 high/low>2.5 买入；range=2.6",
+                day=signal_day,
+                created_at=datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+            )
+            append_order(
+                settings.output_dir,
+                OrderResult("fill-1", "US.BBB", "BUY", 1.0, 16.0, "FILLED", "filled"),
+                "盘后 high/low>2.5 买入；range=2.6",
+                day=signal_day,
+                created_at=datetime(2026, 5, 28, 20, 16, tzinfo=ZoneInfo("America/New_York")),
+            )
+
+            symbols = load_afterhours_bought_symbols(settings, signal_day)
+
+        self.assertEqual(symbols, {"US.BBB"})
+
+    def test_afterhours_sell_skips_when_open_sell_order_exists(self):
+        """Alpaca 当前已有开放卖单时，不重复提交卖出。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 5, 28)
+            candidate = AfterHoursCandidate("AAA", signal_day, 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            write_afterhours_candidates(settings.output_dir, [candidate], signal_day)
+            append_order(
+                settings.output_dir,
+                OrderResult("buy-1", "US.AAA", "BUY", 10.0, 16.0, "FILLED", "filled"),
+                "盘后 high/low>2.5 买入；range=2.6",
+                day=signal_day,
+            )
+            client = type("OpenSellClient", (), {"get_orders": lambda self, filter=None: [type("RawOrder", (), {"symbol": "AAA", "side": "sell"})()]})()
+
+            class Broker:
+                def __init__(self, settings_arg):
+                    self.client = client
+                    self.sell_calls = 0
+
+                def get_positions(self):
+                    return {"US.AAA": Position("US.AAA", 10.0, 16.0, "alpaca")}
+
+                def place_market_sell(self, symbol, quantity, current_price, reason):
+                    self.sell_calls += 1
+                    return OrderResult("sell-1", symbol, "SELL", quantity, current_price, "FILLED", "filled")
+
+            with patch("alpaca_ma5_service.broker.AlpacaStockBroker", Broker):
+                with patch("alpaca_ma5_service.afterhours_high_low.build_afterhours_price_source", return_value=None):
+                    with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote") as fake_price:
+                        results = manage_afterhours_sells(
+                            settings,
+                            datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                            dry_run=False,
+                        )
+
+            self.assertEqual(results, [])
+            fake_price.assert_not_called()
+
+    def test_afterhours_sell_ignores_candidate_without_strategy_buy_record(self):
+        """候选池里有股票但本策略没有真实买成记录时，不能卖掉账户原有持仓。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 5, 28)
+            candidate = AfterHoursCandidate("AAA", signal_day, 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            write_afterhours_candidates(settings.output_dir, [candidate], signal_day)
+
+            with patch("alpaca_ma5_service.broker.AlpacaStockBroker", side_effect=AssertionError("broker should not start")):
+                with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote") as fake_price:
+                    results = manage_afterhours_sells(
+                        settings,
+                        datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                        dry_run=False,
+                    )
+
+            self.assertEqual(results, [])
+            fake_price.assert_not_called()
+
+    def test_afterhours_sell_does_not_mark_half_sold_when_canceled(self):
+        """卖出半仓被取消时不写入 half_sold，下一轮还能继续检查卖出信号。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 5, 28)
+            candidate = AfterHoursCandidate("AAA", signal_day, 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+            write_afterhours_candidates(settings.output_dir, [candidate], signal_day)
+            append_order(
+                settings.output_dir,
+                OrderResult("buy-1", "US.AAA", "BUY", 10.0, 16.0, "FILLED", "filled"),
+                "盘后 high/low>2.5 买入；range=2.6",
+                day=signal_day,
+            )
+            client = type("NoOpenOrdersClient", (), {"get_orders": lambda self, filter=None: []})()
+
+            class Broker:
+                def __init__(self, settings_arg):
+                    self.client = client
+
+                def get_positions(self):
+                    return {"US.AAA": Position("US.AAA", 10.0, 16.0, "alpaca")}
+
+                def place_market_sell(self, symbol, quantity, current_price, reason):
+                    return OrderResult("sell-1", symbol, "SELL", quantity, current_price, "CANCELED", "not filled")
+
+            with patch("alpaca_ma5_service.broker.AlpacaStockBroker", Broker):
+                with patch("alpaca_ma5_service.afterhours_high_low.build_afterhours_price_source", return_value=None):
+                    with patch("alpaca_ma5_service.afterhours_high_low.latest_trade_price_quote", return_value=(18.0, "moomoo_snapshot:last_price")):
+                        results = manage_afterhours_sells(
+                            settings,
+                            datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                            dry_run=False,
+                        )
+
+            self.assertEqual(results[0].status, "CANCELED")
+            self.assertEqual(load_afterhours_sell_state(settings.output_dir), {})
+
+    def test_afterhours_runner_skips_regular_session_without_fetching(self):
+        """常规盘运行时直接退出，不拉行情也不提交买单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            now_et = datetime(2026, 5, 28, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+            with patch("alpaca_ma5_service.afterhours_high_low.fetch_minute_bars") as fake_fetch:
+                with patch("alpaca_ma5_service.afterhours_high_low.manage_afterhours_sells", return_value=[]) as fake_sells:
+                    candidates = run_afterhours_high_low_strategy(settings=settings, symbols=["AAA"], dry_run=True, now_et=now_et)
+
+            self.assertEqual(candidates, [])
+            fake_fetch.assert_not_called()
+            fake_sells.assert_called_once()
 
 
 if __name__ == "__main__":

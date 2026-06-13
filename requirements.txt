@@ -2,3 +2,4 @@ alpaca-py
 moomoo-api==10.5.6508
 pandas
 tzdata
+urllib3<2

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import os
 import socket
 import subprocess
@@ -35,6 +36,7 @@ class PriceQuote:
     source: str
     today_open: float = 0.0
     today_open_source: str = ""
+    as_of: datetime | None = None
 
 
 class MoomooRealtimePriceSource:
@@ -83,7 +85,7 @@ class MoomooRealtimePriceSource:
             raise MoomooQuoteError(f"{code} Moomoo 快照没有有效价格")
         today_open, open_field = snapshot_open_with_field(data)
         open_source = f"moomoo_snapshot:{open_field}" if today_open > 0 else ""
-        return PriceQuote(price, f"moomoo_snapshot:{field}", today_open, open_source)
+        return PriceQuote(price, f"moomoo_snapshot:{field}", today_open, open_source, snapshot_update_time(data))
 
     def _connect(self) -> None:
         if self.quote_ctx is not None:
@@ -195,6 +197,26 @@ def snapshot_open_from_row_with_field(row: Any) -> tuple[float, str]:
         if value > 0:
             return value, field
     return 0.0, ""
+
+
+def snapshot_update_time(snapshot: Any) -> datetime | None:
+    """读取 Moomoo 快照更新时间，用来避免上一交易日价格误触发。"""
+    if snapshot is None or getattr(snapshot, "empty", False):
+        return None
+    return snapshot_update_time_from_row(snapshot.iloc[0])
+
+
+def snapshot_update_time_from_row(row: Any) -> datetime | None:
+    value = row.get("update_time", None)
+    if isinstance(value, datetime):
+        return value
+    text = str(value or "").strip()
+    if not text or text.lower() == "nan":
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
 
 
 def numeric(value: Any) -> float:
