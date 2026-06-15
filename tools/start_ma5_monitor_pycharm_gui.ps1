@@ -1,7 +1,7 @@
 $ErrorActionPreference = "Stop"
 
 $ProjectDir = "C:\Users\zzj\Desktop\alpaca_ma5_service"
-$RunScript = Join-Path $ProjectDir "run_monitor_forever.py"
+$RunScript = Join-Path $ProjectDir "monitor_ma5_forever.py"
 $PyCharmExe = "C:\Program Files\JetBrains\PyCharm 2026.1.1\bin\pycharm64.exe"
 $LogDir = Join-Path $ProjectDir "outputs\logs"
 $LogFile = Join-Path $LogDir ("pycharm_gui_task_{0}.log" -f (Get-Date -Format "yyyyMMdd"))
@@ -17,7 +17,7 @@ function Get-RunningMonitor {
     Get-CimInstance Win32_Process -Filter "Name = 'python.exe'" |
         Where-Object {
             $_.CommandLine -like "*alpaca_ma5_service*" -and
-            $_.CommandLine -like "*run_monitor_forever.py*"
+            $_.CommandLine -like "*monitor_ma5_forever.py*"
         }
 }
 
@@ -54,7 +54,6 @@ try {
         exit 0
     }
 
-    # Open the exact file first, so Ctrl+Shift+F10 runs the monitor script.
     Start-Process -FilePath $PyCharmExe -ArgumentList "`"$ProjectDir`"", "`"$RunScript`""
 
     $deadline = (Get-Date).AddSeconds(90)
@@ -62,7 +61,7 @@ try {
     do {
         Start-Sleep -Seconds 1
         $pyCharm = Get-ProjectPyCharmProcess
-        if ($pyCharm -and $pyCharm.MainWindowTitle -like "*run_monitor_forever.py*") {
+        if ($pyCharm -and $pyCharm.MainWindowTitle -like "*monitor_ma5_forever.py*") {
             break
         }
     } while ((Get-Date) -lt $deadline)
@@ -70,8 +69,8 @@ try {
     if (-not $pyCharm) {
         throw "PyCharm project window was not found."
     }
-    if ($pyCharm.MainWindowTitle -notlike "*run_monitor_forever.py*") {
-        throw "PyCharm did not focus run_monitor_forever.py. Current title: $($pyCharm.MainWindowTitle)"
+    if ($pyCharm.MainWindowTitle -notlike "*monitor_ma5_forever.py*") {
+        throw "PyCharm did not focus monitor_ma5_forever.py. Current title: $($pyCharm.MainWindowTitle)"
     }
 
     Add-Type -AssemblyName Microsoft.VisualBasic
@@ -101,7 +100,7 @@ try {
         exit 0
     }
 
-    throw "No run_monitor_forever.py process detected after GUI start."
+    throw "No monitor_ma5_forever.py process detected after GUI start."
 } catch {
     Write-TaskLog "ERROR: $($_.Exception.Message)"
     exit 1

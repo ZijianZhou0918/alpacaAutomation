@@ -1,4 +1,7 @@
-from entrypoint import ensure_local_venv
+try:
+    from ._bootstrap import ensure_local_venv
+except ImportError:
+    from _bootstrap import ensure_local_venv
 
 ensure_local_venv()
 

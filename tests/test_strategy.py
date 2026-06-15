@@ -14,6 +14,7 @@ from alpaca_ma5_service import openclaw_notify
 from alpaca_ma5_service.afterhours_high_low import (
     AfterHoursCandidate,
     MinuteBar,
+    afterhours_signal_day,
     disable_afterhours_openclaw_output,
     is_afterhours_buy_time,
     is_regular_session,
@@ -44,8 +45,9 @@ from alpaca_ma5_service.trade_notifications import render_order_submitted_messag
 from alpaca_ma5_service.watchlist import read_watch_codes
 from alpaca_ma5_service.watchlist_charts import delete_watch_codes_from_watchlist, write_watchlist_chart_page
 from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, generate_watch_codes, is_common_stock_asset, refresh_watchlist_chart_from_watch_codes, request_end_datetime, screen_candidates, validate_candidates, write_watch_codes
-from run_afterhours_buy import load_afterhours_bought_symbols, run_afterhours_high_low_buyer
-from serve_watchlist_charts_lan import settings_for_watch_file
+from alpaca_ma5_service.afterhours_monitor import afterhours_monitor_settings, generate_afterhours_monitor_stocks, load_afterhours_bought_symbols, run_afterhours_high_low_buyer
+from monitor_afterhours import monitor_afterhours
+from tools.serve_watchlist_charts_lan import settings_for_watch_file
 
 
 class FakeMarketData:
@@ -1526,13 +1528,16 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(next_poll_seconds(settings, datetime(2026, 5, 30, 10, 0)), settings.idle_poll_seconds)
 
     def test_watchlist_generator_filters_strategy_rules(self):
-        """选股生成器使用涨幅、均线多头和 open>MA5 筛选股票。"""
+        """选股生成器使用涨幅、均线多头和 open/MA5>0.97 筛选股票。"""
         now_et = datetime(2026, 1, 21, 10, 0)
         low_shadow_bars = make_screen_bars("LOW_SHADOW", passes=True)
-        low_shadow_bars[-1] = DailyBar("LOW_SHADOW", date(2026, 1, 20), 24.0, 25.5, 23.0, 25.0)
+        low_shadow_bars[-1] = DailyBar("LOW_SHADOW", date(2026, 1, 20), 18.6, 25.5, 18.5, 25.0)
+        weak_open_bars = make_screen_bars("WEAK_OPEN", passes=True)
+        weak_open_bars[-1] = DailyBar("WEAK_OPEN", date(2026, 1, 20), 18.3, 25.5, 18.0, 25.0)
         candidates = screen_candidates(
             {
                 "LOW_SHADOW": low_shadow_bars,
+                "WEAK_OPEN": weak_open_bars,
                 "FAIL": make_screen_bars("FAIL", passes=False),
             },
             now_et,
@@ -1543,6 +1548,8 @@ class ServiceTests(unittest.TestCase):
         self.assertLess(candidates[0].upper_shadow_pct, 0.05)
         self.assertGreater(candidates[0].ma5, candidates[0].ma10)
         self.assertGreater(candidates[0].ma10, candidates[0].ma20)
+        self.assertLess(candidates[0].open, candidates[0].ma5)
+        self.assertGreater(candidates[0].open / candidates[0].ma5, 0.97)
 
     def test_market_data_defaults_to_sip_daily_and_moomoo_realtime(self):
         """日线默认用全市场 SIP，当前价默认用 Moomoo OpenD。"""
@@ -1738,6 +1745,13 @@ class ServiceTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "MA5>MA10>MA20"):
             validate_candidates([candidate])
 
+    def test_watchlist_generator_rejects_weak_open_ratio_before_write(self):
+        """写入前再次强校验，open/MA5 必须大于 0.97。"""
+        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 9.7, 13.0, 12.5)
+
+        with self.assertRaisesRegex(RuntimeError, "open/MA5>0.97"):
+            validate_candidates([candidate])
+
     def test_watchlist_generator_uses_safe_sip_daily_request_end(self):
         """SIP 日线 end 使用 20 分钟旧数据，避免 recent 权限错误。"""
         saturday = datetime(2026, 5, 30, 17, 30)
@@ -1756,12 +1770,24 @@ class AfterHoursHighLowTests(unittest.TestCase):
         """盘中只能管理卖出，不允许触发盘后买入策略。"""
         regular = datetime(2026, 5, 28, 10, 0, tzinfo=ZoneInfo("America/New_York"))
         afterhours = datetime(2026, 5, 28, 16, 1, tzinfo=ZoneInfo("America/New_York"))
+        afterhours_end = datetime(2026, 5, 28, 20, 0, tzinfo=ZoneInfo("America/New_York"))
         late_evening = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
 
         self.assertTrue(is_regular_session(regular))
         self.assertFalse(is_afterhours_buy_time(regular))
         self.assertTrue(is_afterhours_buy_time(afterhours))
-        self.assertTrue(is_afterhours_buy_time(late_evening))
+        self.assertFalse(is_afterhours_buy_time(afterhours_end))
+        self.assertFalse(is_afterhours_buy_time(late_evening))
+
+    def test_afterhours_signal_day_uses_latest_completed_regular_session(self):
+        """生成盘后观察池时，周末或收盘前使用最近一个已完成常规盘。"""
+        friday_after_close = datetime(2026, 6, 12, 16, 1, tzinfo=ZoneInfo("America/New_York"))
+        saturday_evening = datetime(2026, 6, 13, 20, 28, tzinfo=ZoneInfo("America/New_York"))
+        monday_morning = datetime(2026, 6, 15, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        self.assertEqual(afterhours_signal_day(friday_after_close), date(2026, 6, 12))
+        self.assertEqual(afterhours_signal_day(saturday_evening), date(2026, 6, 12))
+        self.assertEqual(afterhours_signal_day(monday_morning), date(2026, 6, 12))
 
     def test_afterhours_screen_uses_regular_high_low_ratio(self):
         """常规盘 high/low > 2.5 才进入盘后候选，并按 close*0.8 算买入价。"""
@@ -1869,6 +1895,29 @@ class AfterHoursHighLowTests(unittest.TestCase):
             fake_fetch.assert_called_once()
             self.assertTrue((settings.output_dir / "afterhours_candidates_2026-05-28.csv").exists())
 
+    def test_afterhours_scan_on_weekend_uses_previous_friday(self):
+        """周末手动生成盘后观察池时，扫描最近一个完成交易日的常规盘。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            signal_day = date(2026, 6, 12)
+            now_et = datetime(2026, 6, 13, 20, 28, tzinfo=ZoneInfo("America/New_York"))
+            bars = {
+                "AAA": [
+                    MinuteBar("AAA", datetime(2026, 6, 12, 9, 30, tzinfo=ZoneInfo("America/New_York")), 10.0, 12.0, 10.0, 11.0),
+                    MinuteBar("AAA", datetime(2026, 6, 12, 15, 59, tzinfo=ZoneInfo("America/New_York")), 19.0, 26.0, 18.0, 20.0),
+                ]
+            }
+
+            with patch("alpaca_ma5_service.afterhours_high_low.load_afterhours_symbol_pool", return_value=["AAA"]):
+                with patch("alpaca_ma5_service.afterhours_high_low.fetch_minute_bars", return_value=bars) as fake_fetch:
+                    candidates = scan_afterhours_candidates(settings, now_et, range_ratio_threshold=2.5)
+
+            self.assertEqual([candidate.symbol for candidate in candidates], ["AAA"])
+            self.assertEqual(candidates[0].signal_date, signal_day)
+            self.assertEqual(fake_fetch.call_args.args[1].date(), signal_day)
+            self.assertEqual(fake_fetch.call_args.args[2].date(), signal_day)
+            self.assertTrue((settings.output_dir / "afterhours_candidates_2026-06-12.csv").exists())
+
     def test_afterhours_scan_ignores_cache_for_custom_symbols(self):
         """手动传入股票列表时不复用全量缓存，避免调试扫描被旧 txt 干扰。"""
         with TemporaryDirectory() as tmp:
@@ -1937,7 +1986,7 @@ class AfterHoursHighLowTests(unittest.TestCase):
                                 settings,
                                 [candidate],
                                 3400.0,
-                                datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                                datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York")),
                             )
 
             self.assertEqual(results[0].status, "NO_SIGNAL")
@@ -1964,7 +2013,7 @@ class AfterHoursHighLowTests(unittest.TestCase):
                             settings,
                             [candidate],
                             3400.0,
-                            datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                            datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York")),
                         )
 
             self.assertEqual(results[0].status, "NO_SIGNAL")
@@ -1989,7 +2038,7 @@ class AfterHoursHighLowTests(unittest.TestCase):
                                     settings,
                                     [candidate],
                                     3400.0,
-                                    datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                                    datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York")),
                                     timeout_seconds=300,
                                     poll_seconds=5,
                                 )
@@ -2024,7 +2073,7 @@ class AfterHoursHighLowTests(unittest.TestCase):
                             settings,
                             [candidate],
                             3400.0,
-                            datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                            datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York")),
                         )
 
             self.assertEqual(results[0].status, "ALREADY_BOUGHT_TODAY")
@@ -2045,7 +2094,7 @@ class AfterHoursHighLowTests(unittest.TestCase):
                         settings,
                         [candidate],
                         3400.0,
-                        datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                        datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York")),
                     )
 
             self.assertEqual(results[0].status, "EXISTING_POSITION")
@@ -2066,7 +2115,7 @@ class AfterHoursHighLowTests(unittest.TestCase):
                         settings,
                         [candidate],
                         3400.0,
-                        datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                        datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York")),
                     )
 
             self.assertEqual(results[0].status, "OPEN_BUY_ORDER")
@@ -2087,7 +2136,7 @@ class AfterHoursHighLowTests(unittest.TestCase):
                         settings,
                         [candidate],
                         3400.0,
-                        datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York")),
+                        datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York")),
                     )
 
             self.assertEqual(results[0].status, "RISK_BLOCKED")
@@ -2107,14 +2156,14 @@ class AfterHoursHighLowTests(unittest.TestCase):
     def test_afterhours_entry_accepts_require_paper_parameter(self):
         """入口函数把是否强制 Paper 下单放在参数里。"""
         settings = make_settings(Path("."))
-        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        now_et = datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York"))
         candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
 
-        with patch("run_afterhours_buy.build_settings", return_value=settings):
-            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
-                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]):
-                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[]) as fake_submit:
-                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]):
+        with patch("alpaca_ma5_service.afterhours_monitor.build_settings", return_value=settings):
+            with patch("alpaca_ma5_service.afterhours_monitor.load_afterhours_bought_symbols", return_value=set()):
+                with patch("alpaca_ma5_service.afterhours_monitor.scan_afterhours_candidates", return_value=[candidate]):
+                    with patch("alpaca_ma5_service.afterhours_monitor.submit_afterhours_limit_buys", return_value=[]) as fake_submit:
+                        with patch("alpaca_ma5_service.afterhours_monitor.manage_afterhours_sells", return_value=[]):
                             run_afterhours_high_low_buyer(require_paper=False, max_loops=1, sleep=lambda seconds: None, now_provider=lambda: now_et)
 
         self.assertFalse(fake_submit.call_args.kwargs["require_paper"])
@@ -2125,15 +2174,15 @@ class AfterHoursHighLowTests(unittest.TestCase):
     def test_afterhours_entry_keeps_monitoring_after_daily_scan(self):
         """入口默认是持续监控：当天只扫一次池，下一轮复用候选池检查买入信号。"""
         settings = make_settings(Path("."))
-        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        now_et = datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York"))
         candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
         result = OrderResult("", "US.AAA", "BUY", 0, 16.0, "NO_SIGNAL", "waiting")
 
-        with patch("run_afterhours_buy.build_settings", return_value=settings):
-            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
-                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]) as fake_scan:
-                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[result]) as fake_submit:
-                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]) as fake_sells:
+        with patch("alpaca_ma5_service.afterhours_monitor.build_settings", return_value=settings):
+            with patch("alpaca_ma5_service.afterhours_monitor.load_afterhours_bought_symbols", return_value=set()):
+                with patch("alpaca_ma5_service.afterhours_monitor.scan_afterhours_candidates", return_value=[candidate]) as fake_scan:
+                    with patch("alpaca_ma5_service.afterhours_monitor.submit_afterhours_limit_buys", return_value=[result]) as fake_submit:
+                        with patch("alpaca_ma5_service.afterhours_monitor.manage_afterhours_sells", return_value=[]) as fake_sells:
                             run_afterhours_high_low_buyer(require_paper=True, max_loops=2, sleep=lambda seconds: None, now_provider=lambda: now_et)
 
         fake_scan.assert_called_once()
@@ -2144,15 +2193,15 @@ class AfterHoursHighLowTests(unittest.TestCase):
     def test_afterhours_monitor_keeps_watching_after_canceled_order(self):
         """撤单不算买入次数，下一轮继续等待同一只股票的新信号。"""
         settings = make_settings(Path("."))
-        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        now_et = datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York"))
         candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
         canceled = OrderResult("order-1", "US.AAA", "BUY", 218.0, 16.0, "CANCELED", "not filled; cancel requested")
 
-        with patch("run_afterhours_buy.build_settings", return_value=settings):
-            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
-                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]):
-                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[canceled]) as fake_submit:
-                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]):
+        with patch("alpaca_ma5_service.afterhours_monitor.build_settings", return_value=settings):
+            with patch("alpaca_ma5_service.afterhours_monitor.load_afterhours_bought_symbols", return_value=set()):
+                with patch("alpaca_ma5_service.afterhours_monitor.scan_afterhours_candidates", return_value=[candidate]):
+                    with patch("alpaca_ma5_service.afterhours_monitor.submit_afterhours_limit_buys", return_value=[canceled]) as fake_submit:
+                        with patch("alpaca_ma5_service.afterhours_monitor.manage_afterhours_sells", return_value=[]):
                             run_afterhours_high_low_buyer(require_paper=True, max_loops=2, sleep=lambda seconds: None, now_provider=lambda: now_et)
 
         self.assertEqual(fake_submit.call_count, 2)
@@ -2160,15 +2209,15 @@ class AfterHoursHighLowTests(unittest.TestCase):
     def test_afterhours_monitor_skips_symbol_after_filled_buy(self):
         """每只股票盘后最多买成一次；成交后不再重复买同一只。"""
         settings = make_settings(Path("."))
-        now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+        now_et = datetime(2026, 5, 28, 19, 15, tzinfo=ZoneInfo("America/New_York"))
         candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
         filled = OrderResult("order-1", "US.AAA", "BUY", 218.0, 16.0, "FILLED", "filled")
 
-        with patch("run_afterhours_buy.build_settings", return_value=settings):
-            with patch("run_afterhours_buy.load_afterhours_bought_symbols", return_value=set()):
-                with patch("run_afterhours_buy.scan_afterhours_candidates", return_value=[candidate]):
-                    with patch("run_afterhours_buy.submit_afterhours_limit_buys", return_value=[filled]) as fake_submit:
-                        with patch("run_afterhours_buy.manage_afterhours_sells", return_value=[]):
+        with patch("alpaca_ma5_service.afterhours_monitor.build_settings", return_value=settings):
+            with patch("alpaca_ma5_service.afterhours_monitor.load_afterhours_bought_symbols", return_value=set()):
+                with patch("alpaca_ma5_service.afterhours_monitor.scan_afterhours_candidates", return_value=[candidate]):
+                    with patch("alpaca_ma5_service.afterhours_monitor.submit_afterhours_limit_buys", return_value=[filled]) as fake_submit:
+                        with patch("alpaca_ma5_service.afterhours_monitor.manage_afterhours_sells", return_value=[]):
                             run_afterhours_high_low_buyer(require_paper=True, max_loops=2, sleep=lambda seconds: None, now_provider=lambda: now_et)
 
         fake_submit.assert_called_once()
@@ -2305,6 +2354,53 @@ class AfterHoursHighLowTests(unittest.TestCase):
             self.assertEqual(candidates, [])
             fake_fetch.assert_not_called()
             fake_sells.assert_called_once()
+
+    def test_afterhours_monitor_settings_use_afterhours_tail_window(self):
+        """自动监控入口把尾盘卖出窗口切到盘后 19:55-20:00。"""
+        settings = make_settings(Path("."))
+
+        monitor_settings = afterhours_monitor_settings(settings)
+
+        self.assertEqual(monitor_settings.close_liquidation_start, time(19, 55))
+        self.assertEqual(monitor_settings.close_liquidation_end, time(20, 0))
+        self.assertEqual(settings.close_liquidation_start, time(15, 55))
+
+    def test_generate_afterhours_monitor_stocks_calls_scan(self):
+        """生成盘后监控股票函数只负责筛选并返回候选池。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            now_et = datetime(2026, 5, 28, 20, 15, tzinfo=ZoneInfo("America/New_York"))
+            candidate = AfterHoursCandidate("AAA", date(2026, 5, 28), 10.0, 26.0, 10.0, 20.0, 2.6, 16.0, 17.6)
+
+            with patch("alpaca_ma5_service.afterhours_monitor.scan_afterhours_candidates", return_value=[candidate]) as fake_scan:
+                candidates = generate_afterhours_monitor_stocks(settings=settings, now_et=now_et)
+
+            self.assertEqual(candidates, [candidate])
+            self.assertEqual(fake_scan.call_args.args[0].output_dir, settings.output_dir)
+            self.assertEqual(fake_scan.call_args.args[1], now_et)
+
+    def test_generate_afterhours_monitor_stocks_does_not_wait_for_time_window(self):
+        """生成 watch code 不看当前时间段；是否入选只由筛选条件决定。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            now_et = datetime(2026, 6, 15, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+            with patch("alpaca_ma5_service.afterhours_monitor.scan_afterhours_candidates", return_value=[]) as fake_scan:
+                candidates = generate_afterhours_monitor_stocks(settings=settings, now_et=now_et)
+
+            self.assertEqual(candidates, [])
+            fake_scan.assert_called_once()
+            self.assertEqual(fake_scan.call_args.args[1], now_et)
+
+    def test_afterhours_monitor_wrapper_runs_shared_monitor(self):
+        """新点击入口直接启动自动筛选/买入/卖出监控。"""
+        now_et = datetime(2026, 5, 28, 15, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        with patch("monitor_afterhours.monitor_afterhours_trades") as fake_monitor:
+            monitor_afterhours(max_loops=1, sleep=lambda seconds: None, now_provider=lambda: now_et)
+
+        self.assertEqual(fake_monitor.call_args.kwargs["max_loops"], 1)
+        self.assertIs(fake_monitor.call_args.kwargs["now_provider"](), now_et)
 
 
 if __name__ == "__main__":

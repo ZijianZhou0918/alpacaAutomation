@@ -31,12 +31,15 @@
 ## 文件
 
 - `watch_codes.txt`：唯一盯盘股票文件。
-- `run_monitor_once.py`：点击运行，只检查一轮。
-- `run_monitor_forever.py`：点击运行，持续轮询。
-- `run_generate_watch_codes.py`：点击运行，用 Alpaca 日线数据生成 `watch_codes.txt`。
-- `run_test_order.py`：点击运行，提交一笔很小的 Alpaca 限价测试单，限价为当前价的 90%。
-- `run_self_tests.py`：点击运行本地测试。
-- `check_alpaca_connection.py`：点击检查 Alpaca API key 是否能连通。
+- `monitor_ma5_once.py`：MA5 只检查一轮工具。
+- `watchcode_afterhours.py`：点击运行，生成盘后监控股票池。
+- `monitor_afterhours.py`：点击运行，自动生成盘后股票池并持续监控买入/卖出。
+- `monitor_ma5_forever.py`：MA5 持续轮询工具。
+- `watchcode_ma5.py`：用 Alpaca 日线数据生成 `watch_codes.txt`。
+- `tools/start_ma5_monitor_pycharm_gui.ps1`：通过 PyCharm GUI 启动 `monitor_ma5_forever.py`。
+- `tools/run_test_order.py`：提交一笔很小的 Alpaca 限价测试单，限价为当前价的 90%。
+- `tools/run_self_tests.py`：运行本地测试。
+- `tools/check_alpaca_connection.py`：检查 Alpaca API key 是否能连通。
 - `alpaca_ma5_service/config.py`：运行参数都在 `build_settings()` 里改，不用命令行参数。
 - `outputs/orders_YYYY-MM-DD.csv`：订单记录。
 
@@ -73,7 +76,7 @@ MOOMOO_PORT=11111
 4. 检查 Alpaca 连接：
 
 ```powershell
-.\.venv\Scripts\python.exe check_alpaca_connection.py
+.\.venv\Scripts\python.exe tools\check_alpaca_connection.py
 ```
 
 监控实时价格会连接本机 Moomoo OpenD，请先启动并登录 OpenD，确认 API 端口是 `11111`。
@@ -89,23 +92,23 @@ NVDA
 6. 先跑测试：
 
 ```powershell
-.\.venv\Scripts\python.exe run_self_tests.py
+.\.venv\Scripts\python.exe tools\run_self_tests.py
 ```
 
 7. 检查一轮盯盘：
 
 ```powershell
-.\.venv\Scripts\python.exe run_monitor_once.py
+.\.venv\Scripts\python.exe monitor_ma5_once.py
 ```
 
 8. 生成 watchlist：
 
 ```powershell
-.\.venv\Scripts\python.exe run_generate_watch_codes.py
+.\.venv\Scripts\python.exe watchcode_ma5.py
 ```
 
 只筛选 Alpaca `US_EQUITY` 里的普通股；会排除权证、单位、优先股、ETF/基金、ADR/ADS 等特殊证券。
-筛选规则：最近一个已收盘交易日涨幅 `>20%`，`MA5 > MA10 > MA20`，且当天 `open > MA5`。
+筛选规则：最近一个已收盘交易日涨幅 `>20%`，`MA5 > MA10 > MA20`，且当天 `open / MA5 > 0.97`。
 默认日线优先使用 Alpaca `sip` 全市场历史数据，并自动避开最近 15 分钟权限限制；读取失败时降级到 `iex`。
 候选诊断会写入 `outputs/watch_candidates_YYYY-MM-DD.csv`。
 
@@ -116,18 +119,18 @@ NVDA
 9. 持续盯盘：
 
 ```powershell
-.\.venv\Scripts\python.exe run_monitor_forever.py
+.\.venv\Scripts\python.exe monitor_ma5_forever.py
 ```
 
 10. 测试下单：
 
 ```powershell
-.\.venv\Scripts\python.exe run_test_order.py
+.\.venv\Scripts\python.exe tools\run_test_order.py
 ```
 
 默认会提交 `AAPL` 买入限价单，金额约 `$5`，限价为当前价 `* 0.9`。如果 `.env` 里是 live key，它就提交 live 限价单。
 测试下单读取当前价时也使用 Alpaca Market Data，和真实监控链路保持一致。
-订单提交后默认等待 `600` 秒（10 分钟），未完全成交就请求取消，并再查一次订单状态确认是否真的取消。测试下单参数在 `run_test_order.py` 最下面的 `run_test_limit_order(...)` 里改。
+订单提交后默认等待 `600` 秒（10 分钟），未完全成交就请求取消，并再查一次订单状态确认是否真的取消。测试下单参数在 `tools/run_test_order.py` 最下面的 `run_test_limit_order(...)` 里改。
 
 ## OpenClaw 对话下单
 
@@ -138,7 +141,7 @@ OpenClaw 在直接聊天里识别到买入、卖出或撤单请求时，会调�
 C:\Users\zzj\.openclaw\workspace\openclaw-alpaca-trade.ps1
 ```
 
-然后这个包装脚本再调用本仓库的 `run_openclaw_trade_command.py`，复用同一套 Alpaca 下单、撤单、记录和通知逻辑。
+然后这个包装脚本再调用本仓库的 `tools/run_openclaw_trade_command.py`，复用同一套 Alpaca 下单、撤单、记录和通知逻辑。
 
 常见消息例子：
 
@@ -166,12 +169,14 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 
 然后点这些函数左边的绿色箭头：
 
-- `run_monitor_once.py` 里的 `run_once_alpaca_auto`
-- `run_monitor_forever.py` 里的 `run_forever_alpaca_auto`
-- `run_generate_watch_codes.py`
-- `run_test_order.py`
-- `run_self_tests.py` 里的 `test_run_all_local_tests`
-- `check_alpaca_connection.py` 里的 `check_alpaca_connection`
+- `monitor_ma5_once.py` 里的 `monitor_ma5_once`
+- `monitor_afterhours.py` 里的 `monitor_afterhours`
+- `watchcode_afterhours.py` 里的 `generate_afterhours_watchcode`
+- `monitor_ma5_forever.py` 里的 `monitor_ma5_forever`
+- `watchcode_ma5.py`
+- `tools/run_test_order.py`
+- `tools/run_self_tests.py` 里的 `test_run_all_local_tests`
+- `tools/check_alpaca_connection.py` 里的 `check_alpaca_connection`
 
 ## 盘前/盘后
 
@@ -190,7 +195,7 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 ## 切换 Paper / Live
 
 不用改代码。把 `.env` 换成 Paper key 就走 Paper，把 `.env` 换成 Live key 就走 Live。
-运行 `check_alpaca_connection.py` 会打印当前识别到的模式。
+运行 `tools/check_alpaca_connection.py` 会打印当前识别到的模式。
 
 官方文档：
 

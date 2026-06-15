@@ -37,7 +37,7 @@ def place_test_order(
 ) -> OrderResult:
     """
     PyCharm 点箭头入口：提交一笔真实 Alpaca BUY LIMIT 测试单。
-    股票、金额、折扣价都在 run_test_order.py 里改。
+    股票、金额、折扣价都在 tools/run_test_order.py 里改。
     """
     settings = settings or build_settings()
     cancel_after_seconds = settings.order_cancel_after_seconds if cancel_after_seconds is None else cancel_after_seconds

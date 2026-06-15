@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -8,7 +7,7 @@ from pathlib import Path
 
 def ensure_local_venv() -> None:
     """点箭头运行时，如果解释器不对，就自动切回项目 .venv。"""
-    project_dir = Path(__file__).resolve().parent
+    project_dir = Path(__file__).resolve().parent.parent
     venv_python = project_dir / ".venv" / "Scripts" / "python.exe"
     if not venv_python.exists():
         return

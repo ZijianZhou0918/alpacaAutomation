@@ -148,7 +148,7 @@ def ensure_watchlist_chart_server_running(settings: Settings) -> None:
         print(f"Watchlist chart port {port} is open, but delete API health check failed. Restart the chart server if delete does not work.", flush=True)
         return
 
-    script = Path(__file__).resolve().parent.parent / "serve_watchlist_charts_lan.py"
+    script = Path(__file__).resolve().parent.parent / "tools" / "serve_watchlist_charts_lan.py"
     log_dir = settings.output_dir / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stdout = (log_dir / "watchlist_chart_server.out.log").open("a", encoding="utf-8")
