@@ -31,12 +31,13 @@
 ## 文件
 
 - `watch_codes.txt`：唯一盯盘股票文件。
-- `monitor_ma5_once.py`：MA5 只检查一轮工具。
 - `watchcode_afterhours.py`：点击运行，生成盘后监控股票池。
 - `monitor_afterhours.py`：点击运行，自动生成盘后股票池并持续监控买入/卖出。
 - `monitor_ma5_forever.py`：MA5 持续轮询工具。
 - `watchcode_ma5.py`：用 Alpaca 日线数据生成 `watch_codes.txt`。
 - `tools/start_ma5_monitor_pycharm_gui.ps1`：通过 PyCharm GUI 启动 `monitor_ma5_forever.py`。
+- `tools/start_ma5_watchcode_pycharm_gui.ps1`：通过 PyCharm GUI 启动 `watchcode_ma5.py`。
+- `tools/install_ma5_pycharm_tasks.ps1`：安装每天 22:00 生成 watch code、23:50 兜底启动监控的 Windows 定时任务。
 - `tools/run_test_order.py`：提交一笔很小的 Alpaca 限价测试单，限价为当前价的 90%。
 - `tools/run_self_tests.py`：运行本地测试。
 - `tools/check_alpaca_connection.py`：检查 Alpaca API key 是否能连通。
@@ -95,10 +96,10 @@ NVDA
 .\.venv\Scripts\python.exe tools\run_self_tests.py
 ```
 
-7. 检查一轮盯盘：
+7. 启动盘中持续盯盘：
 
 ```powershell
-.\.venv\Scripts\python.exe monitor_ma5_once.py
+.\.venv\Scripts\python.exe monitor_ma5_forever.py
 ```
 
 8. 生成 watchlist：
@@ -108,7 +109,7 @@ NVDA
 ```
 
 只筛选 Alpaca `US_EQUITY` 里的普通股；会排除权证、单位、优先股、ETF/基金、ADR/ADS 等特殊证券。
-筛选规则：最近一个已收盘交易日涨幅 `>20%`，`MA5 > MA10 > MA20`，且当天 `open / MA5 > 0.97`。
+筛选规则：最近一个已收盘交易日涨幅 `>20%`，且必须比信号日 `MA5` 涨幅高 `10` 个百分点以上；同时要求 `MA5 > MA10 > MA20`、信号日收盘价 `close / MA5 > 1.10`，且当天 `open / MA5 > 0.95`。信号日 `MA5` 涨幅按 `信号日 MA5 / 前一交易日 MA5 - 1` 计算。
 默认日线优先使用 Alpaca `sip` 全市场历史数据，并自动避开最近 15 分钟权限限制；读取失败时降级到 `iex`。
 候选诊断会写入 `outputs/watch_candidates_YYYY-MM-DD.csv`。
 
@@ -169,7 +170,6 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 
 然后点这些函数左边的绿色箭头：
 
-- `monitor_ma5_once.py` 里的 `monitor_ma5_once`
 - `monitor_afterhours.py` 里的 `monitor_afterhours`
 - `watchcode_afterhours.py` 里的 `generate_afterhours_watchcode`
 - `monitor_ma5_forever.py` 里的 `monitor_ma5_forever`
@@ -177,6 +177,23 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 - `tools/run_test_order.py`
 - `tools/run_self_tests.py` 里的 `test_run_all_local_tests`
 - `tools/check_alpaca_connection.py` 里的 `check_alpaca_connection`
+
+## PyCharm 自动任务
+
+安装每天自动运行的 Windows 定时任务：
+
+```powershell
+.\tools\install_ma5_pycharm_tasks.ps1
+```
+
+安装后会注册两个任务：
+
+- `AlpacaMA5-2200-GenerateWatchcode-PyCharm`：每天本地时间 `22:00` 打开 PyCharm 到 `watchcode_ma5.py`，同时用 `.venv` 直接运行筛选，生成第二天盘中使用的 `watch_codes.txt`。
+- `AlpacaMA5-2350-EnsureMonitor-PyCharm`：每天本地时间 `23:50` 检查 `monitor_ma5_forever.py` 是否已运行；如果没有，就打开 PyCharm 到该文件，同时用 `.venv` 直接启动持续监控。
+
+日志写在 `outputs/logs/pycharm_watchcode_task_YYYYMMDD.log`、`outputs/logs/pycharm_gui_task_YYYYMMDD.log` 和 `outputs/logs/ma5_pycharm_tasks_install.log`。
+
+这些任务需要 Windows 用户已登录才能自动打开 PyCharm；实际运行不依赖窗口焦点或快捷键。
 
 ## 盘前/盘后
 

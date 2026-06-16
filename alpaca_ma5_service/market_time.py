@@ -9,6 +9,7 @@ from .config import Settings
 
 REGULAR_OPEN = time(9, 30)
 REGULAR_CLOSE = time(16, 0)
+DAILY_BAR_READY = time(16, 15)
 REALTIME_ORDER_OPEN = time(4, 0)
 REALTIME_ORDER_CLOSE = time(20, 0)
 
@@ -36,6 +37,27 @@ def is_premarket_time(now_et: datetime) -> bool:
 def regular_open_has_started(now_et: datetime) -> bool:
     """常规盘开盘后，今日开盘价才有稳定含义。"""
     return now_et.weekday() < 5 and now_et.time() >= REGULAR_OPEN
+
+
+def daily_request_end(now_et: datetime, feed: str = "sip") -> datetime:
+    """计算 Alpaca 日线请求 end；SIP 需要避开 recent data 权限窗口。"""
+    if now_et.weekday() < 5 and now_et.time() >= DAILY_BAR_READY:
+        end_date = now_et.date() + timedelta(days=1)
+    else:
+        end_date = now_et.date()
+    boundary = datetime.combine(end_date, time.min, tzinfo=now_et.tzinfo)
+    return stale_sip_daily_end(now_et, boundary) if feed.lower() == "sip" else boundary
+
+
+def stale_sip_daily_end(now_et: datetime, boundary: datetime) -> datetime:
+    """把 SIP 日线请求时间压到 20 分钟前，避免免费权限错误。"""
+    stale_cutoff = now_et - timedelta(minutes=20)
+    if boundary <= stale_cutoff:
+        return boundary
+    close_ready = datetime.combine(now_et.date(), DAILY_BAR_READY, tzinfo=now_et.tzinfo)
+    if stale_cutoff.date() == now_et.date() and stale_cutoff < close_ready:
+        return datetime.combine(now_et.date(), time.min, tzinfo=now_et.tzinfo)
+    return stale_cutoff
 
 
 def is_buy_order_time(now_et: datetime) -> bool:

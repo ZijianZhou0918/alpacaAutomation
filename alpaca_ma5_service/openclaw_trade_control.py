@@ -10,16 +10,27 @@ from .models import OrderResult
 from .watchlist import normalize_symbol
 
 
+TRADE_COMMAND_EXAMPLES_BY_ACTION = {
+    "买入": [
+        "帮我买5刀的NTAP，购买价格固定160",
+        "帮我买5刀的NTAP，购买价格为当前价*0.95",
+        "帮我买5刀的NTAP，市价买入",
+    ],
+    "卖出": [
+        "帮我卖出10股NTAP，限价160",
+        "帮我卖出10股NTAP，价格为当前价*1.05",
+        "帮我卖出NTAP，市价卖出",
+    ],
+    "撤单": [
+        "撤单NTAP",
+        "撤单 订单号: FU1C9F9AADE3E56000",
+        "全部撤单",
+    ],
+}
 SUPPORTED_TRADE_COMMAND_FORMATS = [
-    "帮我买5刀的NTAP，购买价格固定160",
-    "帮我买5刀的NTAP，购买价格为当前价*0.95",
-    "帮我买5刀的NTAP，市价买入",
-    "帮我卖出10股NTAP，限价160",
-    "帮我卖出10股NTAP，价格为当前价*1.05",
-    "帮我卖出NTAP，市价卖出",
-    "撤单NTAP",
-    "撤单 订单号: FU1C9F9AADE3E56000",
-    "全部撤单",
+    example
+    for examples in TRADE_COMMAND_EXAMPLES_BY_ACTION.values()
+    for example in examples
 ]
 
 
@@ -326,5 +337,15 @@ def _has_market_order_intent(text: str) -> bool:
 
 def _unsupported_format_message(reason: str) -> str:
     """把拒绝原因和常用模板放在一起，方便 OpenClaw 原样回复。"""
+    return f"交易指令格式不支持：{reason}\n{supported_trade_command_help()}"
+
+
+def supported_trade_command_help() -> str:
+    """集中维护 OpenClaw 指令约束和示例，避免拒绝回复里复制 prompt。"""
     examples = "\n".join(f"- {item}" for item in SUPPORTED_TRADE_COMMAND_FORMATS)
-    return f"交易指令格式不支持：{reason}\n常见可用格式：\n{examples}"
+    return (
+        "目标：只执行明确的买入、卖出、撤单指令。\n"
+        "输入要求：买入/卖出必须包含股票代码；买入必须包含金额或股数；买卖必须明确固定限价、当前价倍率或市价。\n"
+        "失败处理：格式不完整时直接拒绝，不猜金额、价格或方向。\n"
+        f"常见可用格式：\n{examples}"
+    )

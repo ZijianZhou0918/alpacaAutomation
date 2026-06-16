@@ -340,6 +340,28 @@ def make_screen_bars(symbol="TEST", signal_day=date(2026, 1, 20), passes=True):
     return bars
 
 
+def make_weak_signal_vs_ma5_gain_bars(symbol="WEAK_SIGNAL_MA5", signal_day=date(2026, 1, 20)):
+    """信号日涨幅大于 20%，但没有比 MA5 涨幅高出 10 个点。"""
+    closes = [4.0] * 10 + [5.0] * 4 + [1.0, 10.0, 10.0, 10.0, 10.0]
+    bars = [
+        DailyBar(symbol, date(2026, 1, index + 1), close, close, close, close)
+        for index, close in enumerate(closes)
+    ]
+    bars.append(DailyBar(symbol, signal_day, 11.0, 13.5, 10.5, 13.0))
+    return bars
+
+
+def make_close_below_ma5_bars(symbol="CLOSE_BELOW_MA5", signal_day=date(2026, 1, 20)):
+    """高开且涨幅达标，但信号日收盘价没有比 MA5 高 10 个点。"""
+    closes = [1.0] * 10 + [1.2] * 5 + [2.0, 2.0, 2.0, 1.0]
+    bars = [
+        DailyBar(symbol, date(2026, 1, index + 1), close, close, close, close)
+        for index, close in enumerate(closes)
+    ]
+    bars.append(DailyBar(symbol, signal_day, 1.8, 2.2, 1.3, 1.4))
+    return bars
+
+
 def make_minute_bar(symbol="TEST", hour=9, minute=30, open=10.0, high=10.0, low=10.0, close=10.0):
     """生成盘后策略测试用 1m bar。"""
     timestamp = datetime(2026, 5, 28, hour, minute, tzinfo=ZoneInfo("America/New_York"))
@@ -1528,16 +1550,18 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(next_poll_seconds(settings, datetime(2026, 5, 30, 10, 0)), settings.idle_poll_seconds)
 
     def test_watchlist_generator_filters_strategy_rules(self):
-        """选股生成器使用涨幅、均线多头和 open/MA5>0.97 筛选股票。"""
+        """选股生成器使用涨幅、MA5 动量、均线多头、close/MA5>1.10 和 open/MA5>0.95 筛选股票。"""
         now_et = datetime(2026, 1, 21, 10, 0)
         low_shadow_bars = make_screen_bars("LOW_SHADOW", passes=True)
         low_shadow_bars[-1] = DailyBar("LOW_SHADOW", date(2026, 1, 20), 18.6, 25.5, 18.5, 25.0)
         weak_open_bars = make_screen_bars("WEAK_OPEN", passes=True)
-        weak_open_bars[-1] = DailyBar("WEAK_OPEN", date(2026, 1, 20), 18.3, 25.5, 18.0, 25.0)
+        weak_open_bars[-1] = DailyBar("WEAK_OPEN", date(2026, 1, 20), 18.0, 25.5, 17.8, 25.0)
         candidates = screen_candidates(
             {
                 "LOW_SHADOW": low_shadow_bars,
                 "WEAK_OPEN": weak_open_bars,
+                "WEAK_SIGNAL_MA5": make_weak_signal_vs_ma5_gain_bars("WEAK_SIGNAL_MA5"),
+                "CLOSE_BELOW_MA5": make_close_below_ma5_bars("CLOSE_BELOW_MA5"),
                 "FAIL": make_screen_bars("FAIL", passes=False),
             },
             now_et,
@@ -1545,11 +1569,13 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual([candidate.symbol for candidate in candidates], ["LOW_SHADOW"])
         self.assertGreater(candidates[0].gain_pct, 0.20)
+        self.assertGreater(candidates[0].gain_pct - candidates[0].ma5_gain_pct, 0.10)
         self.assertLess(candidates[0].upper_shadow_pct, 0.05)
         self.assertGreater(candidates[0].ma5, candidates[0].ma10)
         self.assertGreater(candidates[0].ma10, candidates[0].ma20)
+        self.assertGreater(candidates[0].close / candidates[0].ma5, 1.10)
         self.assertLess(candidates[0].open, candidates[0].ma5)
-        self.assertGreater(candidates[0].open / candidates[0].ma5, 0.97)
+        self.assertGreater(candidates[0].open / candidates[0].ma5, 0.95)
 
     def test_market_data_defaults_to_sip_daily_and_moomoo_realtime(self):
         """日线默认用全市场 SIP，当前价默认用 Moomoo OpenD。"""
@@ -1746,10 +1772,24 @@ class ServiceTests(unittest.TestCase):
             validate_candidates([candidate])
 
     def test_watchlist_generator_rejects_weak_open_ratio_before_write(self):
-        """写入前再次强校验，open/MA5 必须大于 0.97。"""
-        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 9.7, 13.0, 12.5)
+        """写入前再次强校验，open/MA5 必须大于 0.95。"""
+        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 9.5, 13.0, 12.5)
 
-        with self.assertRaisesRegex(RuntimeError, "open/MA5>0.97"):
+        with self.assertRaisesRegex(RuntimeError, "open/MA5>0.95"):
+            validate_candidates([candidate])
+
+    def test_watchlist_generator_rejects_weak_close_ma5_ratio_before_write(self):
+        """写入前再次强校验，信号日收盘价必须比 MA5 高 10 个点以上。"""
+        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 11.0, 13.0, 11.0)
+
+        with self.assertRaisesRegex(RuntimeError, "close/MA5>1.1"):
+            validate_candidates([candidate])
+
+    def test_watchlist_generator_rejects_weak_signal_vs_ma5_gain_before_write(self):
+        """写入前再次强校验，信号日涨幅必须比 MA5 涨幅高 10 个点以上。"""
+        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 11.0, 13.0, 12.5, ma5_gain_pct=0.22)
+
+        with self.assertRaisesRegex(RuntimeError, "MA5 涨幅"):
             validate_candidates([candidate])
 
     def test_watchlist_generator_uses_safe_sip_daily_request_end(self):

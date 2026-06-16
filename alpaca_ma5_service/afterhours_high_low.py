@@ -16,7 +16,7 @@ from .models import OrderResult
 from .order_guard import normalize_order_status, wait_for_fill_or_cancel
 from .state import append_order, orders_file
 from .watchlist import normalize_symbol, to_alpaca_symbol
-from .watchlist_generator import batched, is_common_stock_asset
+from .watchlist_generator import batched, load_tradable_symbols
 
 
 REGULAR_OPEN = time(9, 30)
@@ -455,11 +455,6 @@ def is_regular_session(now_et: datetime) -> bool:
     return now_et.weekday() < 5 and REGULAR_OPEN <= now_et.time() < REGULAR_CLOSE
 
 
-def can_scan_after_regular_close(now_et: datetime) -> bool:
-    """只有工作日 16:00 后才启动当日盘后筛选。"""
-    return now_et.weekday() < 5 and now_et.time() >= REGULAR_CLOSE
-
-
 def is_afterhours_buy_time(now_et: datetime) -> bool:
     """盘后真实监控/挂单窗口：16:00 <= t < 20:00 ET。"""
     return now_et.weekday() < 5 and REGULAR_CLOSE <= now_et.time() < AFTERHOURS_DATA_CLOSE
@@ -499,15 +494,8 @@ def afterhours_session_bounds(day: date, tzinfo) -> tuple[datetime, datetime]:
 
 
 def load_afterhours_symbol_pool(max_symbols: int | None = None) -> list[str]:
-    """从 Alpaca assets 读取 active/tradable 普通股，约 5500 只。"""
-    from alpaca.trading.enums import AssetClass, AssetStatus
-    from alpaca.trading.requests import GetAssetsRequest
-
-    client = build_trading_connection().client
-    request = GetAssetsRequest(status=AssetStatus.ACTIVE, asset_class=AssetClass.US_EQUITY)
-    assets = client.get_all_assets(request)
-    symbols = sorted(str(getattr(asset, "symbol", "")).upper() for asset in assets if is_common_stock_asset(asset))
-    return symbols[:max_symbols] if max_symbols is not None else symbols
+    """复用盘中 watch code 的 active/tradable 普通股股票池。"""
+    return load_tradable_symbols(max_symbols=max_symbols)
 
 
 def fetch_minute_bars(
@@ -1086,19 +1074,6 @@ def is_close_sell_time(settings: Settings, now_et: datetime) -> bool:
     return settings.close_liquidation_start <= now_et.time() < settings.close_liquidation_end
 
 
-def load_afterhours_candidate_symbols(output_dir: Path, max_files: int = 5) -> set[str]:
-    """读取最近几个盘后候选文件，只管理这些股票的卖出。"""
-    symbols: set[str] = set()
-    paths = sorted(output_dir.glob("afterhours_candidates_*.csv"), reverse=True)[:max_files]
-    for path in paths:
-        with path.open("r", newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                symbol = normalize_symbol(row.get("symbol", ""))
-                if symbol:
-                    symbols.add(symbol)
-    return symbols
-
-
 def afterhours_sell_state_file(output_dir: Path) -> Path:
     """记录哪些股票已经卖过一半，避免重复触发 10% 止盈。"""
     return output_dir / "afterhours_sell_state.json"
@@ -1121,12 +1096,6 @@ def save_afterhours_sell_state(output_dir: Path, state: dict[str, dict[str, obje
     """保存盘后策略卖出状态。"""
     output_dir.mkdir(parents=True, exist_ok=True)
     afterhours_sell_state_file(output_dir).write_text(json.dumps({"positions": state}, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-def latest_trade_price(symbol: str, settings: Settings, feed: str = "iex", *, price_source=None, now_et: datetime | None = None) -> float:
-    """读取当前成交价；默认按配置优先使用 Moomoo OpenD。"""
-    price, _ = latest_trade_price_quote(symbol, settings, feed=feed, price_source=price_source, now_et=now_et)
-    return price
 
 
 def latest_trade_price_quote(symbol: str, settings: Settings, feed: str = "iex", *, price_source=None, now_et: datetime | None = None) -> tuple[float, str]:

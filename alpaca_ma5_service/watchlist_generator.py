@@ -3,18 +3,22 @@ from __future__ import annotations
 import csv
 import re
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .alpaca_connection import build_trading_connection, load_alpaca_credentials
 from .config import Settings, build_settings
 from .errors import short_error
+from .market_time import daily_request_end, stale_sip_daily_end
 from .watchlist import read_watch_codes, to_alpaca_symbol
 from .watchlist_charts import ensure_watchlist_chart_server_running, watchlist_chart_http_url, write_watchlist_chart_page
 
 
-MIN_OPEN_TO_MA5_RATIO = 0.97
+MIN_SIGNAL_GAIN_PCT = 0.20
+MIN_SIGNAL_GAIN_OVER_MA5_GAIN_PCT = 0.10
+MIN_OPEN_TO_MA5_RATIO = 0.95
+MIN_CLOSE_TO_MA5_RATIO = 1.10
 
 
 @dataclass(frozen=True)
@@ -43,6 +47,7 @@ class WatchCandidate:
     open: float
     high: float
     close: float
+    ma5_gain_pct: float = 0.0
 
 
 def generate_watch_codes(
@@ -210,7 +215,7 @@ def latest_completed_signal_date(bars_by_symbol: dict[str, list[DailyBar]], now_
 
 
 def evaluate_watch_candidate(symbol: str, bars: list[DailyBar], now_et: datetime, signal_date: date) -> WatchCandidate | None:
-    """检查单股是否满足涨幅、MA5>MA10>MA20、open/MA5>0.97。"""
+    """检查单股是否满足涨幅、MA5 动量、MA 多头、close/MA5>1.10、open/MA5>0.95。"""
     completed = [bar for bar in sorted(bars, key=lambda item: item.date) if is_completed_bar(bar, now_et)]
     signal_index = next((index for index, bar in enumerate(completed) if bar.date == signal_date), None)
     if signal_index is None or signal_index < 19:
@@ -225,19 +230,25 @@ def evaluate_watch_candidate(symbol: str, bars: list[DailyBar], now_et: datetime
     ma5 = average(closes20[-5:])
     ma10 = average(closes20[-10:])
     ma20 = average(closes20)
+    previous_ma5 = average([bar.close for bar in completed[signal_index - 5 : signal_index]])
     gain_pct = signal.close / previous.close - 1.0
+    ma5_gain_pct = ma5 / previous_ma5 - 1.0 if previous_ma5 > 0 else 0.0
 
     # 上影线只保留为诊断/排序字段，不再作为入选条件。
     upper_shadow_pct = (signal.high - max(signal.open, signal.close)) / previous.close
 
-    if gain_pct <= 0.20:
+    if gain_pct <= MIN_SIGNAL_GAIN_PCT:
+        return None
+    if gain_pct - ma5_gain_pct <= MIN_SIGNAL_GAIN_OVER_MA5_GAIN_PCT:
         return None
     if not (ma5 > ma10 > ma20):
+        return None
+    if ma5 <= 0 or signal.close / ma5 <= MIN_CLOSE_TO_MA5_RATIO:
         return None
     if ma5 <= 0 or signal.open / ma5 <= MIN_OPEN_TO_MA5_RATIO:
         return None
 
-    return WatchCandidate(symbol, signal.date, gain_pct, upper_shadow_pct, ma5, ma10, ma20, signal.open, signal.high, signal.close)
+    return WatchCandidate(symbol, signal.date, gain_pct, upper_shadow_pct, ma5, ma10, ma20, signal.open, signal.high, signal.close, ma5_gain_pct)
 
 
 def validate_candidates(candidates: list[WatchCandidate]) -> None:
@@ -245,10 +256,14 @@ def validate_candidates(candidates: list[WatchCandidate]) -> None:
     for candidate in candidates:
         if not (candidate.ma5 > candidate.ma10 > candidate.ma20):
             raise RuntimeError(f"{candidate.symbol} 均线不满足 MA5>MA10>MA20")
+        if candidate.ma5 <= 0 or candidate.close / candidate.ma5 <= MIN_CLOSE_TO_MA5_RATIO:
+            raise RuntimeError(f"{candidate.symbol} 收盘价不满足 close/MA5>{MIN_CLOSE_TO_MA5_RATIO:g}")
         if candidate.ma5 <= 0 or candidate.open / candidate.ma5 <= MIN_OPEN_TO_MA5_RATIO:
             raise RuntimeError(f"{candidate.symbol} 开盘价不满足 open/MA5>{MIN_OPEN_TO_MA5_RATIO:g}")
-        if candidate.gain_pct <= 0.20:
-            raise RuntimeError(f"{candidate.symbol} 涨幅不满足 >20%")
+        if candidate.gain_pct <= MIN_SIGNAL_GAIN_PCT:
+            raise RuntimeError(f"{candidate.symbol} 涨幅不满足 >{MIN_SIGNAL_GAIN_PCT:.0%}")
+        if candidate.gain_pct - candidate.ma5_gain_pct <= MIN_SIGNAL_GAIN_OVER_MA5_GAIN_PCT:
+            raise RuntimeError(f"{candidate.symbol} 涨幅不满足比 MA5 涨幅高 {MIN_SIGNAL_GAIN_OVER_MA5_GAIN_PCT:.0%} 以上")
 
 
 def is_completed_bar(bar: DailyBar, now_et: datetime) -> bool:
@@ -272,23 +287,12 @@ def daily_bar_from_alpaca(symbol: str, bar, now_et: datetime) -> DailyBar:
 
 def request_end_datetime(now_et: datetime, feed: str = "sip") -> datetime:
     """计算日线请求 end；SIP 需要避开 recent data 权限窗口。"""
-    if now_et.weekday() < 5 and (now_et.hour > 16 or (now_et.hour == 16 and now_et.minute >= 15)):
-        end_date = now_et.date() + timedelta(days=1)
-    else:
-        end_date = now_et.date()
-    boundary = datetime.combine(end_date, time.min, tzinfo=now_et.tzinfo)
-    return stale_sip_end(now_et, boundary) if feed.lower() == "sip" else boundary
+    return daily_request_end(now_et, feed)
 
 
 def stale_sip_end(now_et: datetime, boundary: datetime) -> datetime:
     """把 SIP 请求时间压到 20 分钟前，避免免费权限错误。"""
-    stale_cutoff = now_et - timedelta(minutes=20)
-    if boundary <= stale_cutoff:
-        return boundary
-    close_ready = datetime.combine(now_et.date(), time(16, 15), tzinfo=now_et.tzinfo)
-    if stale_cutoff.date() == now_et.date() and stale_cutoff < close_ready:
-        return datetime.combine(now_et.date(), time.min, tzinfo=now_et.tzinfo)
-    return stale_cutoff
+    return stale_sip_daily_end(now_et, boundary)
 
 
 def write_watch_codes(path: Path, candidates: list[WatchCandidate]) -> None:
@@ -296,7 +300,7 @@ def write_watch_codes(path: Path, candidates: list[WatchCandidate]) -> None:
     lines = [
         "# Auto-generated by watchcode_ma5.py",
         "# Pool: Alpaca active/tradable common stocks only",
-        f"# Rules: gain>20%, MA5>MA10>MA20, open/MA5>{MIN_OPEN_TO_MA5_RATIO:g}",
+        f"# Rules: gain>{MIN_SIGNAL_GAIN_PCT:.0%}, signal_gain>ma5_gain+{MIN_SIGNAL_GAIN_OVER_MA5_GAIN_PCT:.0%}, MA5>MA10>MA20, close/MA5>{MIN_CLOSE_TO_MA5_RATIO:g}, open/MA5>{MIN_OPEN_TO_MA5_RATIO:g}",
     ]
     if candidates:
         lines.append(f"# signal_date={candidates[0].signal_date}")
@@ -312,7 +316,7 @@ def write_candidate_report(output_dir: Path, candidates: list[WatchCandidate]) -
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.DictWriter(
             f,
-            fieldnames=["symbol", "signal_date", "gain_pct", "upper_shadow_pct", "ma5", "ma10", "ma20", "open", "high", "close"],
+            fieldnames=["symbol", "signal_date", "gain_pct", "ma5_gain_pct", "upper_shadow_pct", "ma5", "ma10", "ma20", "open", "high", "close"],
         )
         writer.writeheader()
         for candidate in candidates:

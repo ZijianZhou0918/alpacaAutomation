@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from .alpaca_connection import load_alpaca_credentials
 from .config import Settings
 from .errors import short_error
-from .market_time import is_realtime_order_time, regular_open_has_started
+from .market_time import daily_request_end, is_realtime_order_time, regular_open_has_started, stale_sip_daily_end
 from .models import MarketSnapshot
 from .moomoo_market_data import MoomooRealtimePriceSource
 from .watchlist import normalize_symbol, to_alpaca_symbol
@@ -140,23 +140,12 @@ class _SnapshotBar:
 
 def _daily_request_end(now: datetime, feed: str = "sip") -> datetime:
     """计算日线请求 end；SIP 需要避开最近数据权限窗口。"""
-    if now.weekday() < 5 and (now.hour > 16 or (now.hour == 16 and now.minute >= 15)):
-        end_date = now.date() + timedelta(days=1)
-    else:
-        end_date = now.date()
-    boundary = datetime.combine(end_date, time.min, tzinfo=now.tzinfo)
-    return _stale_sip_end(now, boundary) if feed.lower() == "sip" else boundary
+    return daily_request_end(now, feed)
 
 
 def _stale_sip_end(now: datetime, boundary: datetime) -> datetime:
     """把 SIP 请求时间压到 20 分钟前，避开 recent data 权限限制。"""
-    stale_cutoff = now - timedelta(minutes=20)
-    if boundary <= stale_cutoff:
-        return boundary
-    close_ready = datetime.combine(now.date(), time(16, 15), tzinfo=now.tzinfo)
-    if stale_cutoff.date() == now.date() and stale_cutoff < close_ready:
-        return datetime.combine(now.date(), time.min, tzinfo=now.tzinfo)
-    return stale_cutoff
+    return stale_sip_daily_end(now, boundary)
 
 
 def _snapshot_inputs(bars: list[_SnapshotBar], now: datetime, latest_trade_price: float) -> tuple[float, list[float]]:
