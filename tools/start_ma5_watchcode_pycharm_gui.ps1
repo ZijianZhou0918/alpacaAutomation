@@ -16,6 +16,9 @@ if (-not (Test-Path $CommonScript)) {
 try {
     $startedAt = Get-Date
     Write-Ma5TaskLog $LogDir $LogFile "Starting direct watchcode task."
+    if (-not (Test-Ma5TradingDayForTask $ProjectDir $LogDir $LogFile 1 "tomorrow watchcode generation")) {
+        exit 0
+    }
 
     if (-not (Test-Path $RunScript)) {
         throw "Run script not found: $RunScript"

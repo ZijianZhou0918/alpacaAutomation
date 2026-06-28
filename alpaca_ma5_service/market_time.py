@@ -8,6 +8,7 @@ from .config import Settings
 
 
 REGULAR_OPEN = time(9, 30)
+BUY_ORDER_CLOSE = time(12, 0)
 REGULAR_CLOSE = time(16, 0)
 DAILY_BAR_READY = time(16, 15)
 REALTIME_ORDER_OPEN = time(4, 0)
@@ -61,8 +62,8 @@ def stale_sip_daily_end(now_et: datetime, boundary: datetime) -> datetime:
 
 
 def is_buy_order_time(now_et: datetime) -> bool:
-    """真实买入窗口：实时价窗口内，但排除盘前。"""
-    return is_realtime_order_time(now_et) and not is_premarket_time(now_et)
+    """真实买入窗口：只允许常规盘开盘后前 2.5 小时，09:30 <= t < 12:00 ET。"""
+    return now_et.weekday() < 5 and REGULAR_OPEN <= now_et.time() < BUY_ORDER_CLOSE
 
 
 def next_poll_seconds(settings: Settings, now_et: datetime) -> int:

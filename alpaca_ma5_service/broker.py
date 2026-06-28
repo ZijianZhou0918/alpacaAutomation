@@ -7,7 +7,7 @@ from datetime import datetime
 from .alpaca_connection import build_trading_connection
 from .config import Settings
 from .errors import short_error
-from .market_time import is_premarket_time, is_realtime_order_time, is_regular_market_time, now_market_time
+from .market_time import is_buy_order_time, is_premarket_time, is_realtime_order_time, is_regular_market_time, now_market_time
 from .models import OrderResult, Position
 from .order_guard import FINAL_STATUSES, cancel_unfilled_order, normalize_order_status, wait_for_fill_or_cancel
 from .state import append_order, load_positions, save_positions
@@ -42,10 +42,7 @@ class DryRunStockBroker:
         """按金额模拟买入，并同步写入本地持仓和订单记录。"""
         if current_price <= 0:
             return OrderResult("", symbol, "BUY", 0, current_price, "REJECTED", "当前价格无效")
-        quantity = notional_usd / current_price
-        if not self.settings.allow_fractional_shares:
-            quantity = math.floor(quantity)
-        quantity = round(quantity, 6)
+        quantity = float(math.floor(notional_usd / current_price))
         if quantity <= 0:
             return OrderResult("", symbol, "BUY", 0, current_price, "REJECTED", "买入金额不足 1 股")
 
@@ -149,7 +146,7 @@ class AlpacaStockBroker:
         *,
         skip_time_validation: bool = False,
     ) -> OrderResult:
-        """按目标金额换算股数后提交买单；不支持碎股时自动向下取整。"""
+        """按目标金额换算整数股后提交买单。"""
         qty = self._buy_qty(symbol, notional_usd, current_price)
         if qty <= 0:
             result = OrderResult("", symbol, "BUY", 0, current_price, "REJECTED", "买入金额不足")
@@ -168,7 +165,7 @@ class AlpacaStockBroker:
         *,
         skip_time_validation: bool = False,
     ) -> OrderResult:
-        """提交用户指定价格的 BUY LIMIT；金额按限价换算成股数。"""
+        """提交用户指定价格的 BUY LIMIT；金额按限价换算成整数股。"""
         qty = self._buy_qty(symbol, notional_usd, limit_price)
         if qty <= 0:
             result = OrderResult("", symbol, "BUY", 0, limit_price, "REJECTED", "买入金额不足")
@@ -287,6 +284,8 @@ class AlpacaStockBroker:
         now_et = now_market_time(self.settings)
         if not skip_time_validation and side == "BUY" and is_premarket_time(now_et):
             return OrderResult("", symbol, side, quantity, current_price, "REJECTED", "盘前时段不买入，已跳过真实买单")
+        if not skip_time_validation and side == "BUY" and not is_buy_order_time(now_et):
+            return OrderResult("", symbol, side, quantity, current_price, "REJECTED", "买入只允许常规盘开盘后前 2.5 小时，已跳过真实买单")
         if not skip_time_validation and not is_realtime_order_time(now_et):
             return OrderResult("", symbol, side, quantity, current_price, "REJECTED", "当前不在实时价下单时段，已跳过真实下单")
 
@@ -352,6 +351,8 @@ class AlpacaStockBroker:
         now_et = now_market_time(self.settings)
         if not skip_time_validation and side == "BUY" and is_premarket_time(now_et):
             return OrderResult("", symbol, side, quantity, limit_price, "REJECTED", "盘前时段不买入，已跳过真实买单")
+        if not skip_time_validation and side == "BUY" and not is_buy_order_time(now_et):
+            return OrderResult("", symbol, side, quantity, limit_price, "REJECTED", "买入只允许常规盘开盘后前 2.5 小时，已跳过真实买单")
         if not skip_time_validation and not is_realtime_order_time(now_et):
             return OrderResult("", symbol, side, quantity, limit_price, "REJECTED", "当前不在实时价下单时段，已跳过真实下单")
         if not skip_time_validation and not is_regular_market_time(now_et) and not self.settings.extended_hours_orders_enabled:
@@ -408,13 +409,10 @@ class AlpacaStockBroker:
         return result
 
     def _buy_qty(self, symbol: str, notional_usd: float, current_price: float) -> float:
-        """把买入金额换算成下单股数，必要时退回整数股。"""
+        """把买入金额换算成整数股下单股数。"""
         if current_price <= 0:
             return 0.0
-        qty = notional_usd / current_price
-        if not self._can_buy_fractional(symbol):
-            return float(math.floor(qty))
-        return round(qty, 6)
+        return float(math.floor(notional_usd / current_price))
 
     def _can_buy_fractional(self, symbol: str) -> bool:
         """查询 Alpaca 碎股权限；查询失败时保守用整数股，减少拒单。"""

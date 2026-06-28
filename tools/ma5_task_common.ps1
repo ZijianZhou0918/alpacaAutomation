@@ -195,3 +195,40 @@ function Wait-Ma5PythonProcess {
 
     return $null
 }
+
+function Test-Ma5TradingDayForTask {
+    param(
+        [string]$ProjectDir,
+        [string]$LogDir,
+        [string]$LogFile,
+        [int]$DateOffsetDays,
+        [string]$Purpose
+    )
+
+    $checker = Join-Path $ProjectDir "tools\check_ma5_trading_day.py"
+    if (-not (Test-Path $checker)) {
+        throw "Trading day checker not found: $checker"
+    }
+
+    $targetDate = (Get-Date).Date.AddDays($DateOffsetDays).ToString("yyyy-MM-dd")
+    $python = Resolve-Ma5Python $ProjectDir
+    $pythonArgs = @($python.Args + @($checker, $targetDate))
+
+    Write-Ma5TaskLog $LogDir $LogFile "Checking trading calendar for $Purpose target_date=$targetDate."
+    $output = & $python.FilePath @pythonArgs 2>&1
+    $exitCode = $LASTEXITCODE
+    foreach ($line in $output) {
+        Write-Ma5TaskLog $LogDir $LogFile "Trading calendar: $line"
+    }
+
+    if ($exitCode -eq 0) {
+        Write-Ma5TaskLog $LogDir $LogFile "Trading calendar allows this task."
+        return $true
+    }
+    if ($exitCode -eq 2) {
+        Write-Ma5TaskLog $LogDir $LogFile "Trading calendar says non-trading day; skip this task."
+        return $false
+    }
+
+    throw "Trading calendar check failed with exit code $exitCode."
+}

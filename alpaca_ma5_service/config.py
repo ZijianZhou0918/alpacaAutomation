@@ -20,6 +20,7 @@ class Settings:
     max_daily_buys: int
     max_symbol_order_errors: int
     stop_loss_pct: float
+    stop_loss_limit_pct: float
     take_profit_half_pct: float
     close_liquidation_start: time
     close_liquidation_end: time
@@ -56,17 +57,18 @@ def build_settings() -> Settings:
         watch_codes_file=BASE_DIR / "watch_codes.txt",
         output_dir=output_dir,
         state_file=output_dir / "state.json",
-        buy_notional_usd=3400.0,
-        max_daily_buys=1,
+        buy_notional_usd=3500.0,
+        max_daily_buys=2,
         max_symbol_order_errors=3,
         stop_loss_pct=-0.10,
+        stop_loss_limit_pct=-0.08,
         take_profit_half_pct=0.10,
         close_liquidation_start=time(15, 55),
         close_liquidation_end=time(16, 0),
         regular_poll_seconds=10,
         idle_poll_seconds=300,
         market_timezone="America/New_York",
-        allow_fractional_shares=True,
+        allow_fractional_shares=False,
         extended_hours_orders_enabled=True,
         extended_hours_limit_buffer_pct=0.003,
         order_cancel_after_seconds=600,

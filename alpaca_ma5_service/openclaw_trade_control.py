@@ -12,9 +12,9 @@ from .watchlist import normalize_symbol
 
 TRADE_COMMAND_EXAMPLES_BY_ACTION = {
     "买入": [
-        "帮我买5刀的NTAP，购买价格固定160",
-        "帮我买5刀的NTAP，购买价格为当前价*0.95",
-        "帮我买5刀的NTAP，市价买入",
+        "帮我买3000刀的NTAP，购买价格固定160",
+        "帮我买3000刀的NTAP，购买价格为当前价*0.95",
+        "帮我买3000刀的NTAP，市价买入",
     ],
     "卖出": [
         "帮我卖出10股NTAP，限价160",

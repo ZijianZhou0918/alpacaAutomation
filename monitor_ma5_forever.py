@@ -1,4 +1,4 @@
-from alpaca_ma5_service.entrypoint import ensure_local_venv
+from alpaca_ma5_service.entrypoint import ensure_local_venv;
 
 ensure_local_venv()
 

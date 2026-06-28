@@ -13,6 +13,9 @@ if (-not (Test-Path $CommonScript)) {
 
 try {
     Write-Ma5TaskLog $LogDir $LogFile "Starting direct monitor task."
+    if (-not (Test-Ma5TradingDayForTask $ProjectDir $LogDir $LogFile 1 "tomorrow monitor startup")) {
+        exit 0
+    }
 
     if (-not (Test-Path $RunScript)) {
         throw "Run script not found: $RunScript"
@@ -29,9 +32,14 @@ try {
 
     Start-Ma5PyCharm $ProjectDir $RunScript $LogDir $LogFile | Out-Null
 
-    $pythonArgs = ConvertTo-Ma5ArgumentList @($python.Args + @($RunScript))
-    $process = Start-Process -FilePath $python.FilePath -ArgumentList $pythonArgs -WorkingDirectory $ProjectDir -WindowStyle Minimized -PassThru
+    $monitorOut = Join-Path $LogDir ("monitor_ma5_forever_{0}.out.log" -f (Get-Date -Format "yyyyMMdd"))
+    $monitorErr = Join-Path $LogDir ("monitor_ma5_forever_{0}.err.log" -f (Get-Date -Format "yyyyMMdd"))
+    $pythonArgs = ConvertTo-Ma5ArgumentList @($python.Args + @("-u", $RunScript))
+    $env:PYTHONIOENCODING = "utf-8"
+    $process = Start-Process -FilePath $python.FilePath -ArgumentList $pythonArgs -WorkingDirectory $ProjectDir -WindowStyle Minimized -RedirectStandardOutput $monitorOut -RedirectStandardError $monitorErr -PassThru
     Write-Ma5TaskLog $LogDir $LogFile "Started monitor_ma5_forever.py through direct python. Starter PID: $($process.Id)"
+    Write-Ma5TaskLog $LogDir $LogFile "Monitor stdout: $monitorOut"
+    Write-Ma5TaskLog $LogDir $LogFile "Monitor stderr: $monitorErr"
 
     $started = Wait-Ma5PythonProcess $ProjectDir "monitor_ma5_forever.py" 30
     if ($started) {

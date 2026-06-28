@@ -42,6 +42,16 @@ class MarketSnapshot:
         return self.today_open / signal_close - 1.0
 
     @property
+    def today_current_gain_pct(self) -> float:
+        """当前价涨幅 = 当前价 / 信号日收盘价 - 1。"""
+        if self.current_price <= 0 or not self.previous_closes:
+            return 0.0
+        signal_close = self.previous_closes[-1]
+        if signal_close <= 0:
+            return 0.0
+        return self.current_price / signal_close - 1.0
+
+    @property
     def today_open_ma5(self) -> float:
         """开盘 MA5 = 前 4 个完成日开盘价 + 今日常规盘开盘价。"""
         if self.today_open <= 0 or len(self.previous_opens) < 4:

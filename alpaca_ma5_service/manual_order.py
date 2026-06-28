@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 from .alpaca_connection import build_trading_connection
@@ -83,32 +84,35 @@ def place_test_order(
         print(f"前4日收盘：{format_previous_closes(snapshot)}", flush=True)
         print(f"今日动态MA5：{snapshot.today_ma5:.4f}", flush=True)
 
-        # 这里会真实提交订单；未在配置时间内完全成交就自动撤单。
-        try:
-            raw = _submit_limit_buy(client, symbol, quantity, limit_price)
-            submitted = OrderResult(
-                str(getattr(raw, "id", "") or ""),
-                symbol,
-                "BUY",
-                quantity,
-                limit_price,
-                normalize_order_status(raw) or "SUBMITTED",
-                f"Alpaca {mode.lower()} 测试单已提交",
-            )
-            notify_order_submitted(settings, submitted, reason, broker_name=broker_name)
-            result = wait_for_fill_or_cancel(
-                client,
-                raw,
-                symbol,
-                "BUY",
-                quantity,
-                limit_price,
-                mode.lower(),
-                timeout_seconds=cancel_after_seconds,
-                poll_seconds=order_status_poll_seconds,
-            )
-        except Exception as exc:
-            result = OrderResult("", symbol, "BUY", quantity, limit_price, "REJECTED", short_error(exc))
+        if quantity <= 0:
+            result = OrderResult("", symbol, "BUY", 0, limit_price, "REJECTED", "买入金额不足 1 股")
+        else:
+            # 这里会真实提交订单；未在配置时间内完全成交就自动撤单。
+            try:
+                raw = _submit_limit_buy(client, symbol, quantity, limit_price)
+                submitted = OrderResult(
+                    str(getattr(raw, "id", "") or ""),
+                    symbol,
+                    "BUY",
+                    quantity,
+                    limit_price,
+                    normalize_order_status(raw) or "SUBMITTED",
+                    f"Alpaca {mode.lower()} 测试单已提交",
+                )
+                notify_order_submitted(settings, submitted, reason, broker_name=broker_name)
+                result = wait_for_fill_or_cancel(
+                    client,
+                    raw,
+                    symbol,
+                    "BUY",
+                    quantity,
+                    limit_price,
+                    mode.lower(),
+                    timeout_seconds=cancel_after_seconds,
+                    poll_seconds=order_status_poll_seconds,
+                )
+            except Exception as exc:
+                result = OrderResult("", symbol, "BUY", quantity, limit_price, "REJECTED", short_error(exc))
         order_time = now_market_time(settings)
         record_order_and_notify(settings, result, reason, broker_name=broker_name, order_time=order_time)
 
@@ -170,12 +174,12 @@ def discounted_limit_price(current_price: float, multiplier: float) -> float:
 
 
 def quantity_for_notional(notional_usd: float, limit_price: float) -> float:
-    """按目标金额和限价换算下单股数。"""
+    """按目标金额和限价换算整数股下单股数。"""
     if notional_usd <= 0:
         raise ValueError("目标金额必须大于 0")
     if limit_price <= 0:
         raise ValueError("限价必须大于 0")
-    return round(notional_usd / limit_price, 6)
+    return float(math.floor(notional_usd / limit_price))
 
 
 def _submit_limit_buy(client, symbol: str, quantity: float, limit_price: float):

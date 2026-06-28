@@ -1158,13 +1158,10 @@ def latest_alpaca_trade_price_quote(symbol: str, feed: str = "iex") -> tuple[flo
 
 
 def buy_quantity(client, symbol: str, notional_usd: float, limit_price: float, allow_fractional_shares: bool) -> float:
-    """按限价把金额换成股数；不支持碎股时向下取整。"""
+    """按限价把金额换成整数股；allow_fractional_shares 参数保留为兼容入口。"""
     if limit_price <= 0:
         return 0.0
-    qty = notional_usd / limit_price
-    if not allow_fractional_shares or not can_buy_fractional(client, symbol):
-        return float(math.floor(qty))
-    return round(qty, 6)
+    return float(math.floor(notional_usd / limit_price))
 
 
 def can_buy_fractional(client, symbol: str) -> bool:
@@ -1342,7 +1339,7 @@ def write_afterhours_fill_report(
         for candidate in candidates:
             fill = fill_by_symbol.get(candidate.symbol)
             fill_price = fill.fill_price if fill and fill.filled else 0.0
-            quantity = round(buy_notional_usd / fill_price, 6) if fill_price > 0 else 0.0
+            quantity = float(math.floor(buy_notional_usd / fill_price)) if fill_price > 0 else 0.0
             writer.writerow(
                 {
                     "symbol": candidate.symbol,

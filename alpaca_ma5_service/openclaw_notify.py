@@ -4,21 +4,28 @@ import json
 import shutil
 import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .config import Settings
 
 
 _OPENCLAW_GATEWAY_READY = False
+_HERMES_AGENT_PYTHON = Path.home() / "AppData" / "Local" / "hermes" / "hermes-agent" / "venv" / "Scripts" / "python.exe"
 
 
 def send_openclaw_telegram_message(settings: Settings, message: str) -> None:
-    """通过本机 OpenClaw gateway 发送一条 Telegram 消息。"""
+    """通过本机 OpenClaw 或 Hermes 发送一条 Telegram 消息。"""
     target = settings.openclaw_telegram_target.strip()
     if not target:
         raise ValueError("OPENCLAW_TELEGRAM_TARGET is empty")
 
-    openclaw = openclaw_executable()
+    kind, command = messaging_command()
+    if kind == "hermes":
+        send_hermes_telegram_message(command, target, message)
+        return
+
+    openclaw = command[0]
     ensure_openclaw_gateway_running(settings, openclaw)
     result = subprocess.run(
         [
@@ -51,17 +58,53 @@ def safe_send_openclaw_messages(settings: Settings, messages: list[str], *, cont
     try:
         for message in messages:
             send_openclaw_telegram_message(settings, message)
-        print(f"OpenClaw 通知已发送: {context}", flush=True)
+        note = f"OpenClaw/Hermes 通知已发送: {context}"
+        print(note, flush=True)
+        write_notify_log(settings, note)
     except Exception as exc:
-        print(f"OpenClaw 通知失败，不影响主流程 {context}：{type(exc).__name__}: {exc}")
+        note = f"OpenClaw/Hermes 通知失败，不影响主流程 {context}：{type(exc).__name__}: {exc}"
+        print(note)
+        write_notify_log(settings, note)
+
+
+def messaging_command() -> tuple[str, list[str]]:
+    """优先兼容旧 OpenClaw；本机没有 openclaw 时使用 Hermes。"""
+    openclaw = shutil.which("openclaw.cmd") or shutil.which("openclaw") or shutil.which("openclaw-cn.cmd") or shutil.which("openclaw-cn")
+    if openclaw:
+        return "openclaw", [openclaw]
+
+    hermes = shutil.which("hermes.cmd") or shutil.which("hermes")
+    if hermes:
+        return "hermes", [hermes]
+
+    if _HERMES_AGENT_PYTHON.exists():
+        return "hermes", [str(_HERMES_AGENT_PYTHON), "-m", "hermes_cli.main"]
+
+    raise FileNotFoundError("openclaw/hermes command not found")
 
 
 def openclaw_executable() -> str:
-    """定位 openclaw 命令行程序。"""
-    openclaw = shutil.which("openclaw.cmd") or shutil.which("openclaw") or shutil.which("openclaw-cn.cmd") or shutil.which("openclaw-cn")
-    if openclaw is None:
+    """定位旧 openclaw 命令行程序，保留给旧调用方和测试使用。"""
+    kind, command = messaging_command()
+    if kind != "openclaw":
         raise FileNotFoundError("openclaw command not found in PATH")
-    return openclaw
+    return command[0]
+
+
+def send_hermes_telegram_message(command: list[str], target: str, message: str) -> None:
+    """使用 Hermes 当前的 send 命令发送 Telegram 消息。"""
+    hermes_target = target if target.startswith("telegram") else f"telegram:{target}"
+    result = subprocess.run(
+        command + ["send", "--to", hermes_target, message, "--json"],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        text=True,
+        timeout=60,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(f"hermes Telegram send failed: {detail}")
 
 
 def ensure_openclaw_gateway_running(settings: Settings, openclaw: str) -> None:
@@ -147,3 +190,13 @@ def start_openclaw_gateway_process(settings: Settings, openclaw: str) -> None:
     finally:
         stdout.close()
         stderr.close()
+
+
+def write_notify_log(settings: Settings, message: str) -> None:
+    """后台任务没有控制台时，把通知结果也落到文件。"""
+    log_dir = settings.output_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / f"trade_notify_{datetime.now().strftime('%Y%m%d')}.log"
+    line = f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}\n"
+    with log_file.open("a", encoding="utf-8") as handle:
+        handle.write(line)

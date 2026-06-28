@@ -26,10 +26,10 @@ def run_test_limit_order(
 
 
 if __name__ == "__main__":
-    # 点箭头运行只改这里：金额很小，超时未成交会自动撤单。
+    # 点箭头运行只改这里：只买整数股；金额不足 1 股会直接拒绝，超时未成交会自动撤单。
     run_test_limit_order(
         symbol="NTAP",
-        buy_notional_usd=5.0,
+        buy_notional_usd=100.0,
         limit_price_multiplier=0.9,
         cancel_after_seconds=300,
         order_status_poll_seconds=5,

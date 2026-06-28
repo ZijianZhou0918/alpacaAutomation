@@ -34,7 +34,8 @@ def write_watchlist_chart_page(settings: Settings, candidates, bars_by_symbol: d
         source_symbol = candidate.symbol if candidate else code
         try:
             bars = prepare_chart_bars(candidate_bars(source_symbol, code, bars_by_symbol), days=days)
-            chart_items.append({"code": code, "sort_return": chart_sort_return(bars), "html": render_daily_kline_card(code, bars, days=days)})
+            signal_date = candidate.signal_date if candidate else report_date
+            chart_items.append({"code": code, "sort_return": chart_sort_return(bars), "html": render_daily_kline_card(code, bars, signal_date, days=days)})
         except Exception as exc:
             message = f"{code}: {type(exc).__name__}: {exc}"
             errors.append(message)
@@ -268,7 +269,7 @@ def render_watch_code_daily_kline_page(
     .code {{ font-size:24px; font-weight:800; line-height:1.1; }}
     .summary {{ color:var(--muted); font-size:13px; }}
     .card-actions {{ display:flex; align-items:center; gap:10px; margin-left:auto; }}
-    .metric-grid {{ display:grid; grid-template-columns:repeat(5, minmax(120px, 1fr)); gap:8px; margin:10px 0 12px; }}
+    .metric-grid {{ display:grid; grid-template-columns:repeat(auto-fit, minmax(136px, 1fr)); gap:8px; margin:10px 0 12px; }}
     .metric {{ background:var(--soft); border:1px solid #e4ebf6; border-radius:7px; padding:8px 10px; }}
     .metric-label {{ color:var(--muted); font-size:12px; margin-bottom:3px; }}
     .metric-value {{ font-size:16px; font-weight:750; }}
@@ -582,12 +583,12 @@ def render_watch_code_daily_kline_page(
 """
 
 
-def render_daily_kline_card(code: str, bars: pd.DataFrame, *, days: int = CHART_DAYS) -> str:
+def render_daily_kline_card(code: str, bars: pd.DataFrame, signal_date: date, *, days: int = CHART_DAYS) -> str:
     safe_code = html.escape(code)
     if bars is None or bars.empty:
         return render_error_card(code, f"{code}: 没有近 {days} 日 K 线数据")
     title = chart_summary_text(bars)
-    metrics = chart_metric_tiles(bars)
+    metrics = chart_metric_tiles(bars, signal_date)
     svg = render_daily_kline_svg(bars)
     return f"""<section class="card" data-stock-card data-code="{safe_code}">
   <div class="card-title"><div class="code">{safe_code}</div><div class="card-actions"><div class="summary">{html.escape(title)}</div><button type="button" class="delete-watch-code" data-delete-code="{safe_code}">删除</button></div></div>
@@ -624,13 +625,14 @@ def chart_summary_text(bars: pd.DataFrame) -> str:
     return f"{first['time_key']} - {last['time_key']} | 收盘 {format_price(close)} | 区间涨跌 {change:.2%}"
 
 
-def chart_metric_tiles(bars: pd.DataFrame) -> str:
+def chart_metric_tiles(bars: pd.DataFrame, signal_date: date) -> str:
     last = bars.iloc[-1]
     first = bars.iloc[0]
     close = float(last["close"])
     prev_close = pd.to_numeric(last.get("prev_close"), errors="coerce")
     day_change = close / float(prev_close) - 1 if not pd.isna(prev_close) and float(prev_close) > 0 else None
     interval_change = close / float(first["close"]) - 1 if float(first["close"]) > 0 else None
+    signal_close_ma5_distance = signal_day_close_ma5_distance_pct(bars, signal_date)
     interval_high = pd.to_numeric(bars["high"], errors="coerce").max()
     interval_low = pd.to_numeric(bars["low"], errors="coerce").min()
     volume = last.get("volume")
@@ -638,6 +640,7 @@ def chart_metric_tiles(bars: pd.DataFrame) -> str:
         ("最新收盘", format_price(close), ""),
         ("当日涨跌", format_pct(day_change), pct_class(day_change)),
         ("区间涨跌", format_pct(interval_change), pct_class(interval_change)),
+        ("信号日收盘距MA5", format_signed_pct(signal_close_ma5_distance), pct_class(signal_close_ma5_distance)),
         ("区间高低", f"{format_price(float(interval_high))} / {format_price(float(interval_low))}", ""),
         ("最新成交量", format_volume(volume), ""),
     ]
@@ -646,6 +649,18 @@ def chart_metric_tiles(bars: pd.DataFrame) -> str:
         value_class = f"metric-value {class_name}".strip()
         items.append(f"""<div class="metric"><div class="metric-label">{html.escape(label)}</div><div class="{value_class}">{html.escape(value)}</div></div>""")
     return f"""<div class="metric-grid">{''.join(items)}</div>"""
+
+
+def signal_day_close_ma5_distance_pct(bars: pd.DataFrame, signal_date: date) -> float | None:
+    signal_rows = bars[bars["time_key"] == signal_date.isoformat()] if "time_key" in bars.columns else pd.DataFrame()
+    if signal_rows.empty:
+        return None
+    row = signal_rows.iloc[-1]
+    close_price = pd.to_numeric(row.get("close"), errors="coerce")
+    ma5 = pd.to_numeric(row.get("ma5"), errors="coerce")
+    if pd.isna(close_price) or pd.isna(ma5) or float(ma5) <= 0:
+        return None
+    return float(close_price) / float(ma5) - 1.0
 
 
 def render_daily_kline_svg(bars: pd.DataFrame) -> str:
