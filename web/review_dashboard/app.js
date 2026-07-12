@@ -4,6 +4,7 @@ const API = {
   dates: "/api/review/dates",
   review: "/api/review",
   evidence: "/api/review/evidence",
+  runtime: "/api/runtime/tasks",
 };
 
 const state = {
@@ -21,6 +22,18 @@ const state = {
   selectedSymbol: null,
   drawerTab: "lifecycle",
   lastFocused: null,
+  runtimeTasks: [],
+  runtimePayload: null,
+  selectedRuntime: null,
+  runtimeFollow: true,
+  runtimeView: "events",
+  runtimeEventFilter: "",
+  runtimeFingerprint: "",
+  runtimeLoading: false,
+  runtimeTimer: null,
+  viewDate: "",
+  mode: "smart",
+  resolvedMode: "review",
 };
 
 const el = {};
@@ -29,8 +42,10 @@ document.addEventListener("DOMContentLoaded", init);
 
 async function init() {
   cacheElements();
+  initializeViewState();
   bindEvents();
   renderMetricSkeletons();
+  loadRuntimeTasks();
   try {
     const response = await fetchJSON(API.dates);
     state.dates = Array.isArray(response.dates) ? response.dates : [];
@@ -38,20 +53,25 @@ async function init() {
     showToast(`日期列表读取失败：${error.message}`, "warning");
   }
   const urlDate = new URL(location.href).searchParams.get("date");
-  const initialDate = validDate(urlDate) ? urlDate : (state.dates[0] || "");
+  const initialDate = validDate(urlDate) ? urlDate : todayISO();
   await loadReview(initialDate);
 }
 
 function cacheElements() {
   const ids = [
-    "menu-button", "section-nav", "previous-date", "next-date", "review-date", "review-status",
+    "menu-button", "section-nav", "previous-date", "next-date", "today-button", "review-date", "review-status",
     "coverage-status", "broker-status", "refresh-button", "chart-link", "market-banner", "headline-title",
     "headline-detail", "generated-at", "conflict-banner", "conflict-title", "conflict-detail",
     "jump-to-attention", "metric-rail", "page-error", "page-error-message", "retry-button", "decision-workspace",
+    "mode-switcher", "data-context-title", "data-context-detail", "freshness-strip", "freshness-page",
+    "freshness-runtime", "freshness-broker", "freshness-source", "freshness-environment",
+    "runtime-dashboard", "runtime-status", "runtime-summary", "runtime-follow", "runtime-refresh", "runtime-task-list",
+    "runtime-view-switcher", "runtime-events-panel", "runtime-console-panel", "runtime-event-filter",
+    "runtime-event-summary", "runtime-event-list", "runtime-console-title", "runtime-updated-at", "runtime-console",
     "decision-count", "clear-filters", "quick-filters", "status-filter", "reason-filter", "symbol-search",
     "filter-summary-button", "active-filter-summary", "decision-table", "decision-table-body", "decision-empty",
     "filtered-total", "timeline-list", "timeline-order", "timeline-empty", "attention-panel", "attention-count",
-    "attention-list", "attention-empty", "funnel-content", "lifecycle-content", "reasons-content", "orders-content",
+    "attention-list", "attention-empty", "funnel-content", "lifecycle-content", "reasons-title", "reasons-content", "orders-content",
     "orders-count", "phases-content", "health-content", "drawer-backdrop", "symbol-drawer", "drawer-previous",
     "drawer-next", "drawer-close", "drawer-title", "drawer-subtitle", "drawer-stats", "drawer-order-timeline",
     "drawer-checklist", "drawer-consistency", "drawer-strategy-context", "drawer-evidence-list",
@@ -62,6 +82,10 @@ function cacheElements() {
 }
 
 function bindEvents() {
+  el["mode-switcher"].addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-mode]");
+    if (button) setWorkspaceMode(button.dataset.mode);
+  });
   el["menu-button"].addEventListener("click", () => {
     const open = el["menu-button"].getAttribute("aria-expanded") === "true";
     el["menu-button"].setAttribute("aria-expanded", String(!open));
@@ -76,8 +100,33 @@ function bindEvents() {
   el["review-date"].addEventListener("change", () => loadReview(el["review-date"].value));
   el["previous-date"].addEventListener("click", () => navigateDate("previous"));
   el["next-date"].addEventListener("click", () => navigateDate("next"));
-  el["refresh-button"].addEventListener("click", () => loadReview(state.data?.review_date || el["review-date"].value));
+  el["today-button"].addEventListener("click", () => loadReview(todayISO()));
+  el["refresh-button"].addEventListener("click", () => loadReview(state.viewDate || el["review-date"].value));
   el["retry-button"].addEventListener("click", () => loadReview(el["review-date"].value));
+  el["runtime-refresh"].addEventListener("click", () => {
+    window.clearTimeout(state.runtimeTimer);
+    loadRuntimeTasks();
+  });
+  el["runtime-follow"].addEventListener("change", () => {
+    state.runtimeFollow = el["runtime-follow"].checked;
+    if (state.runtimeFollow) scrollRuntimeConsole();
+  });
+  el["runtime-task-list"].addEventListener("click", (event) => {
+    const task = event.target.closest("button[data-runtime-id]");
+    if (!task) return;
+    state.selectedRuntime = task.dataset.runtimeId;
+    renderRuntimeDashboard();
+  });
+  el["runtime-view-switcher"].addEventListener("click", (event) => {
+    const button = event.target.closest("button[data-runtime-view]");
+    if (!button) return;
+    state.runtimeView = button.dataset.runtimeView;
+    renderRuntimeView();
+  });
+  el["runtime-event-filter"].addEventListener("change", () => {
+    state.runtimeEventFilter = el["runtime-event-filter"].value;
+    renderRuntimeEvents(selectedRuntimeTask());
+  });
   el["jump-to-attention"].addEventListener("click", () => el["attention-panel"].scrollIntoView({ behavior: "smooth", block: "center" }));
   el["status-filter"].addEventListener("change", () => { state.status = el["status-filter"].value; renderDecisionTable(); });
   el["reason-filter"].addEventListener("change", () => { state.reason = el["reason-filter"].value; renderDecisionTable(); });
@@ -134,6 +183,239 @@ function bindEvents() {
   document.addEventListener("keydown", handleGlobalKeys);
 }
 
+function initializeViewState() {
+  const requestedMode = new URL(location.href).searchParams.get("mode");
+  state.mode = ["smart", "live", "review"].includes(requestedMode) ? requestedMode : "smart";
+}
+
+async function loadRuntimeTasks() {
+  if (state.runtimeLoading) return;
+  state.runtimeLoading = true;
+  try {
+    const payload = await fetchJSON(API.runtime);
+    state.runtimePayload = payload;
+    state.runtimeTasks = Array.isArray(payload.tasks) ? payload.tasks : [];
+    if (!state.runtimeTasks.some((task) => task.instance_id === state.selectedRuntime)) {
+      state.selectedRuntime = state.runtimeTasks.find((task) => task.status === "running")?.instance_id
+        || state.runtimeTasks[0]?.instance_id
+        || null;
+    }
+    renderRuntimeDashboard(payload);
+    renderWorkspaceMode();
+    renderFreshness();
+    scheduleRuntimeRefresh(payload.active_count ? 2000 : 15000);
+  } catch (error) {
+    el["runtime-status"].className = "status-indicator warning";
+    el["runtime-status"].innerHTML = '<span class="status-dot" aria-hidden="true"></span><span>状态读取失败</span>';
+    el["runtime-summary"].textContent = `无法读取本机盯盘状态：${error.message}`;
+    scheduleRuntimeRefresh(15000);
+  } finally {
+    state.runtimeLoading = false;
+  }
+}
+
+function scheduleRuntimeRefresh(delay) {
+  window.clearTimeout(state.runtimeTimer);
+  state.runtimeTimer = window.setTimeout(() => {
+    if (document.hidden) {
+      scheduleRuntimeRefresh(15000);
+      return;
+    }
+    loadRuntimeTasks();
+  }, delay);
+}
+
+function renderRuntimeDashboard(payload = null) {
+  const tasks = state.runtimeTasks;
+  const activeCount = payload?.active_count ?? tasks.filter((task) => task.status === "running").length;
+  el["runtime-status"].className = `status-indicator ${activeCount ? "success" : "neutral"}`;
+  el["runtime-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${activeCount ? `${activeCount} 个任务运行中` : "当前无运行任务"}</span>`;
+  el["runtime-summary"].textContent = activeCount
+    ? "运行中每 2 秒同步；默认只展示状态变化，完整输出保留在原始日志。"
+    : "空闲时每 15 秒发现一次任务；启动任一盯盘入口后会自动切换为实时模式。";
+
+  if (!tasks.length) {
+    el["runtime-task-list"].innerHTML = '<div class="runtime-empty"><svg aria-hidden="true"><use href="#icon-terminal"></use></svg><strong>没有发现盯盘任务</strong><span>任务启动后无需额外绑定，网页会自动显示。</span></div>';
+    el["runtime-console-title"].textContent = "等待盯盘任务";
+    el["runtime-updated-at"].textContent = formatClock(payload?.generated_at);
+    el["runtime-console"].textContent = "尚未发现由本项目入口启动的盯盘任务。\n\n支持入口：\n  • monitor_auto.py\n  • monitor_ma5_forever.py\n  • monitor_premarket_ma5.py\n  • monitor_afterhours.py";
+    el["runtime-event-summary"].textContent = "当前没有运行中的盯盘任务";
+    el["runtime-event-list"].innerHTML = '<div class="runtime-event-empty"><strong>等待状态变化</strong><span>任务启动后，这里优先显示买点、订单、异常与关键阈值变化。</span></div>';
+    renderRuntimeView();
+    return;
+  }
+
+  el["runtime-task-list"].innerHTML = tasks.map((task) => {
+    const selected = task.instance_id === state.selectedRuntime;
+    const running = task.status === "running";
+    const statusLabel = running ? "运行中" : task.status === "failed" ? "异常结束" : "已结束";
+    return `<button class="runtime-task ${selected ? "selected" : ""}" type="button" role="option" aria-selected="${selected}" data-runtime-id="${escapeAttr(task.instance_id)}">
+      <span class="runtime-task-head"><span class="runtime-task-name">${escapeHTML(task.task_label)}</span><span class="runtime-state ${escapeAttr(task.status)}"><span class="status-dot" aria-hidden="true"></span>${statusLabel}</span></span>
+      <span class="runtime-task-meta">${escapeHTML(task.phase_label)} · PID ${num(task.pid)}</span>
+      <span class="runtime-task-meta">${escapeHTML(task.source)} · ${formatDateTime(task.started_at)}</span>
+    </button>`;
+  }).join("");
+
+  const selected = tasks.find((task) => task.instance_id === state.selectedRuntime) || tasks[0];
+  el["runtime-console-title"].textContent = `${selected.task_label} · ${selected.phase_label}`;
+  el["runtime-updated-at"].textContent = `更新 ${formatClock(payload?.generated_at || selected.heartbeat_at)}`;
+  const prefix = selected.log_truncated ? "… 已省略较早输出，仅显示最近内容 …\n\n" : "";
+  const log = selected.log || (selected.status === "running" ? "任务已启动，等待第一行控制台输出…" : "该任务没有留下控制台输出。");
+  const consoleNode = el["runtime-console"];
+  const nearBottom = consoleNode.scrollHeight - consoleNode.scrollTop - consoleNode.clientHeight < 48;
+  consoleNode.textContent = `${prefix}${log}`;
+  if (state.runtimeFollow || nearBottom) scrollRuntimeConsole();
+  renderRuntimeEvents(selected);
+  renderRuntimeView();
+}
+
+function selectedRuntimeTask() {
+  return state.runtimeTasks.find((task) => task.instance_id === state.selectedRuntime) || state.runtimeTasks[0] || null;
+}
+
+function renderRuntimeEvents(task) {
+  if (!task) return;
+  const sourceEvents = Array.isArray(task.events) ? task.events : [];
+  const filter = state.runtimeEventFilter;
+  const events = sourceEvents.filter((event) => {
+    if (!filter) return true;
+    if (filter === "critical") return event.severity === "critical";
+    if (filter === "warning") return event.severity === "warning";
+    return filter === "changed" ? event.kind !== "observation" : true;
+  });
+  const significantCount = sourceEvents.filter((event) => event.kind !== "observation").length;
+  el["runtime-event-summary"].innerHTML = `<strong>${events.length}</strong> 条事件 · <span>${significantCount} 条状态变化</span>${task.status === "running" ? " · 正在监控" : " · 任务已结束"}`;
+  el["runtime-event-list"].innerHTML = events.length ? events.map((event) => `
+    <article class="runtime-event severity-${severityClass(event.severity)}">
+      <span class="runtime-event-marker" aria-hidden="true"></span>
+      <div class="runtime-event-time"><strong>${escapeHTML(event.time_label || "刚刚")}</strong><span>${event.line_number ? `日志 ${num(event.line_number)}` : "实时"}</span></div>
+      <div class="runtime-event-main">
+        <div class="runtime-event-title"><strong>${escapeHTML(event.symbol || "系统")}</strong><span>${escapeHTML(event.title || "状态更新")}</span>${event.count > 1 ? `<em>×${num(event.count)}</em>` : ""}</div>
+        <p>${escapeHTML(event.message || "—")}</p>
+      </div>
+      <div class="runtime-event-action">${escapeHTML(event.action || "继续观察")}</div>
+    </article>`).join("") : '<div class="runtime-event-empty"><strong>没有符合筛选条件的事件</strong><span>可以切换到“全部事件”或查看原始日志。</span></div>';
+
+  const latestImportant = sourceEvents.find((event) => ["critical", "warning"].includes(event.severity));
+  const fingerprint = latestImportant ? `${task.instance_id}:${latestImportant.id}` : "";
+  if (state.runtimeFingerprint && fingerprint && fingerprint !== state.runtimeFingerprint) {
+    announce(`${latestImportant.symbol || "系统"}：${latestImportant.title}`);
+  }
+  state.runtimeFingerprint = fingerprint;
+}
+
+function renderRuntimeView() {
+  const showEvents = state.runtimeView === "events";
+  el["runtime-events-panel"].hidden = !showEvents;
+  el["runtime-console-panel"].hidden = showEvents;
+  el["runtime-view-switcher"].querySelectorAll("[data-runtime-view]").forEach((button) => {
+    button.setAttribute("aria-selected", String(button.dataset.runtimeView === state.runtimeView));
+  });
+  if (!showEvents && state.runtimeFollow) scrollRuntimeConsole();
+}
+
+function scrollRuntimeConsole() {
+  requestAnimationFrame(() => { el["runtime-console"].scrollTop = el["runtime-console"].scrollHeight; });
+}
+
+function formatClock(value) {
+  if (!value) return "—";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "—" : new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(date);
+}
+
+function setWorkspaceMode(mode) {
+  if (!["smart", "live", "review"].includes(mode)) return;
+  state.mode = mode;
+  const url = new URL(location.href);
+  if (mode === "smart") url.searchParams.delete("mode");
+  else url.searchParams.set("mode", mode);
+  history.replaceState({}, "", url);
+  renderWorkspaceMode();
+}
+
+function renderWorkspaceMode() {
+  const activeRuntime = state.runtimeTasks.some((task) => task.status === "running");
+  state.resolvedMode = state.mode === "smart" ? (activeRuntime ? "live" : "review") : state.mode;
+  document.body.classList.toggle("mode-live", state.resolvedMode === "live");
+  document.body.classList.toggle("mode-review", state.resolvedMode === "review");
+  el["mode-switcher"].querySelectorAll("button[data-mode]").forEach((button) => {
+    button.setAttribute("aria-pressed", String(button.dataset.mode === state.mode));
+  });
+  el["runtime-dashboard"].classList.toggle("runtime-quiet", state.resolvedMode === "review" && !activeRuntime);
+  if (state.resolvedMode === "live") {
+    document.querySelector(".headline-panel").before(el["runtime-dashboard"]);
+  } else {
+    el["metric-rail"].after(el["runtime-dashboard"]);
+  }
+
+  const data = state.data;
+  if (!data) return;
+  const viewLabel = state.viewDate === todayISO() ? "今日" : state.viewDate;
+  if (isFallbackView(data)) {
+    el["data-context-title"].textContent = `${viewLabel}状态 · 复盘参考 ${data.review_date}`;
+    el["data-context-detail"].textContent = `实时任务属于当前时刻；交易指标和证据来自最近交易日 ${data.review_date}`;
+  } else {
+    el["data-context-title"].textContent = `${viewLabel} · 当日交易复盘`;
+    el["data-context-detail"].textContent = `指标、订单和证据均对应 ${data.review_date}`;
+  }
+}
+
+function renderFreshness() {
+  const data = state.data || {};
+  const selectedTask = selectedRuntimeTask();
+  const activeTask = state.runtimeTasks.find((task) => task.status === "running") || null;
+  const sources = Array.isArray(data.sources) ? data.sources : [];
+  const missingSources = sources.filter((source) => source.status === "missing").length;
+  const healthySources = sources.filter((source) => ["healthy", "present"].includes(source.status)).length;
+  setFreshnessItem("freshness-page", state.runtimePayload?.generated_at || data.generated_at, "success", "刚刚刷新");
+
+  if (activeTask) {
+    const age = finiteAge(activeTask.heartbeat_at);
+    setFreshnessItem("freshness-runtime", activeTask.heartbeat_at, age <= 5 ? "success" : age <= 15 ? "warning" : "critical", `PID ${activeTask.pid}`);
+  } else {
+    setFreshnessItem("freshness-runtime", null, "neutral", selectedTask ? "当前已停止" : "未发现任务");
+  }
+
+  const broker = data.broker || {};
+  if (broker.status === "verified") {
+    const age = finiteAge(broker.synced_at);
+    setFreshnessItem("freshness-broker", broker.synced_at, age <= 120 ? "success" : age <= 600 ? "warning" : "critical", "只读已核对");
+  } else {
+    setFreshnessItem("freshness-broker", null, broker.status === "unavailable" ? "critical" : "warning", broker.error || "尚未核对");
+  }
+
+  const sourceTone = missingSources ? "critical" : healthySources ? "success" : "warning";
+  const sourceText = isFallbackView(data) ? `参考日文件 ${healthySources}/${sources.length}` : `正常 ${healthySources}/${sources.length}`;
+  setFreshnessItem("freshness-source", null, sourceTone, missingSources ? `${sourceText} · 缺 ${missingSources}` : sourceText);
+  setFreshnessItem("freshness-environment", null, broker.mode === "live" ? "warning" : broker.mode ? "success" : "neutral", broker.mode ? String(broker.mode).toUpperCase() : "—");
+}
+
+function setFreshnessItem(id, timestamp, tone, fallback) {
+  const value = el[id];
+  const item = value.closest(".freshness-item");
+  item.className = `freshness-item ${tone}`;
+  value.textContent = timestamp ? formatAge(timestamp) : fallback;
+  if (timestamp && fallback) value.title = `${fallback} · ${formatDateTime(timestamp)}`;
+  else value.removeAttribute("title");
+}
+
+function finiteAge(value) {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? Number.POSITIVE_INFINITY : Math.max(0, (Date.now() - date.getTime()) / 1000);
+}
+
+function formatAge(value) {
+  const seconds = finiteAge(value);
+  if (!Number.isFinite(seconds)) return "时间未知";
+  if (seconds < 5) return "刚刚";
+  if (seconds < 60) return `${Math.floor(seconds)} 秒前`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)} 分钟前`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)} 小时前`;
+  return `${Math.floor(seconds / 86400)} 天前`;
+}
+
 async function loadReview(dateValue) {
   const token = ++state.requestToken;
   setBusy(true);
@@ -150,12 +432,13 @@ async function loadReview(dateValue) {
     setBusy(false);
     state.brokerLoading = true;
     renderHeader();
-    query.set("date", local.review_date);
+    query.set("date", local.requested_date || local.review_date);
     query.set("broker", "1");
     try {
       const reconciled = await fetchJSON(`${API.review}?${query}`);
       if (token !== state.requestToken) return;
       state.data = reconciled;
+      syncDateState();
       state.brokerLoading = false;
       renderAll();
       announce("券商只读核对完成");
@@ -175,6 +458,8 @@ async function loadReview(dateValue) {
 function renderAll() {
   if (!state.data) return;
   renderHeader();
+  renderWorkspaceMode();
+  renderFreshness();
   renderHeadline();
   renderConflict();
   renderMetrics();
@@ -195,19 +480,26 @@ function renderAll() {
 function renderHeader() {
   const data = state.data;
   if (!data) return;
-  el["review-date"].value = data.review_date || "";
+  const fallback = isFallbackView(data);
+  const requestedTradingDay = data.market_day?.requested_is_trading_day !== false;
+  const viewingToday = state.viewDate === todayISO();
+  el["review-date"].value = state.viewDate || data.review_date || "";
   const complete = (data.summary?.rounds?.intraday || 0) > 0;
-  el["review-status"].className = `status-indicator ${complete ? "success" : "warning"}`;
-  el["review-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${complete ? "复盘已完成" : "数据不完整"}</span>`;
+  const reviewLabel = fallback
+    ? (requestedTradingDay ? (viewingToday ? "今日待数据" : "所选日待数据") : (viewingToday ? "今日休市" : "所选日休市"))
+    : (complete ? "复盘已完成" : "数据不完整");
+  el["review-status"].className = `status-indicator ${fallback ? "warning" : complete ? "success" : "warning"}`;
+  el["review-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${reviewLabel}</span>`;
   const phaseRanges = data.phases || [];
   const first = phaseRanges.find((item) => item.start_at)?.start_at;
   const last = [...phaseRanges].reverse().find((item) => item.end_at)?.end_at;
-  const coverage = first && last ? `${formatTime(first)}—${formatTime(last)} ET` : "覆盖时间不完整";
+  const coverageValue = first && last ? `${formatTime(first)}—${formatTime(last)} ET` : "覆盖时间不完整";
+  const coverage = fallback ? `参考日 ${coverageValue}` : coverageValue;
   el["coverage-status"].innerHTML = `${icon("clock")}<span>${coverage}</span>`;
   const brokerStatus = state.brokerLoading ? "loading" : data.quality?.broker_status;
   const brokerMap = {
     loading: ["warning", "正在只读核对…"],
-    verified: ["success", `Alpaca ${String(data.broker?.mode || "").toUpperCase()} 已核对`],
+    verified: ["success", `Alpaca ${String(data.broker?.mode || "").toUpperCase()} ${fallback ? "参考日已核对" : "已核对"}`],
     unavailable: ["warning", "Alpaca 核对不可用"],
     not_requested: ["neutral", "券商未核对"],
   };
@@ -221,10 +513,22 @@ function renderHeader() {
   el["generated-at"].textContent = `生成 ${formatDateTime(data.generated_at)}`;
   el["market-banner"].hidden = !data.market_day?.banner;
   el["market-banner"].textContent = data.market_day?.banner || "";
+  el["today-button"].disabled = viewingToday;
   updateDateButtons();
 }
 
 function renderHeadline() {
+  const data = state.data || {};
+  if (isFallbackView(data)) {
+    const viewingToday = state.viewDate === todayISO();
+    const requestedTradingDay = data.market_day?.requested_is_trading_day !== false;
+    const dateLabel = viewingToday ? "今日" : state.viewDate;
+    el["headline-title"].textContent = requestedTradingDay
+      ? `${dateLabel}复盘数据尚未生成`
+      : `${dateLabel}休市，当前没有当日交易复盘`;
+    el["headline-detail"].textContent = `实时盯盘仍显示本机当前输出；下方保留最近交易日 ${data.review_date} 的复盘数据作为参考。`;
+    return;
+  }
   const headline = state.data?.headline || {};
   el["headline-title"].textContent = headline.title || "当天复盘";
   el["headline-detail"].textContent = headline.detail || "暂无补充结论。";
@@ -234,21 +538,25 @@ function renderConflict() {
   const critical = (state.data?.attention || []).find((item) => item.severity === "critical");
   el["conflict-banner"].hidden = !critical;
   if (!critical) return;
-  el["conflict-title"].textContent = `必须核对 · ${critical.title}`;
+  const prefix = isFallbackView(state.data) ? "最近交易日参考 · " : "必须核对 · ";
+  el["conflict-title"].textContent = `${prefix}${critical.title}`;
   el["conflict-detail"].textContent = critical.message;
 }
 
 function metricDefinitions() {
   const s = state.data?.summary || {};
+  const referenceDate = isFallbackView(state.data) ? state.data.review_date : "";
+  const label = (currentLabel, referenceLabel) => referenceDate ? referenceLabel : currentLabel;
+  const subtitle = (value) => referenceDate ? `${value} · ${referenceDate}` : value;
   return [
-    { label: "券商买入股票", value: num(s.broker_bought_symbols), subtitle: "至少有部分成交", icon: "bag", tone: "success", bucket: "broker_filled" },
-    { label: "已全部卖出", value: num(s.broker_closed_symbols), subtitle: "按复盘日买卖成交量", icon: "check", tone: "success", bucket: "broker_closed" },
-    { label: "券商订单", value: num(s.broker_order_count), subtitle: "含成交、取消与部分成交", icon: "order", tone: "info", bucket: "broker_activity" },
-    { label: "未成交买入", value: num(s.broker_unfilled_buy_symbols), subtitle: "按股票去重", icon: "hourglass", tone: "warning", bucket: "buy_unfilled" },
-    { label: "策略候选", value: num(s.watch_counts?.intraday), subtitle: "盘中 MA5 观察池", icon: "users", tone: "neutral", bucket: "strategy" },
-    { label: "今日排除", value: num(s.excluded_count), subtitle: "当天不再考虑买入", icon: "ban", tone: "warning", bucket: "excluded" },
+    { label: label("券商买入股票", "参考日券商买入"), value: num(s.broker_bought_symbols), subtitle: subtitle("至少有部分成交"), icon: "bag", tone: "success", bucket: "broker_filled" },
+    { label: label("已全部卖出", "参考日已全部卖出"), value: num(s.broker_closed_symbols), subtitle: subtitle("按复盘日买卖成交量"), icon: "check", tone: "success", bucket: "broker_closed" },
+    { label: label("券商订单", "参考日券商订单"), value: num(s.broker_order_count), subtitle: subtitle("含成交、取消与部分成交"), icon: "order", tone: "info", bucket: "broker_activity" },
+    { label: label("未成交买入", "参考日未成交买入"), value: num(s.broker_unfilled_buy_symbols), subtitle: subtitle("按股票去重"), icon: "hourglass", tone: "warning", bucket: "buy_unfilled" },
+    { label: label("策略候选", "参考日策略候选"), value: num(s.watch_counts?.intraday), subtitle: subtitle("盘中 MA5 观察池"), icon: "users", tone: "neutral", bucket: "strategy" },
+    { label: label("今日排除", "参考日排除"), value: num(s.excluded_count), subtitle: subtitle("当天不再考虑买入"), icon: "ban", tone: "warning", bucket: "excluded" },
     { label: "当前持仓", value: num(s.current_positions), subtitle: "只读券商当前快照", icon: "wallet", tone: "neutral", bucket: "current_position" },
-    { label: "当日成交净现金流", value: money(s.net_cash_flow), subtitle: "按成交额计算，未含费用", icon: "database", tone: cashTone(s.net_cash_flow), bucket: "cash_flow" },
+    { label: label("当日成交净现金流", "参考日成交净现金流"), value: money(s.net_cash_flow), subtitle: subtitle("按成交额计算，未含费用"), icon: "database", tone: cashTone(s.net_cash_flow), bucket: "cash_flow" },
   ];
 }
 
@@ -269,12 +577,13 @@ function renderMetrics() {
 
 function renderQuickFilters() {
   const symbols = state.data?.symbols || [];
+  const excludedLabel = isFallbackView(state.data) ? "参考日排除" : "今日排除";
   const definitions = [
     ["", "全部", symbols.length],
     ["broker_filled", "券商已成交", symbols.filter((item) => ["broker_closed", "broker_bought"].includes(item.bucket)).length],
     ["buy_unfilled", "买入未成", symbols.filter((item) => item.bucket === "buy_unfilled").length],
     ["strategy", "策略未买", symbols.filter((item) => ["not_bought", "window_outside_closest", "excluded"].includes(item.bucket)).length],
-    ["excluded", "今日排除", symbols.filter((item) => item.bucket === "excluded").length],
+    ["excluded", excludedLabel, symbols.filter((item) => item.bucket === "excluded").length],
     ["data_conflict", "数据冲突", symbols.filter((item) => ["missing", "partial", "unmatched"].includes(item.local_ledger_match)).length],
   ];
   el["quick-filters"].innerHTML = definitions.map(([key, label, count]) => `
@@ -408,6 +717,7 @@ function renderLifecycle() {
 
 function renderReasons() {
   const items = state.data?.reason_distribution || [];
+  el["reasons-title"].textContent = isFallbackView(state.data) ? `未买原因（参考日 ${state.data.review_date}）` : "未买原因（当日）";
   const max = Math.max(1, ...items.map((item) => item.count || 0));
   el["reasons-content"].innerHTML = items.length ? `<div class="reason-list">${items.map((item) => `
     <button class="reason-row text-button" type="button" data-reason="${escapeAttr(item.code)}">
@@ -736,22 +1046,32 @@ function syncDateState() {
   if (!data) return;
   if (!state.dates.includes(data.review_date)) state.dates.push(data.review_date);
   state.dates.sort().reverse();
-  el["review-date"].value = data.review_date;
+  state.viewDate = validDate(data.requested_date) ? data.requested_date : data.review_date;
+  el["review-date"].value = state.viewDate;
   const url = new URL(location.href);
-  url.searchParams.set("date", data.review_date);
+  url.searchParams.set("date", state.viewDate);
   history.replaceState({}, "", url);
 }
 
 function updateDateButtons() {
-  const dateValue = state.data?.review_date;
+  const dateValue = state.viewDate || state.data?.review_date;
   const index = state.dates.indexOf(dateValue);
-  el["previous-date"].disabled = index < 0 || index >= state.dates.length - 1;
-  el["next-date"].disabled = index <= 0;
+  if (index >= 0) {
+    el["previous-date"].disabled = index >= state.dates.length - 1;
+    el["next-date"].disabled = index <= 0;
+  } else {
+    el["previous-date"].disabled = !state.dates.some((dateValueItem) => dateValueItem < dateValue);
+    el["next-date"].disabled = !state.dates.some((dateValueItem) => dateValueItem > dateValue);
+  }
 }
 
 function navigateDate(direction) {
-  const index = state.dates.indexOf(state.data?.review_date);
-  const target = direction === "previous" ? state.dates[index + 1] : state.dates[index - 1];
+  const dateValue = state.viewDate || state.data?.review_date;
+  const index = state.dates.indexOf(dateValue);
+  let target;
+  if (index >= 0) target = direction === "previous" ? state.dates[index + 1] : state.dates[index - 1];
+  else if (direction === "previous") target = state.dates.find((dateValueItem) => dateValueItem < dateValue);
+  else target = [...state.dates].reverse().find((dateValueItem) => dateValueItem > dateValue);
   if (target) loadReview(target);
 }
 
@@ -759,6 +1079,7 @@ function setBusy(busy) {
   el["refresh-button"].disabled = busy;
   el["refresh-button"].classList.toggle("is-loading", busy);
   el["review-date"].disabled = busy;
+  el["today-button"].disabled = busy || state.viewDate === todayISO();
   if (busy) announce("正在加载当天复盘");
 }
 
@@ -838,7 +1159,7 @@ function symbolTime(item) {
 function sourceName(value) { return value === "alpaca" ? "Alpaca API" : value === "monitor_auto" ? "监控日志" : value === "buy_exclusions" ? "排除记录" : value === "local" ? "本地账本" : String(value || "本地证据"); }
 function healthStatus(value) { return ({ healthy: "正常", present: "正常", empty: "空文件", missing: "缺失", verified: "已核对", unavailable: "不可用", not_requested: "未核对" })[value] || String(value || "未知"); }
 function bucketPriority(value) { return ({ broker_closed: 0, broker_bought: 1, buy_unfilled: 2, position_unreconciled: 3, excluded: 4, window_outside_closest: 5, not_bought: 6, broker_activity: 7 })[value] ?? 99; }
-function bucketLabel(value) { return ({ broker_filled: "券商已成交", broker_closed: "已全部卖出", broker_activity: "券商订单", buy_unfilled: "买入未成", strategy: "策略未买", excluded: "今日排除", current_position: "当前持仓", cash_flow: "有成交净现金流", data_conflict: "数据冲突" })[value] || "全部"; }
+function bucketLabel(value) { return ({ broker_filled: "券商已成交", broker_closed: "已全部卖出", broker_activity: "券商订单", buy_unfilled: "买入未成", strategy: "策略未买", excluded: isFallbackView(state.data) ? "参考日排除" : "今日排除", current_position: "当前持仓", cash_flow: "有成交净现金流", data_conflict: "数据冲突" })[value] || "全部"; }
 function severityClass(value) { return ["success", "warning", "critical", "info", "neutral"].includes(value) ? value : "neutral"; }
 function cashTone(value) { return value === null || value === undefined ? "neutral" : (Number(value) >= 0 ? "success" : "danger"); }
 function money(value) { return value === null || value === undefined || Number.isNaN(Number(value)) ? "—" : `${Number(value) >= 0 ? "+" : "-"}$${Math.abs(Number(value)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
@@ -851,6 +1172,12 @@ function bytes(value) { const number = Number(value || 0); if (!number) return "
 function formatTime(value) { if (!value) return "—"; const date = new Date(value); return Number.isNaN(date.getTime()) ? String(value).slice(11, 16) : new Intl.DateTimeFormat("zh-CN", { timeZone: "America/New_York", hour: "2-digit", minute: "2-digit", hour12: false }).format(date); }
 function formatDateTime(value) { if (!value) return "—"; const date = new Date(value); return Number.isNaN(date.getTime()) ? String(value) : new Intl.DateTimeFormat("zh-CN", { timeZone: "America/New_York", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(date); }
 function validDate(value) { return /^\d{4}-\d{2}-\d{2}$/.test(String(value || "")); }
+function isFallbackView(data) { return Boolean(data?.market_day?.is_fallback && data.requested_date && data.requested_date !== data.review_date); }
+function todayISO() {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
 function localeCompare(a, b) { return a.localeCompare(b, "zh-CN", { numeric: true, sensitivity: "base" }); }
 function emptyText(text) { return `<div class="section-empty compact-empty">${icon("info")}<span>${escapeHTML(text)}</span></div>`; }
 function isTextInput(target) { return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target?.isContentEditable; }

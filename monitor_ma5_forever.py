@@ -7,6 +7,7 @@ ensure_local_venv()
 from alpaca_ma5_service import strategy_ma5_dip
 from alpaca_ma5_service.config import MA5_DIP_STRATEGY_NAME, build_settings
 from alpaca_ma5_service.final_strategy import STRATEGY_NAME as GAP_CONFIRMED_PULLBACK_STRATEGY
+from alpaca_ma5_service.monitor_runtime import monitor_runtime
 from alpaca_ma5_service.service import run_forever
 
 
@@ -156,8 +157,7 @@ def monitor_ma5_forever() -> None:
     if STRATEGY_NAME == MA5_DIP_STRATEGY_NAME:
         apply_ma5_dip_config()
 
-    run_forever(
-        build_settings(
+    settings = build_settings(
             strategy_name=STRATEGY_NAME,
             buy_stock_count=BUY_STOCK_COUNT,
             buy_notional_usd=BUY_NOTIONAL_USD,
@@ -179,7 +179,8 @@ def monitor_ma5_forever() -> None:
             realtime_price_source=REALTIME_PRICE_SOURCE,
             trade_notify_mode=TRADE_NOTIFY_MODE,
         )
-    )
+    with monitor_runtime(settings.output_dir, "monitor_ma5", "intraday"):
+        run_forever(settings)
 
 
 if __name__ == "__main__":

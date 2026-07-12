@@ -5,6 +5,8 @@ from alpaca_ma5_service.entrypoint import ensure_local_venv
 ensure_local_venv()
 
 from alpaca_ma5_service.afterhours_monitor import AFTERHOURS_REQUIRE_PAPER, monitor_afterhours_trades
+from alpaca_ma5_service.config import build_settings
+from alpaca_ma5_service.monitor_runtime import monitor_runtime
 
 
 def monitor_afterhours(
@@ -22,7 +24,9 @@ def monitor_afterhours(
     }
     if sleep is not None:
         kwargs["sleep"] = sleep
-    monitor_afterhours_trades(require_paper=AFTERHOURS_REQUIRE_PAPER, **kwargs)
+    settings = build_settings()
+    with monitor_runtime(settings.output_dir, "monitor_afterhours", "afterhours"):
+        monitor_afterhours_trades(require_paper=AFTERHOURS_REQUIRE_PAPER, **kwargs)
 
 
 if __name__ == "__main__":

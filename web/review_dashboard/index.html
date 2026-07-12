@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071016">
   <meta name="description" content="MA5 每日交易复盘与证据核对工作台">
   <title>MA5 每日复盘</title>
-  <link rel="stylesheet" href="./styles.css">
+  <link rel="stylesheet" href="./styles.css?v=20260712-optimize1">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到复盘内容</a>
@@ -42,6 +42,7 @@
     <symbol id="icon-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m6 6 12 12"/></symbol>
     <symbol id="icon-hourglass" viewBox="0 0 24 24"><path d="M7 3h10M7 21h10M8 3c0 5 2 6 4 9-2 3-4 4-4 9M16 3c0 5-2 6-4 9 2 3 4 4 4 9"/></symbol>
     <symbol id="icon-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></symbol>
+    <symbol id="icon-terminal" viewBox="0 0 24 24"><path d="m5 7 4 5-4 5M11 17h8"/></symbol>
   </svg>
 
   <header class="app-header">
@@ -52,6 +53,7 @@
       <a class="brand" href="./" aria-label="MA5 每日复盘首页">MA5 每日复盘</a>
       <nav id="section-nav" class="section-nav" aria-label="页面区域" hidden>
         <a href="#decision-workspace">统一决策</a>
+        <a href="#runtime-dashboard">实时盯盘</a>
         <a href="#evidence-column">证据与核对</a>
         <a href="#review-sections">六区复盘</a>
       </nav>
@@ -69,6 +71,7 @@
       <button id="next-date" class="icon-button compact" type="button" aria-label="下一交易日" disabled>
         <svg aria-hidden="true"><use href="#icon-chevron-right"></use></svg>
       </button>
+      <button id="today-button" class="button secondary today-button" type="button">今日</button>
     </div>
 
     <div class="header-statuses" aria-label="复盘状态">
@@ -96,6 +99,27 @@
   <main id="main-content" tabindex="-1">
     <div id="market-banner" class="market-banner" role="status" hidden></div>
 
+    <section class="workspace-control-bar" aria-label="看板工作模式与数据上下文">
+      <div id="mode-switcher" class="mode-switcher" role="group" aria-label="工作模式">
+        <button type="button" data-mode="smart" aria-pressed="true">智能布局</button>
+        <button type="button" data-mode="live" aria-pressed="false">盘中监控</button>
+        <button type="button" data-mode="review" aria-pressed="false">盘后复盘</button>
+      </div>
+      <div id="data-context" class="data-context">
+        <span class="context-label">数据上下文</span>
+        <strong id="data-context-title">正在确认日期…</strong>
+        <span id="data-context-detail">实时任务与复盘证据将分别标注</span>
+      </div>
+    </section>
+
+    <section id="freshness-strip" class="freshness-strip" aria-label="数据新鲜度与连接状态">
+      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>页面</span><strong id="freshness-page">加载中</strong></div>
+      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>盯盘心跳</span><strong id="freshness-runtime">未发现</strong></div>
+      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>Alpaca</span><strong id="freshness-broker">待核对</strong></div>
+      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>本地证据</span><strong id="freshness-source">待读取</strong></div>
+      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>环境</span><strong id="freshness-environment">—</strong></div>
+    </section>
+
     <section class="headline-panel" aria-labelledby="headline-title">
       <div>
         <h1 id="headline-title">正在读取当天复盘…</h1>
@@ -114,6 +138,49 @@
     </section>
 
     <section id="metric-rail" class="metric-rail" aria-label="今日关键指标" aria-busy="true"></section>
+
+    <section id="runtime-dashboard" class="panel runtime-dashboard" aria-labelledby="runtime-title">
+      <div class="panel-header runtime-header">
+        <div>
+          <div class="runtime-title-row">
+            <h2 id="runtime-title">实时盯盘输出</h2>
+            <span id="runtime-status" class="status-indicator neutral"><span class="status-dot" aria-hidden="true"></span><span>正在发现本机任务</span></span>
+          </div>
+          <p id="runtime-summary" class="muted">Python 命令行与 IDE 启动的监控都会自动出现在这里。</p>
+        </div>
+        <div class="runtime-actions">
+          <label class="follow-control"><input id="runtime-follow" type="checkbox" checked><span>跟随最新输出</span></label>
+          <button id="runtime-refresh" class="button secondary compact-button" type="button">
+            <svg aria-hidden="true"><use href="#icon-refresh"></use></svg><span>立即刷新</span>
+          </button>
+        </div>
+      </div>
+      <div class="runtime-layout">
+        <div id="runtime-task-list" class="runtime-task-list" role="listbox" aria-label="本地盯盘任务"></div>
+        <div class="runtime-main">
+          <div class="runtime-view-toolbar">
+            <div id="runtime-view-switcher" class="runtime-view-switcher" role="tablist" aria-label="盯盘输出视图">
+              <button id="runtime-events-tab" type="button" role="tab" aria-selected="true" aria-controls="runtime-events-panel" data-runtime-view="events">状态变化</button>
+              <button id="runtime-console-tab" type="button" role="tab" aria-selected="false" aria-controls="runtime-console-panel" data-runtime-view="console">原始日志</button>
+            </div>
+            <label class="runtime-event-filter"><span>筛选</span><select id="runtime-event-filter"><option value="">全部事件</option><option value="critical">异常与订单</option><option value="warning">触发与接近</option><option value="changed">仅状态变化</option></select></label>
+            <span id="runtime-updated-at">—</span>
+          </div>
+          <section id="runtime-events-panel" class="runtime-events-panel" role="tabpanel" aria-labelledby="runtime-events-tab">
+            <div id="runtime-event-summary" class="runtime-event-summary">正在提取状态变化…</div>
+            <div id="runtime-event-list" class="runtime-event-list"></div>
+          </section>
+          <div id="runtime-console-panel" class="runtime-console-shell" role="tabpanel" aria-labelledby="runtime-console-tab" hidden>
+            <div class="runtime-console-bar">
+              <div><span class="terminal-dot red"></span><span class="terminal-dot amber"></span><span class="terminal-dot green"></span></div>
+              <span id="runtime-console-title">等待盯盘任务</span>
+              <span>诊断原始输出</span>
+            </div>
+            <pre id="runtime-console" class="runtime-console" tabindex="0">正在查找本机运行中的盯盘任务…</pre>
+          </div>
+        </div>
+      </div>
+    </section>
 
     <div id="page-error" class="page-state error-state" role="alert" hidden>
       <svg aria-hidden="true"><use href="#icon-alert"></use></svg>
@@ -221,7 +288,7 @@
         <div id="lifecycle-content" class="panel-content"></div>
       </article>
       <article class="panel review-panel" aria-labelledby="reasons-title">
-        <div class="panel-header"><h2 id="reasons-title">未买原因（今日）</h2></div>
+        <div class="panel-header"><h2 id="reasons-title">未买原因</h2></div>
         <div id="reasons-content" class="panel-content"></div>
       </article>
       <article class="panel review-panel orders-panel" aria-labelledby="orders-title">
@@ -325,6 +392,6 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <div id="app-live-region" class="sr-only" role="status" aria-live="polite"></div>
 
-  <script src="./app.js" defer></script>
+  <script src="./app.js?v=20260712-optimize1" defer></script>
 </body>
 </html>

@@ -166,6 +166,10 @@ def make_review_handler(base_dir: Path, *, review_api=None):
                 if path == "/api/review/evidence":
                     self._serve_evidence(parsed.query, send_body=send_body)
                     return
+                if path == "/api/runtime/tasks":
+                    self._require_query_keys(parsed.query, set())
+                    self._serve_runtime_tasks(send_body=send_body)
+                    return
                 if path.startswith("/api/"):
                     self._json_error(HTTPStatus.NOT_FOUND, "API endpoint not found", send_body=send_body)
                     return
@@ -203,6 +207,11 @@ def make_review_handler(base_dir: Path, *, review_api=None):
             api = review_api if review_api is not None else _review_data_api()
             dates = api.list_review_dates(base_dir=root)
             self._send_json(HTTPStatus.OK, {"dates": dates}, send_body=send_body)
+
+        def _serve_runtime_tasks(self, *, send_body: bool) -> None:
+            from .monitor_runtime import read_monitor_tasks
+
+            self._send_json(HTTPStatus.OK, read_monitor_tasks(root), send_body=send_body)
 
         def _serve_review(self, query: str, *, send_body: bool) -> None:
             params = self._require_query_keys(query, {"date", "broker"})

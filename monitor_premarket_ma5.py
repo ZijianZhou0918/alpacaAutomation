@@ -5,6 +5,7 @@ from alpaca_ma5_service.entrypoint import ensure_local_venv
 ensure_local_venv()
 
 from alpaca_ma5_service.config import build_settings
+from alpaca_ma5_service.monitor_runtime import monitor_runtime
 from alpaca_ma5_service.premarket_monitor import run_premarket_recommendations_forever
 
 
@@ -22,7 +23,8 @@ def monitor_premarket_ma5(*, max_loops: int | None = None, sleep=None, now_provi
     kwargs = {"settings": settings, "max_loops": max_loops, "now_provider": now_provider}
     if sleep is not None:
         kwargs["sleep"] = sleep
-    run_premarket_recommendations_forever(**kwargs)
+    with monitor_runtime(settings.output_dir, "monitor_premarket", "premarket"):
+        run_premarket_recommendations_forever(**kwargs)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ from alpaca_ma5_service.afterhours_monitor import AFTERHOURS_RANGE_RATIO_THRESHO
 from alpaca_ma5_service.config import build_settings
 from alpaca_ma5_service.daily_report import send_daily_monitor_report
 from alpaca_ma5_service.market_time import DAILY_BAR_READY, REALTIME_ORDER_CLOSE, REGULAR_CLOSE, REGULAR_OPEN
+from alpaca_ma5_service.monitor_runtime import monitor_runtime
 from alpaca_ma5_service.premarket_watchlist import premarket_watch_codes_path
 from alpaca_ma5_service.run_lock import acquire_run_lock
 from alpaca_ma5_service.watchlist import read_watch_codes
@@ -78,36 +79,37 @@ def monitor_auto(*, now_provider=None, sleep=time.sleep) -> None:
     """Single scheduled entrypoint: prepare watchcodes, then run the active session monitor."""
     settings = build_settings()
     now_provider = now_provider or (lambda: datetime.now(ZoneInfo(settings.market_timezone)))
-    run_lock = acquire_run_lock(settings.output_dir, "auto_ma5_monitor.lock", "自动 MA5 监控入口")
-    try:
-        while True:
-            now_et = now_provider()
-            now_time = now_et.time()
+    with monitor_runtime(settings.output_dir, "monitor_auto", "auto"):
+        run_lock = acquire_run_lock(settings.output_dir, "auto_ma5_monitor.lock", "自动 MA5 监控入口")
+        try:
+            while True:
+                now_et = now_provider()
+                now_time = now_et.time()
 
-            if now_time < REGULAR_OPEN:
-                ensure_premarket_watchcode(now_et)
-                print("当前处于盘前准备/盘前时段，进入盘前推荐监控。", flush=True)
-                monitor_premarket_ma5(sleep=sleep, now_provider=now_provider)
-                continue
+                if now_time < REGULAR_OPEN:
+                    ensure_premarket_watchcode(now_et)
+                    print("当前处于盘前准备/盘前时段，进入盘前推荐监控。", flush=True)
+                    monitor_premarket_ma5(sleep=sleep, now_provider=now_provider)
+                    continue
 
-            if now_time < REGULAR_CLOSE:
-                ensure_intraday_watchcode(now_et)
-                print("当前处于盘中时段，进入盘中 MA5 监控。", flush=True)
-                monitor_ma5_forever()
-                continue
+                if now_time < REGULAR_CLOSE:
+                    ensure_intraday_watchcode(now_et)
+                    print("当前处于盘中时段，进入盘中 MA5 监控。", flush=True)
+                    monitor_ma5_forever()
+                    continue
 
-            if now_time < REALTIME_ORDER_CLOSE:
-                ensure_afterhours_watchcode(now_et)
-                print("当前处于盘后时段，进入盘后 high/low 监控。", flush=True)
-                monitor_afterhours(sleep=sleep, now_provider=now_provider, stop_at_afterhours_end=True)
-                send_daily_monitor_report(settings, now_et=now_provider())
+                if now_time < REALTIME_ORDER_CLOSE:
+                    ensure_afterhours_watchcode(now_et)
+                    print("当前处于盘后时段，进入盘后 high/low 监控。", flush=True)
+                    monitor_afterhours(sleep=sleep, now_provider=now_provider, stop_at_afterhours_end=True)
+                    send_daily_monitor_report(settings, now_et=now_provider())
+                    return
+
+                print(f"[{now_et:%Y-%m-%d %H:%M:%S %Z}] 已到 20:00 ET，盘前/盘中/盘后自动监控入口退出。", flush=True)
+                send_daily_monitor_report(settings, now_et=now_et)
                 return
-
-            print(f"[{now_et:%Y-%m-%d %H:%M:%S %Z}] 已到 20:00 ET，盘前/盘中/盘后自动监控入口退出。", flush=True)
-            send_daily_monitor_report(settings, now_et=now_et)
-            return
-    finally:
-        run_lock.close()
+        finally:
+            run_lock.close()
 
 
 def ensure_intraday_watchcode(now_et: datetime) -> None:

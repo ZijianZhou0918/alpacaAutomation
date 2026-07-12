@@ -167,6 +167,38 @@ class ReviewWebHTTPTests(TestCase):
         self.assertIn(("review", "2026-07-10", True, self.root), self.api.calls)
         self.assertIn(("evidence", "2026-07-10", "monitor:US.HAO", 42, 3, self.root), self.api.calls)
 
+    def test_runtime_tasks_endpoint_is_read_only_and_root_scoped(self):
+        runtime_dir = self.root / "outputs" / "monitor_runtime"
+        runtime_dir.mkdir(parents=True)
+        instance_id = "999999-unit"
+        (runtime_dir / f"{instance_id}.log").write_text("hello dashboard\n", encoding="utf-8")
+        (runtime_dir / f"{instance_id}.json").write_text(
+            json.dumps(
+                {
+                    "instance_id": instance_id,
+                    "pid": 999999,
+                    "task_name": "monitor_ma5",
+                    "task_label": "盘中 MA5 盯盘",
+                    "phase": "intraday",
+                    "phase_label": "盘中监控",
+                    "status": "finished",
+                    "started_at": "2026-07-12T10:00:00+00:00",
+                    "heartbeat_at": "2026-07-12T10:00:01+00:00",
+                    "log_file": f"{instance_id}.log",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+        status, headers, payload = self.request_json("/api/runtime/tasks")
+
+        self.assertEqual(status, HTTPStatus.OK)
+        self.assertEqual(headers["Cache-Control"], "no-store, max-age=0")
+        self.assertEqual(payload["active_count"], 0)
+        self.assertEqual(payload["tasks"][0]["instance_id"], instance_id)
+        self.assertIn("hello dashboard", payload["tasks"][0]["log"])
+
     def test_api_rejects_invalid_or_ambiguous_query_values(self):
         invalid_targets = [
             "/api/review?date=2026-02-30",
