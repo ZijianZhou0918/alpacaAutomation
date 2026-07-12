@@ -1,8 +1,10 @@
 $ErrorActionPreference = "Stop"
 
 $ProjectDir = "C:\Users\zzj\Desktop\alpaca_ma5_service"
-$RunScript = Join-Path $ProjectDir "watchcode_ma5.py"
+$IntradayRunScript = Join-Path $ProjectDir "watchcode_ma5.py"
+$PremarketRunScript = Join-Path $ProjectDir "watchcode_premarket.py"
 $WatchCodesFile = Join-Path $ProjectDir "watch_codes.txt"
+$PremarketWatchCodesFile = Join-Path $ProjectDir "watch_codes_premarket.txt"
 $LogDir = Join-Path $ProjectDir "outputs\logs"
 $LogFile = Join-Path $LogDir ("pycharm_watchcode_task_{0}.log" -f (Get-Date -Format "yyyyMMdd"))
 $DirectRunLog = Join-Path $LogDir ("watchcode_direct_run_{0}.log" -f (Get-Date -Format "yyyyMMdd"))
@@ -13,33 +15,32 @@ if (-not (Test-Path $CommonScript)) {
 }
 . $CommonScript
 
-try {
-    $startedAt = Get-Date
-    Write-Ma5TaskLog $LogDir $LogFile "Starting direct watchcode task."
-    if (-not (Test-Ma5TradingDayForTask $ProjectDir $LogDir $LogFile 1 "tomorrow watchcode generation")) {
-        exit 0
-    }
+function Invoke-Ma5WatchcodeScript {
+    param(
+        [object]$Python,
+        [string]$RunScript,
+        [string]$ScriptName,
+        [string]$OutputFile,
+        [string]$Label,
+        [datetime]$StartedAt
+    )
 
     if (-not (Test-Path $RunScript)) {
-        throw "Run script not found: $RunScript"
+        throw "$Label script not found: $RunScript"
     }
-    $python = Resolve-Ma5Python $ProjectDir
-    Write-Ma5TaskLog $LogDir $LogFile "Using python fallback: $($python.Label) at $($python.FilePath)"
 
-    $existing = Get-Ma5PythonProcess $ProjectDir "watchcode_ma5.py"
+    $existing = Get-Ma5PythonProcess $ProjectDir $ScriptName
     if ($existing) {
         $ids = ($existing | ForEach-Object { $_.ProcessId }) -join ", "
-        Write-Ma5TaskLog $LogDir $LogFile "watchcode_ma5.py is already running. Skip direct start. PIDs: $ids"
-        exit 0
+        Write-Ma5TaskLog $LogDir $LogFile "$ScriptName is already running. Skip direct $Label generation. PIDs: $ids"
+        return
     }
 
-    Start-Ma5PyCharm $ProjectDir $RunScript $LogDir $LogFile | Out-Null
-
-    Write-Ma5TaskLog $LogDir $LogFile "Running watchcode_ma5.py through direct python."
+    Write-Ma5TaskLog $LogDir $LogFile "Running $ScriptName for $Label through direct python."
     Push-Location $ProjectDir
     try {
-        $pythonExe = $python.FilePath
-        $pythonArgs = @($python.Args + @($RunScript))
+        $pythonExe = $Python.FilePath
+        $pythonArgs = @($Python.Args + @($RunScript))
         & $pythonExe @pythonArgs *>> $DirectRunLog
         $exitCode = $LASTEXITCODE
     } finally {
@@ -47,18 +48,37 @@ try {
     }
 
     if ($exitCode -ne 0) {
-        throw "Direct watchcode_ma5.py run failed with exit code $exitCode. See $DirectRunLog"
+        throw "Direct $ScriptName run failed with exit code $exitCode. See $DirectRunLog"
     }
-    if (-not (Test-Path $WatchCodesFile)) {
-        throw "watchcode_ma5.py finished, but watch_codes.txt was not found."
-    }
-
-    $watchCodes = Get-Item $WatchCodesFile
-    if ($watchCodes.LastWriteTime -lt $startedAt.AddSeconds(-2)) {
-        throw "watchcode_ma5.py finished, but watch_codes.txt was not updated. See $DirectRunLog"
+    if (-not (Test-Path $OutputFile)) {
+        throw "$ScriptName finished, but output file was not found: $OutputFile"
     }
 
-    Write-Ma5TaskLog $LogDir $LogFile "Direct watchcode_ma5.py run completed and updated watch_codes.txt."
+    $watchCodes = Get-Item $OutputFile
+    if ($watchCodes.LastWriteTime -lt $StartedAt.AddSeconds(-2)) {
+        throw "$ScriptName finished, but output file was not updated: $OutputFile. See $DirectRunLog"
+    }
+
+    Write-Ma5TaskLog $LogDir $LogFile "Direct $ScriptName run completed and updated $OutputFile."
+}
+
+try {
+    $startedAt = Get-Date
+    Write-Ma5TaskLog $LogDir $LogFile "Starting direct watchcode task for intraday and premarket."
+    if (-not (Test-Ma5TradingDayForTask $ProjectDir $LogDir $LogFile 1 "tomorrow watchcode generation")) {
+        exit 0
+    }
+
+    $python = Resolve-Ma5Python $ProjectDir
+    Write-Ma5TaskLog $LogDir $LogFile "Using python fallback: $($python.Label) at $($python.FilePath)"
+
+    Start-Ma5PyCharm $ProjectDir $IntradayRunScript $LogDir $LogFile | Out-Null
+    Start-Ma5LogTailWindow $DirectRunLog "MA5 watchcode logs" $LogDir $LogFile
+
+    Invoke-Ma5WatchcodeScript $python $IntradayRunScript "watchcode_ma5.py" $WatchCodesFile "intraday watchcode" $startedAt
+    Invoke-Ma5WatchcodeScript $python $PremarketRunScript "watchcode_premarket.py" $PremarketWatchCodesFile "premarket watchcode" $startedAt
+
+    Write-Ma5TaskLog $LogDir $LogFile "Direct watchcode task completed for intraday and premarket."
     exit 0
 } catch {
     Write-Ma5TaskLog $LogDir $LogFile "ERROR: $($_.Exception.Message)"

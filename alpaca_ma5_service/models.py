@@ -123,11 +123,15 @@ def is_order_error_status(status: str) -> bool:
 
 
 def consumes_daily_buy_slot(status: str) -> bool:
-    """判断买单是否占用每日名额；拒单不占，未确认风险占。"""
+    """判断买单是否占用每日名额；只有真实成交才占用。"""
     status = status.upper()
-    if is_order_error_status(status):
-        return False
-    return is_executed_order_status(status) or status in {
+    return is_executed_order_status(status)
+
+
+def has_unconfirmed_order_status(status: str) -> bool:
+    """判断订单是否仍可能有未确认暴露，用于本轮暂停继续买入。"""
+    status = status.upper()
+    return status in {
         "ACCEPTED",
         "CANCEL_FAILED",
         "CANCEL_REQUESTED",

@@ -1,0 +1,330 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#071016">
+  <meta name="description" content="MA5 每日交易复盘与证据核对工作台">
+  <title>MA5 每日复盘</title>
+  <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main-content">跳到复盘内容</a>
+
+  <svg class="svg-sprite" aria-hidden="true" focusable="false">
+    <symbol id="icon-menu" viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></symbol>
+    <symbol id="icon-calendar" viewBox="0 0 24 24"><path d="M6 3v3M18 3v3M4 9h16M5 5h14a1 1 0 0 1 1 1v14H4V6a1 1 0 0 1 1-1Z"/></symbol>
+    <symbol id="icon-chevron-left" viewBox="0 0 24 24"><path d="m15 18-6-6 6-6"/></symbol>
+    <symbol id="icon-chevron-right" viewBox="0 0 24 24"><path d="m9 18 6-6-6-6"/></symbol>
+    <symbol id="icon-chevron-down" viewBox="0 0 24 24"><path d="m7 10 5 5 5-5"/></symbol>
+    <symbol id="icon-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+    <symbol id="icon-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="icon-refresh" viewBox="0 0 24 24"><path d="M20 11a8 8 0 1 0-2.3 6M20 5v6h-6"/></symbol>
+    <symbol id="icon-chart" viewBox="0 0 24 24"><path d="M4 19V5M4 19h16M7 15l3-4 3 2 5-7"/></symbol>
+    <symbol id="icon-alert" viewBox="0 0 24 24"><path d="M12 3 2.8 20h18.4L12 3Z"/><path d="M12 9v5M12 17.5v.1"/></symbol>
+    <symbol id="icon-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.1"/></symbol>
+    <symbol id="icon-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="m16 16 4 4"/></symbol>
+    <symbol id="icon-filter" viewBox="0 0 24 24"><path d="M4 5h16l-6.5 7.2V19l-3 1v-7.8L4 5Z"/></symbol>
+    <symbol id="icon-external" viewBox="0 0 24 24"><path d="M14 5h5v5M19 5l-8 8M18 13v6H5V6h6"/></symbol>
+    <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="1"/><path d="M16 8V4H5v12h3"/></symbol>
+    <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v11H3V6Z"/></symbol>
+    <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="icon-up" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
+    <symbol id="icon-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
+    <symbol id="icon-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
+    <symbol id="icon-file" viewBox="0 0 24 24"><path d="M6 3h8l4 4v14H6V3Z"/><path d="M14 3v5h5M9 13h6M9 17h6"/></symbol>
+    <symbol id="icon-link" viewBox="0 0 24 24"><path d="M10 13a4 4 0 0 0 5.7 0l2.3-2.3A4 4 0 0 0 12.3 5L11 6.3M14 11a4 4 0 0 0-5.7 0L6 13.3A4 4 0 0 0 11.7 19l1.3-1.3"/></symbol>
+    <symbol id="icon-order" viewBox="0 0 24 24"><path d="M7 4h10v16H7V4Z"/><path d="M10 8h4M10 12h4M10 16h2"/></symbol>
+    <symbol id="icon-wallet" viewBox="0 0 24 24"><path d="M4 7h15v12H4V7Z"/><path d="M4 7V5h12v2M15 12h6v4h-6a2 2 0 0 1 0-4Z"/></symbol>
+    <symbol id="icon-bag" viewBox="0 0 24 24"><path d="M5 8h14l-1 12H6L5 8Z"/><path d="M9 9V6a3 3 0 0 1 6 0v3"/></symbol>
+    <symbol id="icon-users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="3"/><path d="M3 20v-2a6 6 0 0 1 12 0v2M16 5a3 3 0 0 1 0 6M17 14a5 5 0 0 1 4 5v1"/></symbol>
+    <symbol id="icon-ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="m6 6 12 12"/></symbol>
+    <symbol id="icon-hourglass" viewBox="0 0 24 24"><path d="M7 3h10M7 21h10M8 3c0 5 2 6 4 9-2 3-4 4-4 9M16 3c0 5-2 6-4 9 2 3 4 4 4 9"/></symbol>
+    <symbol id="icon-database" viewBox="0 0 24 24"><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></symbol>
+  </svg>
+
+  <header class="app-header">
+    <div class="brand-cluster">
+      <button id="menu-button" class="icon-button" type="button" aria-label="打开页面导航" aria-expanded="false" aria-controls="section-nav">
+        <svg aria-hidden="true"><use href="#icon-menu"></use></svg>
+      </button>
+      <a class="brand" href="./" aria-label="MA5 每日复盘首页">MA5 每日复盘</a>
+      <nav id="section-nav" class="section-nav" aria-label="页面区域" hidden>
+        <a href="#decision-workspace">统一决策</a>
+        <a href="#evidence-column">证据与核对</a>
+        <a href="#review-sections">六区复盘</a>
+      </nav>
+    </div>
+
+    <div class="date-switcher" aria-label="交易日切换">
+      <button id="previous-date" class="icon-button compact" type="button" aria-label="上一交易日" disabled>
+        <svg aria-hidden="true"><use href="#icon-chevron-left"></use></svg>
+      </button>
+      <label class="date-field">
+        <svg aria-hidden="true"><use href="#icon-calendar"></use></svg>
+        <span class="sr-only">选择交易日</span>
+        <input id="review-date" type="date" autocomplete="off">
+      </label>
+      <button id="next-date" class="icon-button compact" type="button" aria-label="下一交易日" disabled>
+        <svg aria-hidden="true"><use href="#icon-chevron-right"></use></svg>
+      </button>
+    </div>
+
+    <div class="header-statuses" aria-label="复盘状态">
+      <span id="review-status" class="status-indicator neutral">
+        <span class="status-dot" aria-hidden="true"></span><span>等待数据</span>
+      </span>
+      <span id="coverage-status" class="status-indicator neutral">
+        <svg aria-hidden="true"><use href="#icon-clock"></use></svg><span>覆盖时间待定</span>
+      </span>
+      <span id="broker-status" class="status-indicator neutral">
+        <span class="status-dot" aria-hidden="true"></span><span>券商未核对</span>
+      </span>
+    </div>
+
+    <div class="header-actions">
+      <button id="refresh-button" class="button secondary" type="button">
+        <svg aria-hidden="true"><use href="#icon-refresh"></use></svg><span>刷新数据</span>
+      </button>
+      <a id="chart-link" class="button secondary" href="#" target="_blank" rel="noopener" aria-disabled="true" tabindex="-1">
+        <svg aria-hidden="true"><use href="#icon-chart"></use></svg><span>打开 K 线图</span>
+      </a>
+    </div>
+  </header>
+
+  <main id="main-content" tabindex="-1">
+    <div id="market-banner" class="market-banner" role="status" hidden></div>
+
+    <section class="headline-panel" aria-labelledby="headline-title">
+      <div>
+        <h1 id="headline-title">正在读取当天复盘…</h1>
+        <p id="headline-detail">先加载本地事实，随后自动进行只读券商核对。</p>
+      </div>
+      <div id="generated-at" class="generated-at" aria-label="数据生成时间">—</div>
+    </section>
+
+    <section id="conflict-banner" class="conflict-banner" aria-labelledby="conflict-title" hidden>
+      <svg aria-hidden="true"><use href="#icon-alert"></use></svg>
+      <div>
+        <h2 id="conflict-title">必须核对</h2>
+        <p id="conflict-detail"></p>
+      </div>
+      <button id="jump-to-attention" class="button danger-outline" type="button">查看核对队列</button>
+    </section>
+
+    <section id="metric-rail" class="metric-rail" aria-label="今日关键指标" aria-busy="true"></section>
+
+    <div id="page-error" class="page-state error-state" role="alert" hidden>
+      <svg aria-hidden="true"><use href="#icon-alert"></use></svg>
+      <div><strong>当天复盘加载失败</strong><p id="page-error-message"></p></div>
+      <button id="retry-button" class="button secondary" type="button">重新加载</button>
+    </div>
+
+    <div class="workspace-grid">
+      <section id="decision-workspace" class="panel decision-panel" aria-labelledby="decision-title">
+        <div class="panel-header decision-header">
+          <div>
+            <h2 id="decision-title">统一决策视图</h2>
+            <p id="decision-count" class="muted">等待数据</p>
+          </div>
+          <button id="clear-filters" class="text-button" type="button" hidden>清除全部筛选</button>
+        </div>
+
+        <div id="quick-filters" class="quick-filters" role="group" aria-label="指标快捷筛选"></div>
+
+        <div class="table-toolbar">
+          <label class="control-field">
+            <span class="sr-only">状态筛选</span>
+            <select id="status-filter" aria-label="按状态筛选"><option value="">全部状态</option></select>
+          </label>
+          <label class="control-field">
+            <span class="sr-only">原因筛选</span>
+            <select id="reason-filter" aria-label="按原因筛选"><option value="">全部原因</option></select>
+          </label>
+          <label class="search-field">
+            <svg aria-hidden="true"><use href="#icon-search"></use></svg>
+            <span class="sr-only">搜索股票代码、状态或原因</span>
+            <input id="symbol-search" type="search" placeholder="搜索代码 / 状态 / 原因…" autocomplete="off">
+            <kbd aria-hidden="true">/</kbd>
+          </label>
+          <button id="filter-summary-button" class="button secondary compact-button" type="button" aria-expanded="false" aria-controls="active-filter-summary">
+            <svg aria-hidden="true"><use href="#icon-filter"></use></svg><span>筛选</span>
+          </button>
+        </div>
+        <div id="active-filter-summary" class="active-filter-summary" hidden></div>
+
+        <div class="table-wrap" tabindex="0" aria-label="可横向滚动的股票决策表">
+          <table class="audit-table" id="decision-table">
+            <thead>
+              <tr>
+                <th data-sort="symbol" aria-sort="ascending"><button type="button">代码<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="source"><button type="button">证据来源<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="status"><button type="button">主状态<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="buy"><button type="button">买入成交<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="sell"><button type="button">卖出成交<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="value"><button type="button">净现金流 / 条件距离<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="time"><button type="button">时间<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="match"><button type="button">记录一致性<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th>详情</th>
+              </tr>
+            </thead>
+            <tbody id="decision-table-body"></tbody>
+          </table>
+          <div id="decision-empty" class="section-empty" hidden>
+            <svg aria-hidden="true"><use href="#icon-search"></use></svg>
+            <strong>没有匹配的股票</strong>
+            <span>调整搜索词或清除筛选后重试。</span>
+          </div>
+        </div>
+        <div class="table-footer">
+          <span>点击任一行查看成交闭环、策略上下文与原始证据</span>
+          <span id="filtered-total">共 0 只</span>
+        </div>
+      </section>
+
+      <aside id="evidence-column" class="evidence-column" aria-label="证据与核对">
+        <section class="panel timeline-panel" aria-labelledby="timeline-title">
+          <div class="panel-header">
+            <div><h2 id="timeline-title">证据时间线</h2><p class="muted">按事件时间排序</p></div>
+            <button id="timeline-order" class="icon-button compact" type="button" aria-label="切换时间线排序" title="切换排序">
+              <svg aria-hidden="true"><use href="#icon-down"></use></svg>
+            </button>
+          </div>
+          <ol id="timeline-list" class="timeline-list"></ol>
+          <div id="timeline-empty" class="section-empty compact-empty" hidden><span>当天没有可显示的证据事件。</span></div>
+        </section>
+
+        <section id="attention-panel" class="panel attention-panel" aria-labelledby="attention-title">
+          <div class="panel-header attention-heading">
+            <div>
+              <h2 id="attention-title">必须核对</h2>
+              <p class="muted">最高优先级问题</p>
+            </div>
+            <span id="attention-count" class="count-badge">0</span>
+          </div>
+          <ul id="attention-list" class="attention-list"></ul>
+          <div id="attention-empty" class="section-empty compact-empty" hidden>
+            <svg aria-hidden="true"><use href="#icon-check"></use></svg><span>当前没有待核对事项。</span>
+          </div>
+        </section>
+      </aside>
+    </div>
+
+    <section id="review-sections" class="review-grid" aria-label="详细复盘区">
+      <article class="panel review-panel" aria-labelledby="funnel-title">
+        <div class="panel-header"><h2 id="funnel-title">策略决策漏斗</h2></div>
+        <div id="funnel-content" class="panel-content"></div>
+      </article>
+      <article class="panel review-panel" aria-labelledby="lifecycle-title">
+        <div class="panel-header"><h2 id="lifecycle-title">券商成交闭环</h2></div>
+        <div id="lifecycle-content" class="panel-content"></div>
+      </article>
+      <article class="panel review-panel" aria-labelledby="reasons-title">
+        <div class="panel-header"><h2 id="reasons-title">未买原因（今日）</h2></div>
+        <div id="reasons-content" class="panel-content"></div>
+      </article>
+      <article class="panel review-panel orders-panel" aria-labelledby="orders-title">
+        <div class="panel-header"><h2 id="orders-title">订单流水（按来源）</h2><span id="orders-count" class="muted">0 笔</span></div>
+        <div id="orders-content" class="panel-content"></div>
+      </article>
+      <article class="panel review-panel" aria-labelledby="phases-title">
+        <div class="panel-header"><h2 id="phases-title">三时段复盘</h2></div>
+        <div id="phases-content" class="panel-content"></div>
+      </article>
+      <article class="panel review-panel" aria-labelledby="health-title">
+        <div class="panel-header"><h2 id="health-title">证据与数据健康</h2></div>
+        <div id="health-content" class="panel-content"></div>
+      </article>
+    </section>
+  </main>
+
+  <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
+  <aside id="symbol-drawer" class="symbol-drawer" role="dialog" aria-modal="true" aria-labelledby="drawer-title" hidden>
+    <header class="drawer-header">
+      <button id="drawer-previous" class="text-button drawer-nav" type="button">
+        <svg aria-hidden="true"><use href="#icon-chevron-left"></use></svg><span>上一只</span>
+      </button>
+      <div class="drawer-title-group">
+        <h2 id="drawer-title">股票详情</h2>
+        <p id="drawer-subtitle"></p>
+      </div>
+      <button id="drawer-next" class="text-button drawer-nav" type="button">
+        <span>下一只</span><svg aria-hidden="true"><use href="#icon-chevron-right"></use></svg>
+      </button>
+      <button id="drawer-close" class="icon-button" type="button" aria-label="关闭股票详情">
+        <svg aria-hidden="true"><use href="#icon-close"></use></svg>
+      </button>
+    </header>
+
+    <div id="drawer-stats" class="drawer-stats" aria-label="股票成交摘要"></div>
+
+    <div class="drawer-tabs" role="tablist" aria-label="股票详情区域">
+      <button id="tab-lifecycle" role="tab" aria-selected="true" aria-controls="panel-lifecycle" tabindex="0" data-tab="lifecycle">成交闭环</button>
+      <button id="tab-strategy" role="tab" aria-selected="false" aria-controls="panel-strategy" tabindex="-1" data-tab="strategy">策略上下文</button>
+      <button id="tab-evidence" role="tab" aria-selected="false" aria-controls="panel-evidence" tabindex="-1" data-tab="evidence">原始证据</button>
+    </div>
+
+    <div class="drawer-body">
+      <section id="panel-lifecycle" class="drawer-tab-panel" role="tabpanel" aria-labelledby="tab-lifecycle">
+        <div class="drawer-two-column">
+          <article class="drawer-section">
+            <h3>1. 订单生命周期</h3>
+            <ol id="drawer-order-timeline" class="order-timeline"></ol>
+          </article>
+          <article class="drawer-section">
+            <h3>2. 核对清单</h3>
+            <ul id="drawer-checklist" class="checklist"></ul>
+          </article>
+        </div>
+        <article class="drawer-section">
+          <h3>3. 记录一致性</h3>
+          <div id="drawer-consistency"></div>
+        </article>
+      </section>
+
+      <section id="panel-strategy" class="drawer-tab-panel" role="tabpanel" aria-labelledby="tab-strategy" hidden>
+        <article class="drawer-section">
+          <h3>4. 策略上下文</h3>
+          <div id="drawer-strategy-context" class="snapshot-grid"></div>
+        </article>
+      </section>
+
+      <section id="panel-evidence" class="drawer-tab-panel" role="tabpanel" aria-labelledby="tab-evidence" hidden>
+        <article class="drawer-section">
+          <h3>5. 证据来源</h3>
+          <ul id="drawer-evidence-list" class="evidence-list"></ul>
+          <div id="drawer-evidence-context" class="evidence-context" hidden>
+            <div class="evidence-context-header">
+              <strong id="evidence-context-title">证据上下文</strong>
+              <button id="close-evidence-context" class="icon-button compact" type="button" aria-label="关闭证据上下文">
+                <svg aria-hidden="true"><use href="#icon-close"></use></svg>
+              </button>
+            </div>
+            <pre id="evidence-context-output" tabindex="0"></pre>
+          </div>
+        </article>
+      </section>
+    </div>
+
+    <footer class="drawer-footer">
+      <button id="show-symbol-orders" class="button danger-outline" type="button">
+        <svg aria-hidden="true"><use href="#icon-order"></use></svg><span>查看该股订单</span>
+      </button>
+      <button id="copy-summary" class="button secondary" type="button">
+        <svg aria-hidden="true"><use href="#icon-copy"></use></svg><span>复制核对摘要</span>
+      </button>
+      <button id="open-first-evidence" class="button info-outline" type="button">
+        <svg aria-hidden="true"><use href="#icon-folder"></use></svg><span>查看原始证据</span>
+      </button>
+      <span id="copy-status" class="sr-only" role="status" aria-live="polite"></span>
+    </footer>
+    <p class="drawer-hint">提示：使用 ↑ ↓ 切换上一只/下一只，Esc 关闭抽屉，Enter 展开或折叠证据。</p>
+  </aside>
+
+  <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
+  <div id="app-live-region" class="sr-only" role="status" aria-live="polite"></div>
+
+  <script src="./app.js" defer></script>
+</body>
+</html>

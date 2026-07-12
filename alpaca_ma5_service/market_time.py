@@ -35,6 +35,26 @@ def is_premarket_time(now_et: datetime) -> bool:
     return now_et.weekday() < 5 and REALTIME_ORDER_OPEN <= now_et.time() < REGULAR_OPEN
 
 
+def is_premarket_monitor_finished(now_et: datetime) -> bool:
+    """盘前推荐监控到 09:30 ET 后退出。"""
+    return now_et.time() >= REGULAR_OPEN
+
+
+def is_intraday_monitor_finished(now_et: datetime) -> bool:
+    """盘中监控到 16:00 ET 后退出。"""
+    return now_et.time() >= REGULAR_CLOSE
+
+
+def seconds_until_premarket_monitor_end(now_et: datetime) -> int:
+    """距离当天 09:30 ET 还有多少秒；已过则为 0。"""
+    return seconds_until_today_time(now_et, REGULAR_OPEN)
+
+
+def seconds_until_intraday_monitor_end(now_et: datetime) -> int:
+    """距离当天 16:00 ET 还有多少秒；已过则为 0。"""
+    return seconds_until_today_time(now_et, REGULAR_CLOSE)
+
+
 def regular_open_has_started(now_et: datetime) -> bool:
     """常规盘开盘后，今日开盘价才有稳定含义。"""
     return now_et.weekday() < 5 and now_et.time() >= REGULAR_OPEN
@@ -90,3 +110,8 @@ def next_regular_market_open(now_et: datetime) -> datetime:
     while day.weekday() >= 5:
         day += timedelta(days=1)
     return datetime.combine(day, REGULAR_OPEN, tzinfo=now_et.tzinfo)
+
+
+def seconds_until_today_time(now_et: datetime, target: time) -> int:
+    target_at = datetime.combine(now_et.date(), target, tzinfo=now_et.tzinfo)
+    return max(0, ceil((target_at - now_et).total_seconds()))

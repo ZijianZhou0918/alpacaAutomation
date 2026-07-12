@@ -8,13 +8,13 @@
 
 - 买入：当前价格距离分段买点 `2%` 内时触发。
   - 计算方式：`today_ma5 = (前 4 个已完成交易日收盘价之和 + 当前价) / 5`
-  - 风控过滤：当前价相对信号日收盘价跌幅必须达到 `18%` 或更多，才允许触发买入。
-  - 风控过滤：如果当前价已经触达今日动态 MA5，但当前跌幅还没有达到 `18%`，这只股票当天不再考虑买入。
+  - 风控过滤：当前价相对信号日收盘价跌幅必须达到 `10%` 或更多，才允许触发买入。
+  - 风控过滤：如果当前价已经触达今日动态 MA5，但当前跌幅还没有达到 `10%`，这只股票当天不再考虑买入。
   - 风控过滤：今日常规盘开盘价相对信号日收盘价跌幅达到 `40%` 或更多，本轮不下单。
   - 风控过滤：今日常规盘开盘价如果低于开盘价 MA5 `10%` 或更多，这只股票当天不买入。
   - 风控过滤：今日常规盘开盘价如果低于今日动态 MA5，本轮不下单。
   - 开盘价 MA5：`(前 4 个已完成交易日开盘价之和 + 今日常规盘开盘价) / 5`
-  - 信号日涨幅 `20% ~ 40%`：基础买点 `MA5 + 0.5%`
+  - 信号日涨幅 `15% ~ 40%`：基础买点 `MA5 + 0.5%`
   - 信号日涨幅 `40% ~ 100%`：基础买点 `MA5 + 3%`
   - 信号日涨幅 `>100%`：基础买点 `MA5 + 4%`
   - 当天开盘涨幅 `>15%`：再加 `2%`
@@ -23,34 +23,85 @@
   - 最终买点：`today_ma5 * (1 + 基础买点加成 + 开盘加成)`
   - 自动下单使用 BUY LIMIT，限价固定为最终买点，不使用当前价。
   - 真实买入只允许常规盘开盘后前 `2.5` 小时，即 `09:30-12:00 ET`。
-  - 默认每天最多买入 `2` 只；每轮开始时按 Alpaca `cash / 2` 预先算好每只股票金额，后续买单复用这个金额；如果测试通道读不到 `cash`，使用配置金额 `$3500`；所有买入只提交整数股。
+  - `monitor_ma5_forever.py` 里的 `BUY_STOCK_COUNT` 控制本轮最多买入股票数，`BUY_NOTIONAL_USD` 控制每只股票入场金额；如果入口不覆盖金额，默认每只股票 `$1500`；所有买入只提交整数股。
   - 同一只股票当天下单错误累计 `3` 次后，当天不再对这只股票继续提交订单。
 - 卖出：
   - 美股常规盘临近收盘，默认 `15:55-16:00 ET`
   - 持仓亏损 `10%`：按成本价亏损 `8%` 的价格提交 SELL LIMIT 卖出全部；这条会检查当前账户所有持仓，不只限 `watch_codes.txt` 或当天买入的股票
   - 监控进程启动后第一次检查时，如果某个旧持仓已经亏损 `10%` 或更多，本次监控会话不会自动清仓；监控启动后新出现的持仓，或旧持仓成本/数量变化后，再跌到 `10%` 会触发限价清仓
   - 持仓收益 `10%`：卖出一半；当天已成交过一次后不重复触发
+  - 半仓止盈已成交后，剩余仓回落到成本价 `+5%`：用保护 SELL LIMIT 卖出剩余全部
 - 范围：只处理 `watch_codes.txt` 文件中的代码。
 
 ## 文件
 
 - `watch_codes.txt`：唯一盯盘股票文件。
+- `watch_codes_premarket.txt`：盘前推荐专用股票文件，只给推荐提醒使用，不参与自动下单。
 - `watchcode_afterhours.py`：点击运行，生成盘后监控股票池。
-- `monitor_afterhours.py`：点击运行，自动生成盘后股票池并持续监控买入/卖出。
+- `monitor_afterhours.py`：点击运行，自动生成盘后股票池并持续监控价格提醒，不提交买单或卖单。
+- `watchcode_premarket.py`：点击运行，生成最近已收盘交易日涨幅前 50 的盘前推荐股票池。
+- `monitor_premarket_ma5.py`：点击运行，盘前监控 `watch_codes_premarket.txt`，靠近动态 MA5 时发送云端推荐提醒，不下单。
 - `monitor_ma5_forever.py`：MA5 持续轮询工具。
+- `monitor_auto.py`：每天自动监控的单一入口，自动检查当前是盘前、盘中还是盘后，缺 watchcode 时先生成，再运行对应监控。
 - `watchcode_ma5.py`：用 Alpaca 日线数据生成 `watch_codes.txt`。
-- `watchcode_chart.py`：按当前 `watch_codes.txt` 单独刷新同款 HTML 图表，不重新筛选股票。
-- `tools/start_ma5_monitor_pycharm_gui.ps1`：通过 PyCharm GUI 启动 `monitor_ma5_forever.py`。
-- `tools/start_ma5_watchcode_pycharm_gui.ps1`：通过 PyCharm GUI 启动 `watchcode_ma5.py`。
+- `watchcode_chart.py`：按文件顶部 `CHART_SESSION` 选择盘前/盘中/盘后 watchcode，单独刷新同款 HTML 图表，不重新筛选股票。
+- `tools/start_ma5_monitor_pycharm_gui.ps1`：通过 PyCharm GUI 和 `.venv` 兜底启动 `monitor_auto.py` 单一入口。
+- `tools/start_ma5_watchcode_pycharm_gui.ps1`：通过 PyCharm GUI 和 `.venv` 兜底生成盘中与盘前 watchcode。
 - `tools/check_ma5_trading_day.py`：给 Windows 定时任务判断目标日期是否为美股交易日，优先 Alpaca calendar，失败时用内置 NYSE/Nasdaq 节假日表兜底。
-- `tools/install_ma5_pycharm_tasks.ps1`：安装每天 22:00 生成 watch code、23:50 兜底启动监控、04:00 健康检查的 Windows 定时任务。
+- `tools/install_ma5_pycharm_tasks.ps1`：安装每天 22:00 生成 watch code、00:50 兜底启动监控、04:00 健康检查的 Windows 定时任务。
 - `tools/run_test_order.py`：提交一笔很小的 Alpaca 限价测试单，限价为当前价的 90%。
 - `tools/run_self_tests.py`：运行本地测试。
 - `tools/check_alpaca_connection.py`：检查 Alpaca API key 是否能连通。
-- `alpaca_ma5_service/config.py`：运行参数都在 `build_settings()` 里改，不用命令行参数。
+- `monitor_ma5_forever.py`：持续监控的常用运行参数都在文件顶部配置区改，不用命令行参数。
 - `outputs/orders_YYYY-MM-DD.csv`：订单记录。
+- `open_daily_review.cmd`：双击打开“MA5 每日复盘”网页；服务只读，不会下单或修改观察池。
 
-真实 Alpaca 买入、卖出和撤单结果会先写入本地 CSV，再通过本机 OpenClaw 发送 Telegram 通知；通知失败只打印错误，不会中断监控或下单流程。
+## MA5 每日复盘网页
+
+双击项目根目录的：
+
+```text
+open_daily_review.cmd
+```
+
+也可以在 PowerShell 里运行：
+
+```powershell
+.\.venv\Scripts\python.exe .\open_daily_review.py
+```
+
+网页会先用本地日志、候选 CSV、排除记录和订单账本秒开当天复盘，然后自动通过服务端对 Alpaca 做只读核对。页面重点区分：
+
+- 券商实际买入、卖出、取消和当前持仓。
+- MA5 策略在真实买入窗口内的最佳机会、全天最接近与日终状态。
+- 已买、买入未成、条件未满足、今日排除、窗口外最接近和来源未核对。
+- 本地账本与 Alpaca 订单不一致、开放订单、持仓增减和缺失数据。
+- 盘前、盘中、盘后覆盖范围、事件时间线、原始证据和数据新鲜度。
+
+服务默认只绑定 `127.0.0.1`，端口从 `8788` 开始自动选择；不会把 `.env` 或 API key 发给浏览器。历史页面中的“当日成交净现金流”只按买卖成交额计算，未含费用，也不等同于券商口径的已实现盈亏。
+
+真实 Alpaca 买入、卖出和撤单结果会先写入本地 CSV，再按 `.env` 里的通知通道发送 Telegram 通知；通知失败只打印错误，不会中断监控或下单流程。
+
+## Telegram 本地通知
+
+通知通道由 `.env` 的 `TRADE_NOTIFY_MODE` 控制：
+
+- `TRADE_NOTIFY_MODE=local`：走本机 OpenClaw/Hermes。OpenClaw gateway 没启动时会先尝试 `gateway probe/start/run`，再发送 Telegram；Hermes `send` 会直接使用本机 Hermes 配置。
+- `TRADE_NOTIFY_MODE=cloud`：走云端 Hermes webhook，需要同时配置 `CLOUD_NOTIFY_WEBHOOK_URL` 和 `CLOUD_NOTIFY_WEBHOOK_SECRET`。
+
+点击运行测试：
+
+```powershell
+.\.venv\Scripts\python.exe tools\send_local_notify.py
+```
+
+Python 里如果想让一条控制台消息同步发 Telegram：
+
+```python
+from alpaca_ma5_service.console_notify import notify_print
+
+notify_print("任务完成了", context="manual task")
+```
 
 ## 第一次使用
 
@@ -73,6 +124,9 @@ py -3.14 -m venv .venv
 APCA_API_KEY_ID=你的 API Key ID
 APCA_API_SECRET_KEY=你的 Secret Key
 TRADE_NOTIFY_OPENCLAW_ENABLED=true
+TRADE_NOTIFY_MODE=local
+CLOUD_NOTIFY_WEBHOOK_URL=
+CLOUD_NOTIFY_WEBHOOK_SECRET=
 OPENCLAW_TELEGRAM_TARGET=你的 Telegram target
 OPENCLAW_GATEWAY_PORT=18789
 REALTIME_PRICE_SOURCE=moomoo
@@ -201,17 +255,23 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 
 安装后会注册三个任务：
 
-- `AlpacaMA5-2200-GenerateWatchcode-PyCharm`：每天本地时间 `22:00` 打开 PyCharm 到 `watchcode_ma5.py`，同时用 `.venv` 直接运行筛选，生成第二天盘中使用的 `watch_codes.txt`。
-- `AlpacaMA5-2350-EnsureMonitor-PyCharm`：每天本地时间 `23:50` 检查 `monitor_ma5_forever.py` 是否已运行；如果没有，就打开 PyCharm 到该文件，同时用 `.venv` 直接启动持续监控。
-- `AlpacaMA5-0400-HealthCheck-PyCharm`：每天本地时间 `04:00` 再检查 `monitor_ma5_forever.py` 是否运行，并检查 `watch_codes.txt` 是否足够新；如果监控没运行或 watchcode 过旧，就调用现有脚本重新启动/重新生成。
+- `AlpacaMA5-2200-GenerateWatchcode-PyCharm`：每天本地时间 `22:00` 打开 PyCharm 到 `watchcode_ma5.py`，同时用 `.venv` 直接运行 `watchcode_ma5.py` 和 `watchcode_premarket.py`，生成 `watch_codes.txt` 与 `watch_codes_premarket.txt`。
+- `AlpacaMA5-0050-EnsureMonitor-PyCharm`：每天本地时间 `00:50` 检查 `monitor_auto.py` 是否已运行；如果没有，就打开 PyCharm 到该文件，同时用 `.venv` 直接启动单一入口，并打开一个 UTF-8 日志跟随窗口显示输出。
+- `AlpacaMA5-0400-HealthCheck-PyCharm`：每天本地时间 `04:00` 再检查 `monitor_auto.py` 是否运行，并检查 `watch_codes.txt` 与 `watch_codes_premarket.txt` 是否足够新；如果监控缺失或 watchcode 过旧，就调用现有脚本重新启动/重新生成。
 
-每个任务真正执行前都会先做交易日判断：`22:00` 生成 watchcode 和 `23:50` 启动监控检查“明天”是否为美股交易日；`04:00` 健康检查检查“今天”是否为美股交易日。若目标日期是周末或节假日，任务会写日志并正常退出，不生成、不启动、不报失败。
+每个任务真正执行前都会先做交易日判断：`22:00` 生成 watchcode 检查“明天”是否为美股交易日；`00:50` 启动监控和 `04:00` 健康检查检查“今天”是否为美股交易日。若目标日期是周末或节假日，任务会写日志并正常退出，不生成、不启动、不报失败。
 
-日志写在 `outputs/logs/pycharm_watchcode_task_YYYYMMDD.log`、`outputs/logs/pycharm_gui_task_YYYYMMDD.log`、`outputs/logs/ma5_0400_health_YYYYMMDD.log` 和 `outputs/logs/ma5_pycharm_tasks_install.log`。
+日志写在 `outputs/logs/pycharm_watchcode_task_YYYYMMDD.log`、`outputs/logs/pycharm_gui_task_YYYYMMDD.log`、`outputs/logs/ma5_0400_health_YYYYMMDD.log` 和 `outputs/logs/ma5_pycharm_tasks_install.log`；自动监控会另外打开一个 UTF-8 PowerShell 日志跟随窗口，直接显示 Python 输出。
 
 这些任务需要 Windows 用户已登录才能自动打开 PyCharm；实际运行不依赖窗口焦点或快捷键。
 
 ## 盘前/盘后
+
+盘前推荐是独立提醒链路，不会提交 Alpaca 订单：
+
+- 先运行 `watchcode_premarket.py`，按最近已收盘交易日涨幅排序，写出前 50 到 `watch_codes_premarket.txt`。
+- 再运行 `monitor_premarket_ma5.py`，只在盘前 `04:00-09:30 ET` 发送云端提醒；到 `09:30 ET` 自动退出。
+- 提醒条件：盘前当前价相对最近已收盘日收盘价跌幅至少 `15%`，且当前价在动态 MA5 上方 `0%` 到 `3%` 内；同一股票同一天按 `3%/2%/1%/0%` 距离档位去重，价格更靠近 MA5 时可再次提醒。
 
 自动监控买入始终使用分段买点 BUY LIMIT。盘前不提交买单；止损卖出使用成本价亏损 8% 的 SELL LIMIT；非止损卖出在常规盘内使用 market order，盘前卖出或盘后买卖会自动改用 Alpaca extended-hours limit order：
 
@@ -221,9 +281,9 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 - 其他买入路径若需要盘前/盘后保护限价，则为当前价上浮 `0.3%`
 - 非止损盘前/盘后卖出限价 = 当前价下浮 `0.3%`
 
-这些参数在 `alpaca_ma5_service/config.py` 的 `build_settings()` 里改。
+这些参数在 `monitor_ma5_forever.py` 文件顶部的配置区里改。
 真实监控链路也会在订单提交后最多等待 `order_cancel_after_seconds=600` 秒（10 分钟）；未完全成交时自动请求取消订单。被 Alpaca 拒单不占用每日买入名额，只累计到该股票自己的三次错误保护；未确认撤单或撤单失败仍按风险占用，防止同一轮继续重复买入。
-常规盘按 `regular_poll_seconds=10` 秒轮询；盘前/盘后通常使用 `idle_poll_seconds`，临近 9:30 ET 会自动缩短等待时间。
+常规盘按 `regular_poll_seconds=10` 秒轮询；盘前/盘后通常使用 `idle_poll_seconds`，临近 9:30 ET 会自动缩短等待时间。盘中监控到 `16:00 ET` 自动退出。
 
 ## 切换 Paper / Live
 

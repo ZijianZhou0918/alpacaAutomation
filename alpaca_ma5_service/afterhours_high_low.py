@@ -22,8 +22,8 @@ from .watchlist_generator import batched, load_tradable_symbols
 REGULAR_OPEN = time(9, 30)
 REGULAR_CLOSE = time(16, 0)
 AFTERHOURS_DATA_CLOSE = time(20, 0)
-RANGE_RATIO_THRESHOLD = 2.5
-DROP_SIGNAL_THRESHOLD = 0.18
+RANGE_RATIO_THRESHOLD = 1.8
+DROP_SIGNAL_THRESHOLD = 0.15
 BUY_LIMIT_MULTIPLIER = 0.8
 PROFIT_TARGET_MULTIPLIER = 1.1
 LOG_WIDTH = 72
@@ -133,13 +133,13 @@ def print_table_header(columns: list[tuple[str, str, int]]) -> None:
 
 def print_table_row(columns: list[tuple[str, str, int]], row: dict[str, object]) -> None:
     """打印一行监控表数据。"""
-    values = [pad_table_cell(row.get(key, ""), width) for key, _, width in columns]
+    values = [pad_table_cell(row.get(key, ""), width, truncate=key not in {"note", "reason"}) for key, _, width in columns]
     print("  " + " | ".join(values), flush=True)
 
 
-def pad_table_cell(value: object, width: int) -> str:
+def pad_table_cell(value: object, width: int, *, truncate: bool = True) -> str:
     """按显示宽度裁剪/补齐，避免中文列名把表格撑乱。"""
-    text = shorten_table_text(str(value), width)
+    text = shorten_table_text(str(value), width) if truncate else " ".join(str(value).split())
     return text + " " * max(width - display_width(text), 0)
 
 
@@ -322,7 +322,7 @@ def run_afterhours_high_low_strategy(
     require_paper: bool | None = None,
     now_et: datetime | None = None,
 ) -> list[AfterHoursCandidate]:
-    """盘中不买；盘后筛选 high/low>2.5 的股票并按 close*0.8 准备买入。"""
+    """盘中不买；盘后筛选 high/low>1.8 的股票并按 close*0.8 准备买入。"""
     settings = settings or build_settings()
     now_et = now_et or datetime.now(ZoneInfo(settings.market_timezone))
     buy_notional_usd = buy_notional_usd or settings.buy_notional_usd
@@ -577,7 +577,7 @@ def screen_afterhours_candidates(
     *,
     range_ratio_threshold: float = RANGE_RATIO_THRESHOLD,
 ) -> list[AfterHoursCandidate]:
-    """筛选常规盘 high/low > 2.5 的股票，并计算 close*0.8 买入价。"""
+    """筛选常规盘 high/low > 1.8 的股票，并计算 close*0.8 买入价。"""
     candidates: list[AfterHoursCandidate] = []
     for symbol, bars in bars_by_symbol.items():
         summary = summarize_regular_session(symbol, bars, signal_day)
@@ -735,7 +735,7 @@ def submit_afterhours_limit_buys(
 
             qty = buy_quantity(client, symbol, buy_notional_usd, candidate.buy_limit, settings.allow_fractional_shares)
             reason = (
-                f"盘后 high/low>2.5 买入；range={candidate.range_ratio:.4f} "
+                f"盘后 high/low>1.8 买入；range={candidate.range_ratio:.4f} "
                 f"close={candidate.regular_close:.4f} current={current_price:.4f} "
                 f"source={current_price_source or 'unknown'} "
                 f"drop={drop_pct:.2%} limit=close*0.8；5分钟不成交撤单"

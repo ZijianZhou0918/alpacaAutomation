@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import shutil
 import socket
 import subprocess
@@ -140,14 +141,23 @@ def write_watch_code_daily_kline_chart_page(
     return page
 
 
-def ensure_watchlist_chart_server_running(settings: Settings) -> None:
-    """启动本地图表服务；如果端口已有旧服务，只提示不打断生成。"""
-    port = int(settings.watchlist_chart_lan_port)
-    if watchlist_chart_server_ready(port):
-        return
-    if tcp_port_is_open("127.0.0.1", port):
-        print(f"Watchlist chart port {port} is open, but delete API health check failed. Restart the chart server if delete does not work.", flush=True)
-        return
+def ensure_watchlist_chart_server_running(settings: Settings) -> int:
+    """启动本项目的图表服务，并返回真正可点击的服务端口。"""
+    preferred_port = int(settings.watchlist_chart_lan_port)
+    expected_chart_dir = (settings.output_dir / "watchlist_charts").resolve()
+    if watchlist_chart_server_ready(preferred_port, expected_chart_dir=expected_chart_dir):
+        return preferred_port
+
+    port = preferred_port
+    if tcp_port_is_open("127.0.0.1", preferred_port):
+        existing_port = find_running_watchlist_chart_server(preferred_port + 1, expected_chart_dir=expected_chart_dir)
+        if existing_port is not None:
+            return existing_port
+        port = find_available_tcp_port(preferred_port + 1)
+        print(
+            f"Watchlist chart port {preferred_port} is occupied by another service; starting current chart server on port {port}.",
+            flush=True,
+        )
 
     script = Path(__file__).resolve().parent.parent / "tools" / "serve_watchlist_charts_lan.py"
     log_dir = settings.output_dir / "logs"
@@ -155,29 +165,45 @@ def ensure_watchlist_chart_server_running(settings: Settings) -> None:
     stdout = (log_dir / "watchlist_chart_server.out.log").open("a", encoding="utf-8")
     stderr = (log_dir / "watchlist_chart_server.err.log").open("a", encoding="utf-8")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    subprocess.Popen(
-        [sys.executable, str(script)],
-        cwd=str(Path(__file__).resolve().parent.parent),
-        stdout=stdout,
-        stderr=stderr,
-        creationflags=creationflags,
-    )
-    if not wait_for_tcp_port("127.0.0.1", port, timeout_seconds=8.0):
+    env = os.environ.copy()
+    env["WATCHLIST_CHART_LAN_PORT"] = str(port)
+    try:
+        subprocess.Popen(
+            [sys.executable, str(script)],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=env,
+            stdout=stdout,
+            stderr=stderr,
+            creationflags=creationflags,
+        )
+    finally:
+        stdout.close()
+        stderr.close()
+    if not wait_for_watchlist_chart_server_ready(port, expected_chart_dir=expected_chart_dir, timeout_seconds=8.0):
         raise RuntimeError(f"watchlist chart server did not start on port {port}")
+    return port
 
 
-def watchlist_chart_http_url(settings: Settings) -> str:
+def watchlist_chart_http_url(settings: Settings, *, port: int | None = None) -> str:
     """返回手机或浏览器直接打开的 latest HTML URL。"""
     host = settings.watchlist_chart_lan_host or first_lan_ip() or "127.0.0.1"
-    return f"http://{host}:{int(settings.watchlist_chart_lan_port)}/{CHART_FILE}"
+    actual_port = int(settings.watchlist_chart_lan_port if port is None else port)
+    return f"http://{host}:{actual_port}/{CHART_FILE}"
 
 
-def watchlist_chart_server_ready(port: int) -> bool:
+def watchlist_chart_server_ready(port: int, *, expected_chart_dir: Path | None = None) -> bool:
     """确认端口上运行的是新版图表服务，而不只是普通静态服务。"""
     try:
         with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/watchlist/health", timeout=1.0) as response:
             payload = json.loads(response.read().decode("utf-8"))
-        return bool(payload.get("ok") and payload.get("service") == "watchlist_chart")
+        if not bool(payload.get("ok") and payload.get("service") == "watchlist_chart"):
+            return False
+        if expected_chart_dir is not None:
+            actual_chart_dir = payload.get("chart_dir")
+            if not actual_chart_dir:
+                return False
+            return Path(actual_chart_dir).resolve() == expected_chart_dir.resolve()
+        return True
     except Exception:
         return False
 
@@ -873,6 +899,39 @@ def wait_for_tcp_port(host: str, port: int, *, timeout_seconds: float) -> bool:
             return True
         time.sleep(0.2)
     return False
+
+
+def wait_for_watchlist_chart_server_ready(port: int, *, expected_chart_dir: Path, timeout_seconds: float) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() <= deadline:
+        if watchlist_chart_server_ready(port, expected_chart_dir=expected_chart_dir):
+            return True
+        time.sleep(0.2)
+    return False
+
+
+def find_running_watchlist_chart_server(start_port: int, *, expected_chart_dir: Path, max_ports: int = 50) -> int | None:
+    end_port = min(65535, max(1, start_port) + max(0, max_ports))
+    for port in range(max(1, start_port), end_port + 1):
+        if watchlist_chart_server_ready(port, expected_chart_dir=expected_chart_dir):
+            return port
+    return None
+
+
+def find_available_tcp_port(start_port: int) -> int:
+    for port in range(max(1, start_port), 65536):
+        if tcp_port_is_available(port):
+            return port
+    raise RuntimeError(f"no available TCP port found from {start_port}")
+
+
+def tcp_port_is_available(port: int) -> bool:
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", port))
+        return True
+    except OSError:
+        return False
 
 
 def first_lan_ip() -> str | None:

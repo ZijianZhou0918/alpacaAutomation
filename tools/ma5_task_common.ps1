@@ -129,6 +129,40 @@ function ConvertTo-Ma5ArgumentList {
     ($Arguments | ForEach-Object { Quote-Ma5Argument $_ }) -join " "
 }
 
+function Start-Ma5LogTailWindow {
+    param(
+        [string[]]$LogPath,
+        [string]$Title,
+        [string]$LogDir,
+        [string]$LogFile
+    )
+
+    foreach ($path in $LogPath) {
+        $parent = Split-Path -Parent $path
+        if ($parent) {
+            New-Item -ItemType Directory -Force -Path $parent | Out-Null
+        }
+        if (-not (Test-Path $path)) {
+            New-Item -ItemType File -Force -Path $path | Out-Null
+        }
+    }
+
+    $tailScript = Join-Path $PSScriptRoot "tail_ma5_logs.ps1"
+    if (-not (Test-Path $tailScript)) {
+        Write-Ma5TaskLog $LogDir $LogFile "Log tail script not found: $tailScript"
+        return
+    }
+
+    $arguments = @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tailScript, "-Title", $Title, "-Path") + $LogPath
+    $argumentList = ConvertTo-Ma5ArgumentList $arguments
+    try {
+        Start-Process -FilePath "powershell.exe" -ArgumentList $argumentList -WindowStyle Normal | Out-Null
+        Write-Ma5TaskLog $LogDir $LogFile "Opened visible log tail window: $Title -> $($LogPath -join ', ')"
+    } catch {
+        Write-Ma5TaskLog $LogDir $LogFile "Could not open log tail window for $($LogPath -join ', '): $($_.Exception.Message)"
+    }
+}
+
 function Start-Ma5PyCharm {
     param(
         [string]$ProjectDir,

@@ -59,7 +59,7 @@ def notify_trade_order_event(settings: Settings, result: OrderResult, reason: st
 
 
 def render_trade_order_messages(result: OrderResult, reason: str, *, broker_name: str) -> list[str]:
-    """把最终订单结果压成一条消息，避免原因和状态分散发送。"""
+    """把最终订单结果压成一条结构化消息，避免原因和状态分散发送。"""
     side_text = order_side_text(result.side)
     status = result.status.upper()
     if result.side.upper() == "CANCEL":
@@ -73,38 +73,50 @@ def render_trade_order_messages(result: OrderResult, reason: str, *, broker_name
     else:
         title = f"Alpaca交易{side_text}状态: {result.symbol}"
 
-    summary_parts = [
-        f"账户: {broker_name}",
-        f"数量: {format_quantity(result.quantity)}",
-        f"价格: {format_price(result.price)}",
-        f"状态: {status}",
+    symbol = result.symbol or "订单"
+    lines = [
+        f"【Alpaca 交易结果】{symbol}",
+        f"结论：{title}",
+        "动作：已记录订单结果；如为买入/卖出成交，系统会按当前策略继续后续监控。",
+        "",
+        "订单信息",
+        f"- 账户：{broker_name}",
+        f"- 方向：{side_text}",
+        f"- 数量：{format_quantity(result.quantity)}",
+        f"- 价格：{format_price(result.price)}",
+        f"- 状态：{status}",
     ]
     if result.order_id:
-        summary_parts.append(f"订单号: {compact_text(result.order_id, 36)}")
+        lines.append(f"- 订单号：{compact_text(result.order_id, 36)}")
 
-    lines = [title, " | ".join(summary_parts)]
     if reason:
-        lines.append(f"原因: {compact_text(reason, 160)}")
+        lines.extend(["", "策略原因", f"- {full_text(reason)}"])
     if result.message:
-        lines.append(f"结果: {compact_text(result.message, 160)}")
+        lines.extend(["", "执行结果", f"- {full_text(result.message)}"])
     return ["\n".join(lines)]
 
 
 def render_order_submitted_message(result: OrderResult, reason: str, *, broker_name: str) -> str:
     """渲染订单刚提交成功时的即时通知。"""
     side_text = order_side_text(result.side)
-    parts = [
-        f"Alpaca交易{side_text}已提交: {result.symbol}",
-        f"账户: {broker_name}",
-        f"数量: {format_quantity(result.quantity)}",
-        f"价格: {format_price(result.price)}",
-        f"状态: {result.status.upper()}",
+    title = f"Alpaca交易{side_text}已提交: {result.symbol}"
+    lines = [
+        f"【Alpaca 交易提交】{result.symbol}",
+        f"结论：{title}",
+        "动作：订单已提交到 Alpaca，等待成交/撤单结果；最终状态会另行通知。",
+        "",
+        "订单信息",
+        f"- 账户：{broker_name}",
+        f"- 方向：{side_text}",
+        f"- 数量：{format_quantity(result.quantity)}",
+        f"- 价格：{format_price(result.price)}",
+        f"- 状态：{result.status.upper()}",
     ]
     if result.order_id:
-        parts.append(f"订单号: {compact_text(result.order_id, 36)}")
+        lines.append(f"- 订单号：{compact_text(result.order_id, 36)}")
     if reason:
-        parts.append(f"原因: {compact_text(reason, 120)}")
-    return " | ".join(parts)
+        lines.extend(["", "策略原因", f"- {full_text(reason)}"])
+    return "\n".join(lines)
 
 
 def order_side_text(side: str) -> str:
@@ -131,3 +143,8 @@ def compact_text(value: str, max_chars: int) -> str:
     """压缩长文本，避免通知刷屏。"""
     text = " ".join(str(value).split())
     return text if len(text) <= max_chars else text[: max_chars - 1] + "..."
+
+
+def full_text(value: str) -> str:
+    """保留完整内容，只压缩换行和重复空白。"""
+    return " ".join(str(value).split())

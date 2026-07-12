@@ -61,7 +61,16 @@ def serve_watchlist_charts(file_name: str = "watch_codes.txt") -> None:
         def do_GET(self) -> None:
             parsed = urllib.parse.urlparse(self.path)
             if parsed.path == "/api/watchlist/health":
-                self.send_json_response(200, {"ok": True, "service": "watchlist_chart", "port": port})
+                self.send_json_response(
+                    200,
+                    {
+                        "ok": True,
+                        "service": "watchlist_chart",
+                        "port": port,
+                        "chart_dir": str(chart_dir),
+                        "watch_codes_file": str(settings.watch_codes_file.resolve()),
+                    },
+                )
                 return
             if parsed.path == "/api/watchlist/delete":
                 self.send_json_response(405, {"ok": False, "error": "delete endpoint requires POST", "codes": []})

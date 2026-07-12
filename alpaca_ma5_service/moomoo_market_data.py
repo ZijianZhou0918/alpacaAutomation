@@ -9,11 +9,14 @@ import time
 from pathlib import Path
 from typing import Any
 
+from .market_time import is_premarket_time
 from .watchlist import normalize_symbol
 
 
 DEFAULT_OPEND_EXE_PATH = r"%APPDATA%\moomoo_OpenD\moomoo_OpenD.exe"
 LOCAL_OPEND_HOSTS = {"127.0.0.1", "localhost", "::1"}
+SNAPSHOT_MIN_INTERVAL_SECONDS = 0.55
+PREMARKET_SNAPSHOT_PRICE_FIELDS = ["pre_price"]
 SNAPSHOT_PRICE_FIELDS = [
     "last_price",
     "nominal_price",
@@ -65,22 +68,22 @@ class MoomooRealtimePriceSource:
         """返回当前价；失败时会重连一次再试。"""
         return self.latest_price_quote(symbol).price
 
-    def latest_price_quote(self, symbol: str) -> PriceQuote:
+    def latest_price_quote(self, symbol: str, *, now: datetime | None = None) -> PriceQuote:
         """返回当前价，并标出具体来自哪个 Moomoo 快照字段。"""
         code = normalize_symbol(symbol)
         try:
-            return self._latest_price_quote_once(code)
+            return self._latest_price_quote_once(code, now=now)
         except Exception:
             self.close()
-            return self._latest_price_quote_once(code)
+            return self._latest_price_quote_once(code, now=now)
 
-    def _latest_price_quote_once(self, code: str) -> PriceQuote:
+    def _latest_price_quote_once(self, code: str, *, now: datetime | None = None) -> PriceQuote:
         self._connect()
         self._throttle_snapshot()
         ret, data = self.quote_ctx.get_market_snapshot([code])
         if ret != self.mm.RET_OK:
             raise MoomooQuoteError(f"获取 {code} Moomoo 快照失败：{data}")
-        price, field = snapshot_price_with_field(data)
+        price, field = snapshot_price_with_field(data, fields=snapshot_price_fields_for_time(now))
         if price <= 0:
             raise MoomooQuoteError(f"{code} Moomoo 快照没有有效价格")
         today_open, open_field = snapshot_open_with_field(data)
@@ -118,10 +121,10 @@ class MoomooRealtimePriceSource:
         raise MoomooQuoteError(f"Moomoo OpenD 在 {self.opend_startup_timeout:.1f}s 内未就绪")
 
     def _throttle_snapshot(self) -> None:
-        # 复用 StockAPI 的限频思路，避免监控循环把 OpenD 快照接口打满。
+        # OpenD 快照接口常见限制是每 30 秒 60 次，单股轮询时按 0.55s 控制节奏。
         elapsed = time.monotonic() - self._last_snapshot_time
-        if elapsed < 0.05:
-            time.sleep(0.05 - elapsed)
+        if elapsed < SNAPSHOT_MIN_INTERVAL_SECONDS:
+            time.sleep(SNAPSHOT_MIN_INTERVAL_SECONDS - elapsed)
         self._last_snapshot_time = time.monotonic()
 
     def close(self) -> None:
@@ -163,22 +166,28 @@ def snapshot_price(snapshot: Any) -> float:
     return snapshot_price_with_field(snapshot)[0]
 
 
-def snapshot_price_with_field(snapshot: Any) -> tuple[float, str]:
+def snapshot_price_with_field(snapshot: Any, *, fields: list[str] | None = None) -> tuple[float, str]:
     if snapshot is None or getattr(snapshot, "empty", False):
         return 0.0, ""
-    return snapshot_price_from_row_with_field(snapshot.iloc[0])
+    return snapshot_price_from_row_with_field(snapshot.iloc[0], fields=fields)
 
 
 def snapshot_price_from_row(row: Any) -> float:
     return snapshot_price_from_row_with_field(row)[0]
 
 
-def snapshot_price_from_row_with_field(row: Any) -> tuple[float, str]:
-    for field in SNAPSHOT_PRICE_FIELDS:
+def snapshot_price_from_row_with_field(row: Any, *, fields: list[str] | None = None) -> tuple[float, str]:
+    for field in fields or SNAPSHOT_PRICE_FIELDS:
         value = numeric(row.get(field, 0.0))
         if value > 0:
             return value, field
     return 0.0, ""
+
+
+def snapshot_price_fields_for_time(now: datetime | None) -> list[str]:
+    if now is not None and is_premarket_time(now):
+        return PREMARKET_SNAPSHOT_PRICE_FIELDS
+    return SNAPSHOT_PRICE_FIELDS
 
 
 def snapshot_open_with_field(snapshot: Any) -> tuple[float, str]:

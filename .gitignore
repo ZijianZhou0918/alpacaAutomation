@@ -5,3 +5,5 @@ __pycache__/
 .env
 outputs/
 .codex-remote-attachments/
+backtest/output/
+backtest/data/

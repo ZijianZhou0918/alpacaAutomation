@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 from .alpaca_connection import load_alpaca_credentials
 from .config import Settings
 from .errors import short_error
-from .market_time import daily_request_end, is_realtime_order_time, regular_open_has_started, stale_sip_daily_end
+from .market_time import daily_request_end, is_premarket_time, is_realtime_order_time, regular_open_has_started, stale_sip_daily_end
 from .models import MarketSnapshot
 from .moomoo_market_data import MoomooRealtimePriceSource
 from .watchlist import normalize_symbol, to_alpaca_symbol
@@ -65,13 +65,36 @@ class AlpacaMarketData:
     def _current_price(self, normalized_symbol: str, alpaca_symbol: str, now: datetime) -> tuple[float, str, float, str]:
         """优先读注入的实时源；未配置时才回退到 Alpaca latest trade。"""
         if self.realtime_price_source is not None:
-            if hasattr(self.realtime_price_source, "latest_price_quote"):
-                quote = self.realtime_price_source.latest_price_quote(normalized_symbol)
-                return quote.price, quote.source, getattr(quote, "today_open", 0.0), getattr(quote, "today_open_source", "")
-            return self.realtime_price_source.latest_price(normalized_symbol), type(self.realtime_price_source).__name__, 0.0, ""
+            try:
+                if hasattr(self.realtime_price_source, "latest_price_quote"):
+                    quote = self.realtime_price_source.latest_price_quote(normalized_symbol, now=now)
+                    return quote.price, quote.source, getattr(quote, "today_open", 0.0), getattr(quote, "today_open_source", "")
+                return self.realtime_price_source.latest_price(normalized_symbol), type(self.realtime_price_source).__name__, 0.0, ""
+            except Exception as exc:
+                if not _requires_realtime_price(now):
+                    raise
+                return self._fallback_realtime_price(alpaca_symbol, now, exc)
         if not _requires_realtime_price(now):
             return 0.0, "", 0.0, ""
-        return self._latest_trade_price(alpaca_symbol), f"alpaca_latest_trade:{self.trade_feed.lower()}", 0.0, ""
+        return self._fallback_realtime_price(alpaca_symbol, now)
+
+    def _fallback_realtime_price(self, symbol: str, now: datetime, source_error: Exception | None = None) -> tuple[float, str, float, str]:
+        """Moomoo 无可用快照时切到 Alpaca；盘前优先 quote，盘中优先 trade。"""
+        errors: list[str] = []
+        fallback_order = ("quote", "trade") if is_premarket_time(now) else ("trade", "quote")
+        if source_error is not None:
+            errors.append(f"Moomoo: {short_error(source_error)}")
+        for source in fallback_order:
+            try:
+                if source == "quote":
+                    price, price_source = self._latest_quote_price(symbol)
+                else:
+                    price = self._latest_trade_price(symbol)
+                    price_source = f"alpaca_latest_trade:{self.trade_feed.lower()}"
+                return price, price_source, 0.0, ""
+            except Exception as exc:
+                errors.append(f"Alpaca {source}: {short_error(exc)}")
+        raise RuntimeError(f"{symbol} 无法从备用实时数据源取得价格；" + " | ".join(errors))
 
     def _daily_bars(self, symbol: str, now: datetime):
         """读取 Alpaca 日线；SIP 权限失败时降级 IEX，避免监控中断。"""
@@ -121,6 +144,28 @@ class AlpacaMarketData:
         if price <= 0:
             raise RuntimeError(f"{symbol} {feed_label} 实时成交价无效")
         return price
+
+    def _latest_quote_price(self, symbol: str) -> tuple[float, str]:
+        """读取 Alpaca latest quote；盘前 Moomoo 没有 pre_price 时优先用 bid/ask。"""
+        from alpaca.data.enums import DataFeed
+        from alpaca.data.requests import StockLatestQuoteRequest
+
+        feed = self.trade_feed.lower()
+        feed_label = self.trade_feed.upper()
+        try:
+            request = StockLatestQuoteRequest(symbol_or_symbols=[symbol], feed=DataFeed(feed))
+            quote = self.client.get_stock_latest_quote(request).get(symbol)
+            bid = _positive_float(getattr(quote, "bid_price", 0.0))
+            ask = _positive_float(getattr(quote, "ask_price", 0.0))
+        except Exception as exc:
+            raise RuntimeError(f"{symbol} 无法读取 {feed_label} 实时报价：{exc}") from exc
+        if bid > 0 and ask > 0:
+            return round((bid + ask) / 2.0, 6), f"alpaca_latest_quote:midpoint:{feed}"
+        if bid > 0:
+            return bid, f"alpaca_latest_quote:bid:{feed}"
+        if ask > 0:
+            return ask, f"alpaca_latest_quote:ask:{feed}"
+        raise RuntimeError(f"{symbol} {feed_label} 实时报价无效")
 
     def close(self) -> None:
         """关闭外部实时行情连接，避免点箭头脚本结束后进程卡住。"""
@@ -184,6 +229,14 @@ def _usable_today_open(now: datetime, today_open: float, today_open_source: str)
 def _requires_realtime_price(now: datetime) -> bool:
     """可交易窗口内必须有实时价，不能用日线 close 冒充当前价。"""
     return is_realtime_order_time(now)
+
+
+def _positive_float(value) -> float:
+    try:
+        number = float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if number > 0 else 0.0
 
 
 def build_market_data(settings: Settings) -> AlpacaMarketData:

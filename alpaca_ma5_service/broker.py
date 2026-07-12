@@ -30,6 +30,10 @@ class DryRunStockBroker:
         """读取本地模拟持仓，供卖出规则判断使用。"""
         return load_positions(self.settings.state_file)
 
+    def get_open_buy_order_symbols(self) -> set[str]:
+        """dry-run 没有真实开放买单。"""
+        return set()
+
     def place_market_buy(
         self,
         symbol: str,
@@ -136,6 +140,17 @@ class AlpacaStockBroker:
             avg_price = float(getattr(raw, "avg_entry_price", 0) or 0)
             positions[symbol] = Position(symbol, qty, avg_price, "alpaca", source=self.source_name())
         return positions
+
+    def get_open_buy_order_symbols(self) -> set[str]:
+        """读取 Alpaca 当前开放买单，用于自动监控防重复下单。"""
+        symbols: set[str] = set()
+        for raw in self._get_open_orders(""):
+            if _raw_order_side(raw) != "BUY":
+                continue
+            symbol = normalize_symbol(getattr(raw, "symbol", ""))
+            if symbol:
+                symbols.add(symbol)
+        return symbols
 
     def place_market_buy(
         self,
@@ -281,6 +296,10 @@ class AlpacaStockBroker:
 
         alpaca_symbol = to_alpaca_symbol(symbol)
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+        if side == "SELL":
+            quantity = self._sell_qty(symbol, quantity)
+            if quantity <= 0:
+                return OrderResult("", symbol, side, 0, current_price, "REJECTED", "卖出数量不足 1 股")
         now_et = now_market_time(self.settings)
         if not skip_time_validation and side == "BUY" and is_premarket_time(now_et):
             return OrderResult("", symbol, side, quantity, current_price, "REJECTED", "盘前时段不买入，已跳过真实买单")
@@ -348,6 +367,10 @@ class AlpacaStockBroker:
 
         alpaca_symbol = to_alpaca_symbol(symbol)
         order_side = OrderSide.BUY if side == "BUY" else OrderSide.SELL
+        if side == "SELL":
+            quantity = self._sell_qty(symbol, quantity)
+            if quantity <= 0:
+                return OrderResult("", symbol, side, 0, limit_price, "REJECTED", "卖出数量不足 1 股")
         now_et = now_market_time(self.settings)
         if not skip_time_validation and side == "BUY" and is_premarket_time(now_et):
             return OrderResult("", symbol, side, quantity, limit_price, "REJECTED", "盘前时段不买入，已跳过真实买单")
@@ -414,6 +437,22 @@ class AlpacaStockBroker:
             return 0.0
         return float(math.floor(notional_usd / current_price))
 
+    def _sell_qty(self, symbol: str, quantity: float) -> float:
+        """卖出前按 Alpaca 碎股权限规整数量，避免非碎股资产被拒单。"""
+        try:
+            qty = float(quantity)
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(qty) or qty <= 0:
+            return 0.0
+
+        rounded_qty = round(qty)
+        if math.isclose(qty, rounded_qty, rel_tol=0.0, abs_tol=1e-6):
+            return float(rounded_qty)
+        if self._can_sell_fractional(symbol):
+            return round(qty, 6)
+        return float(math.floor(qty))
+
     def _can_buy_fractional(self, symbol: str) -> bool:
         """查询 Alpaca 碎股权限；查询失败时保守用整数股，减少拒单。"""
         if not self.settings.allow_fractional_shares:
@@ -423,6 +462,15 @@ class AlpacaStockBroker:
             return bool(getattr(asset, "fractionable", False))
         except Exception as exc:
             print(f"{symbol}: 查询 Alpaca 碎股权限失败，改用整数股。{short_error(exc)}", flush=True)
+            return False
+
+    def _can_sell_fractional(self, symbol: str) -> bool:
+        """卖出碎股只看 Alpaca asset 权限；查询失败时保守改用整数股。"""
+        try:
+            asset = self.client.get_asset(to_alpaca_symbol(symbol))
+            return bool(getattr(asset, "fractionable", False))
+        except Exception as exc:
+            print(f"{symbol}: 查询 Alpaca 碎股权限失败，卖出改用整数股。{short_error(exc)}", flush=True)
             return False
 
     def _extended_limit_price(self, side: str, current_price: float) -> float:

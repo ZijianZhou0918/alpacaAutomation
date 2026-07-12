@@ -56,22 +56,30 @@ function Register-Ma5Task {
     Write-InstallLog "Registered $Name at $At local time."
 }
 
+foreach ($deprecatedTaskName in @("AlpacaMA5-2350-EnsureMonitor-PyCharm")) {
+    $deprecatedTask = Get-ScheduledTask -TaskName $deprecatedTaskName -ErrorAction SilentlyContinue
+    if ($deprecatedTask) {
+        Unregister-ScheduledTask -TaskName $deprecatedTaskName -Confirm:$false
+        Write-InstallLog "Removed deprecated task $deprecatedTaskName."
+    }
+}
+
 Register-Ma5Task `
     -Name "AlpacaMA5-2200-GenerateWatchcode-PyCharm" `
     -ScriptPath $WatchcodeScript `
     -At "22:00" `
-    -Description "At 22:00, run watchcode_ma5.py only when tomorrow is a US equity trading day; open PyCharm if possible, then use direct python fallback."
+    -Description "At 22:00, generate intraday and premarket watchcode files only when tomorrow is a US equity trading day; open PyCharm if possible, then use direct python fallback."
 
 Register-Ma5Task `
-    -Name "AlpacaMA5-2350-EnsureMonitor-PyCharm" `
+    -Name "AlpacaMA5-0050-EnsureMonitor-PyCharm" `
     -ScriptPath $MonitorScript `
-    -At "23:50" `
-    -Description "At 23:50, start monitor_ma5_forever.py only when tomorrow is a US equity trading day and the monitor is not already running."
+    -At "00:50" `
+    -Description "At 00:50, start monitor_auto.py only when today is a US equity trading day; the single entrypoint prepares watchcodes and runs the active session monitor."
 
 Register-Ma5Task `
     -Name "AlpacaMA5-0400-HealthCheck-PyCharm" `
     -ScriptPath $HealthCheckScript `
     -At "04:00" `
-    -Description "At 04:00, on US equity trading days only, ensure monitor_ma5_forever.py is running and regenerate stale watch_codes.txt."
+    -Description "At 04:00, on US equity trading days only, ensure monitor_auto.py is running and regenerate stale watchcode files."
 
-Write-InstallLog "Done. These tasks open PyCharm when possible, then run through direct python fallback without keyboard shortcuts."
+Write-InstallLog "Done. Monitor task opens one visible monitor_auto.py Python window; output is also written to outputs\\logs."

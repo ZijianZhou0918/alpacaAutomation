@@ -66,7 +66,7 @@ def append_order(output_dir: Path, result: OrderResult, reason: str, day: date |
 
 
 def count_today_buy_orders(output_dir: Path, day: date | None = None) -> int:
-    """统计占用每日买入名额的买单；拒单不占，未确认撤单占。"""
+    """统计当天实际买成的买单；拒单、撤单、未确认撤单都不占名额。"""
     path = orders_file(output_dir, day)
     if not path.exists():
         return 0
@@ -131,7 +131,7 @@ def append_daily_buy_exclusion(
 
 
 def count_today_symbol_take_profit_half_sells(output_dir: Path, symbol: str, day: date | None = None) -> int:
-    """统计单股当天已成交的 10% 半仓止盈卖单，避免每轮重复卖一半。"""
+    """统计单股当天已成交的分批止盈卖单，避免每轮重复卖出。"""
     path = orders_file(output_dir, day)
     if not path.exists():
         return 0
@@ -142,6 +142,6 @@ def count_today_symbol_take_profit_half_sells(output_dir: Path, symbol: str, day
             for row in csv.DictReader(f)
             if normalize_symbol(row.get("symbol", "")) == target
             and row.get("side") == "SELL"
-            and "止盈一半" in row.get("reason", "")
+            and "止盈" in row.get("reason", "")
             and is_executed_order_status(row.get("status", ""))
         )
