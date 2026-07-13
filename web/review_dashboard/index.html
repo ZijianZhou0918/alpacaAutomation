@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071016">
   <meta name="description" content="MA5 每日交易复盘与证据核对工作台">
   <title>MA5 每日复盘</title>
-  <link rel="stylesheet" href="./styles.css?v=20260712-optimize1">
+  <link rel="stylesheet" href="./styles.css?v=20260712-ux-polish1">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到复盘内容</a>
@@ -30,6 +30,7 @@
     <symbol id="icon-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="11" height="12" rx="1"/><path d="M16 8V4H5v12h3"/></symbol>
     <symbol id="icon-folder" viewBox="0 0 24 24"><path d="M3 6h7l2 2h9v11H3V6Z"/></symbol>
     <symbol id="icon-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+    <symbol id="icon-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
     <symbol id="icon-up" viewBox="0 0 24 24"><path d="M12 19V5M6 11l6-6 6 6"/></symbol>
     <symbol id="icon-down" viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></symbol>
     <symbol id="icon-minus" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
@@ -147,8 +148,31 @@
             <span id="runtime-status" class="status-indicator neutral"><span class="status-dot" aria-hidden="true"></span><span>正在发现本机任务</span></span>
           </div>
           <p id="runtime-summary" class="muted">Python 命令行与 IDE 启动的监控都会自动出现在这里。</p>
+          <p id="premarket-watchcode-status" class="runtime-control-status"><span class="status-dot" aria-hidden="true"></span><span>正在检查盘前 WatchCode…</span></p>
+          <p id="watchcode-status" class="runtime-control-status"><span class="status-dot" aria-hidden="true"></span><span>正在检查盘中 WatchCode…</span></p>
         </div>
         <div class="runtime-actions">
+          <div class="runtime-action-group" aria-label="盘前任务控制">
+            <span class="runtime-action-label">盘前 · 只提醒</span>
+            <button id="generate-premarket-watchcode" class="button secondary compact-button" type="button">
+              <svg aria-hidden="true"><use href="#icon-database"></use></svg><span>生成盘前 WatchCode</span>
+            </button>
+            <button id="start-premarket-monitor" class="button info-outline compact-button" type="button">
+              <svg aria-hidden="true"><use href="#icon-clock"></use></svg><span>启动盘前监控</span>
+            </button>
+          </div>
+          <div class="runtime-action-group" aria-label="自动和盘中任务控制">
+            <span class="runtime-action-label">自动 / 盘中</span>
+            <button id="generate-watchcode" class="button secondary compact-button" type="button">
+              <svg aria-hidden="true"><use href="#icon-database"></use></svg><span>生成盘中 WatchCode</span>
+            </button>
+            <button id="start-monitor" class="button info-outline compact-button" type="button">
+              <svg aria-hidden="true"><use href="#icon-chart"></use></svg><span>启动自动盯盘</span>
+            </button>
+          </div>
+          <button id="stop-monitor" class="button danger-outline compact-button" type="button" disabled>
+            <svg aria-hidden="true"><use href="#icon-stop"></use></svg><span>结束盯盘</span>
+          </button>
           <label class="follow-control"><input id="runtime-follow" type="checkbox" checked><span>跟随最新输出</span></label>
           <button id="runtime-refresh" class="button secondary compact-button" type="button">
             <svg aria-hidden="true"><use href="#icon-refresh"></use></svg><span>立即刷新</span>
@@ -165,6 +189,10 @@
             </div>
             <label class="runtime-event-filter"><span>筛选</span><select id="runtime-event-filter"><option value="">全部事件</option><option value="critical">异常与订单</option><option value="warning">触发与接近</option><option value="changed">仅状态变化</option></select></label>
             <span id="runtime-updated-at">—</span>
+          </div>
+          <div id="runtime-link-bar" class="runtime-link-bar" aria-live="polite" hidden>
+            <span class="runtime-link-label"><svg aria-hidden="true"><use href="#icon-link"></use></svg>检测到网页</span>
+            <div id="runtime-links" class="runtime-links"></div>
           </div>
           <section id="runtime-events-panel" class="runtime-events-panel" role="tabpanel" aria-labelledby="runtime-events-tab">
             <div id="runtime-event-summary" class="runtime-event-summary">正在提取状态变化…</div>
@@ -392,6 +420,6 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <div id="app-live-region" class="sr-only" role="status" aria-live="polite"></div>
 
-  <script src="./app.js?v=20260712-optimize1" defer></script>
+  <script src="./app.js?v=20260713-task-switch1" defer></script>
 </body>
 </html>

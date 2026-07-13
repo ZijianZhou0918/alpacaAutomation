@@ -5,7 +5,22 @@ const API = {
   review: "/api/review",
   evidence: "/api/review/evidence",
   runtime: "/api/runtime/tasks",
+  actionStatus: "/api/actions/status",
+  generateWatchcode: "/api/actions/generate-watchcode",
+  startMonitor: "/api/actions/start-monitor",
+  generatePremarketWatchcode: "/api/actions/generate-premarket-watchcode",
+  startPremarketMonitor: "/api/actions/start-premarket-monitor",
+  stopMonitor: "/api/actions/stop-monitor",
 };
+
+const RUNTIME_POLL = Object.freeze({
+  burst: [120, 180, 280, 420, 650, 900, 1200, 1600],
+  active: 1000,
+  idle: 3000,
+  hidden: 10000,
+});
+const RUNTIME_LINK_PATTERN = /https?:\/\/[^\s<>"'`]+|[A-Za-z]:\\[^\r\n]*?\\watch_code_daily_kline_(?:latest|\d{4}-\d{2}-\d{2})\.html|watch_code_daily_kline_(?:latest|\d{4}-\d{2}-\d{2})\.html/gi;
+const WATCHCODE_CHART_NAME_PATTERN = /watch_code_daily_kline_(?:latest|\d{4}-\d{2}-\d{2})\.html/i;
 
 const state = {
   data: null,
@@ -25,12 +40,20 @@ const state = {
   runtimeTasks: [],
   runtimePayload: null,
   selectedRuntime: null,
+  runtimeTaskListMarkup: "",
   runtimeFollow: true,
   runtimeView: "events",
   runtimeEventFilter: "",
   runtimeFingerprint: "",
   runtimeLoading: false,
   runtimeTimer: null,
+  runtimeFailureCount: 0,
+  runtimeBurstAction: "",
+  runtimeBurstUntil: 0,
+  runtimeBurstIndex: 0,
+  pendingRuntimeTask: null,
+  actionStatus: null,
+  actionLoading: "",
   viewDate: "",
   mode: "smart",
   resolvedMode: "review",
@@ -65,12 +88,15 @@ function cacheElements() {
     "jump-to-attention", "metric-rail", "page-error", "page-error-message", "retry-button", "decision-workspace",
     "mode-switcher", "data-context-title", "data-context-detail", "freshness-strip", "freshness-page",
     "freshness-runtime", "freshness-broker", "freshness-source", "freshness-environment",
-    "runtime-dashboard", "runtime-status", "runtime-summary", "runtime-follow", "runtime-refresh", "runtime-task-list",
+    "runtime-dashboard", "runtime-status", "runtime-summary", "premarket-watchcode-status", "watchcode-status",
+    "generate-premarket-watchcode", "start-premarket-monitor", "generate-watchcode", "start-monitor", "stop-monitor",
+    "runtime-follow", "runtime-refresh", "runtime-task-list",
     "runtime-view-switcher", "runtime-events-panel", "runtime-console-panel", "runtime-event-filter",
     "runtime-event-summary", "runtime-event-list", "runtime-console-title", "runtime-updated-at", "runtime-console",
+    "runtime-link-bar", "runtime-links",
     "decision-count", "clear-filters", "quick-filters", "status-filter", "reason-filter", "symbol-search",
     "filter-summary-button", "active-filter-summary", "decision-table", "decision-table-body", "decision-empty",
-    "filtered-total", "timeline-list", "timeline-order", "timeline-empty", "attention-panel", "attention-count",
+    "filtered-total", "timeline-list", "timeline-order", "timeline-empty", "attention-panel", "attention-title", "attention-count",
     "attention-list", "attention-empty", "funnel-content", "lifecycle-content", "reasons-title", "reasons-content", "orders-content",
     "orders-count", "phases-content", "health-content", "drawer-backdrop", "symbol-drawer", "drawer-previous",
     "drawer-next", "drawer-close", "drawer-title", "drawer-subtitle", "drawer-stats", "drawer-order-timeline",
@@ -107,6 +133,11 @@ function bindEvents() {
     window.clearTimeout(state.runtimeTimer);
     loadRuntimeTasks();
   });
+  el["generate-watchcode"].addEventListener("click", () => runDashboardAction("generate-watchcode"));
+  el["start-monitor"].addEventListener("click", () => runDashboardAction("start-monitor"));
+  el["generate-premarket-watchcode"].addEventListener("click", () => runDashboardAction("generate-premarket-watchcode"));
+  el["start-premarket-monitor"].addEventListener("click", () => runDashboardAction("start-premarket-monitor"));
+  el["stop-monitor"].addEventListener("click", () => runDashboardAction("stop-monitor"));
   el["runtime-follow"].addEventListener("change", () => {
     state.runtimeFollow = el["runtime-follow"].checked;
     if (state.runtimeFollow) scrollRuntimeConsole();
@@ -181,6 +212,10 @@ function bindEvents() {
     }
   });
   document.addEventListener("keydown", handleGlobalKeys);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) triggerRuntimeRefresh(0);
+  });
+  window.addEventListener("online", () => triggerRuntimeRefresh(0));
 }
 
 function initializeViewState() {
@@ -189,28 +224,286 @@ function initializeViewState() {
 }
 
 async function loadRuntimeTasks() {
-  if (state.runtimeLoading) return;
+  if (state.runtimeLoading) {
+    scheduleRuntimeRefresh(100);
+    return;
+  }
   state.runtimeLoading = true;
   try {
-    const payload = await fetchJSON(API.runtime);
+    const payload = await fetchJSON(API.runtime, { timeoutMs: 5000 });
     state.runtimePayload = payload;
     state.runtimeTasks = Array.isArray(payload.tasks) ? payload.tasks : [];
-    if (!state.runtimeTasks.some((task) => task.instance_id === state.selectedRuntime)) {
-      state.selectedRuntime = state.runtimeTasks.find((task) => task.status === "running")?.instance_id
-        || state.runtimeTasks[0]?.instance_id
-        || null;
+    state.runtimeFailureCount = 0;
+    reconcilePendingRuntimeTask(payload);
+    const displayTasks = runtimeTasksForDisplay();
+    const selectedTask = displayTasks.find((task) => task.instance_id === state.selectedRuntime);
+    const preferredRunningTask = displayTasks.find((task) => ["running", "starting"].includes(task.status));
+    if (!selectedTask) {
+      state.selectedRuntime = preferredRunningTask?.instance_id || displayTasks[0]?.instance_id || null;
     }
     renderRuntimeDashboard(payload);
     renderWorkspaceMode();
     renderFreshness();
-    scheduleRuntimeRefresh(payload.active_count ? 2000 : 15000);
+    try {
+      await loadActionStatus();
+    } catch (error) {
+      renderActionStatusError(error);
+    }
+    scheduleRuntimeRefresh(nextRuntimeRefreshDelay(payload.active_count));
   } catch (error) {
+    state.runtimeFailureCount += 1;
     el["runtime-status"].className = "status-indicator warning";
     el["runtime-status"].innerHTML = '<span class="status-dot" aria-hidden="true"></span><span>状态读取失败</span>';
     el["runtime-summary"].textContent = `无法读取本机盯盘状态：${error.message}`;
-    scheduleRuntimeRefresh(15000);
+    const retryDelay = Math.min(8000, 500 * (2 ** Math.min(state.runtimeFailureCount - 1, 4)));
+    scheduleRuntimeRefresh(retryDelay);
   } finally {
     state.runtimeLoading = false;
+  }
+}
+
+async function loadActionStatus() {
+  state.actionStatus = await fetchJSON(API.actionStatus, { timeoutMs: 5000 });
+  renderActionStatus();
+}
+
+function renderActionStatus() {
+  const status = state.actionStatus || {};
+  const watchcode = status.watchcode || {};
+  const premarketWatchcode = status.premarket_watchcode || {};
+  const generating = Boolean(status.intraday_generator_running || status.pending_actions?.includes("generate-watchcode"));
+  const premarketGenerating = Boolean(status.premarket_generator_running || status.pending_actions?.includes("generate-premarket-watchcode"));
+  const anyGenerating = Boolean(status.generator_running || generating || premarketGenerating);
+  const startingMonitor = Boolean(status.pending_actions?.includes("start-monitor"));
+  const startingPremarketMonitor = Boolean(status.pending_actions?.includes("start-premarket-monitor"));
+  const monitorRunning = Boolean(status.monitor_running);
+  const premarketMonitorRunning = Boolean(status.premarket_monitor_running);
+  const stoppable = monitorRunning || anyGenerating || startingMonitor || startingPremarketMonitor;
+  renderWatchcodeStatus("premarket-watchcode-status", "盘前", premarketWatchcode, premarketGenerating);
+  renderWatchcodeStatus("watchcode-status", "盘中", watchcode, generating);
+  el["generate-premarket-watchcode"].disabled = anyGenerating || Boolean(state.actionLoading);
+  el["generate-watchcode"].disabled = anyGenerating || Boolean(state.actionLoading);
+  el["start-premarket-monitor"].disabled = monitorRunning || startingPremarketMonitor || Boolean(state.actionLoading);
+  el["start-monitor"].disabled = monitorRunning || startingMonitor || Boolean(state.actionLoading);
+  el["stop-monitor"].disabled = !stoppable || Boolean(state.actionLoading);
+  el["generate-premarket-watchcode"].classList.toggle("is-loading", state.actionLoading === "generate-premarket-watchcode");
+  el["start-premarket-monitor"].classList.toggle("is-loading", state.actionLoading === "start-premarket-monitor");
+  el["generate-watchcode"].classList.toggle("is-loading", state.actionLoading === "generate-watchcode");
+  el["start-monitor"].classList.toggle("is-loading", state.actionLoading === "start-monitor");
+  el["stop-monitor"].classList.toggle("is-loading", state.actionLoading === "stop-monitor");
+  el["start-premarket-monitor"].querySelector("span").textContent = premarketMonitorRunning ? "盘前监控运行中" : (startingPremarketMonitor ? "正在启动" : "启动盘前监控");
+  el["start-monitor"].querySelector("span").textContent = monitorRunning ? "盯盘运行中" : (startingMonitor ? "正在启动" : "启动自动盯盘");
+  el["stop-monitor"].querySelector("span").textContent = state.actionLoading === "stop-monitor" ? "正在结束" : "结束盯盘";
+}
+
+function renderWatchcodeStatus(elementId, sessionLabel, watchcode, generating) {
+  let tone = "critical";
+  let label = `${sessionLabel} WatchCode 缺失或过期 · 需要信号日 ${watchcode.expected_signal_date || "—"}`;
+  if (generating) {
+    tone = "warning";
+    label = `正在生成${sessionLabel} WatchCode，输出会显示在下方`;
+  } else if (watchcode.ready) {
+    tone = "success";
+    label = `${sessionLabel} WatchCode 已就绪 · 信号日 ${watchcode.signal_date} · ${num(watchcode.symbol_count)} 只`;
+  } else if (watchcode.exists) {
+    tone = "warning";
+    label = `${sessionLabel} WatchCode 已过期（${watchcode.signal_date || "日期未知"}）· 启动时会先更新`;
+  }
+  el[elementId].className = `runtime-control-status ${tone}`;
+  el[elementId].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${escapeHTML(label)}</span>`;
+}
+
+function renderActionStatusError(error) {
+  ["premarket-watchcode-status", "watchcode-status"].forEach((elementId) => {
+    el[elementId].className = "runtime-control-status warning";
+    el[elementId].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>任务控制状态读取失败：${escapeHTML(error.message)}</span>`;
+  });
+}
+
+function beginPendingRuntimeTask(action) {
+  const definitions = {
+    "generate-watchcode": { taskName: "watchcode_ma5", taskLabel: "生成盘中 WatchCode", phase: "prepare" },
+    "start-monitor": { taskName: "monitor_auto", taskLabel: "自动盯盘", phase: "startup" },
+    "generate-premarket-watchcode": { taskName: "watchcode_premarket", taskLabel: "生成盘前 WatchCode", phase: "prepare" },
+    "start-premarket-monitor": { taskName: "monitor_premarket", taskLabel: "盘前 MA5 盯盘", phase: "startup" },
+  };
+  const definition = definitions[action];
+  if (!definition) return;
+  const startedAt = new Date().toISOString();
+  const instanceId = `pending-${action}-${Date.now()}`;
+  state.pendingRuntimeTask = {
+    instance_id: instanceId,
+    task_name: definition.taskName,
+    task_label: definition.taskLabel,
+    phase: definition.phase,
+    phase_label: "正在提交启动请求",
+    status: "starting",
+    started_at: startedAt,
+    heartbeat_at: startedAt,
+    source: "网页控制",
+    command: "dashboard action",
+    pid: 0,
+    log: "启动请求正在提交，左侧任务卡已提前建立。",
+    log_truncated: false,
+    events: [{
+      id: `${instanceId}-submitted`,
+      kind: "lifecycle",
+      severity: "info",
+      symbol: "",
+      title: "正在创建任务",
+      message: "启动请求正在提交，等待 Python 进程登记实时输出。",
+      action: "自动追踪",
+      time_label: "刚刚",
+      line_number: 0,
+      count: 1,
+    }],
+    pending: true,
+  };
+  state.selectedRuntime = instanceId;
+  startRuntimeBurst(action, 15000);
+  renderRuntimeDashboard(state.runtimePayload);
+  renderWorkspaceMode();
+  triggerRuntimeRefresh(50);
+}
+
+function markPendingRuntimeStarted(payload) {
+  const pending = state.pendingRuntimeTask;
+  if (!pending) return;
+  pending.pid = Number(payload?.pid) || 0;
+  pending.phase_label = "进程已创建，正在登记输出";
+  pending.log = pending.pid
+    ? `启动进程 PID ${pending.pid} 已创建，正在等待第一条实时输出…`
+    : "启动进程已创建，正在等待第一条实时输出…";
+  pending.events[0].title = "进程已创建";
+  pending.events[0].message = pending.log;
+  renderRuntimeDashboard(state.runtimePayload);
+}
+
+function clearPendingRuntimeTask() {
+  const pendingId = state.pendingRuntimeTask?.instance_id;
+  state.pendingRuntimeTask = null;
+  if (state.selectedRuntime === pendingId) {
+    state.selectedRuntime = state.runtimeTasks.find((task) => task.status === "running")?.instance_id
+      || state.runtimeTasks[0]?.instance_id
+      || null;
+  }
+}
+
+function runtimeTasksForDisplay() {
+  return state.pendingRuntimeTask ? [state.pendingRuntimeTask, ...state.runtimeTasks] : state.runtimeTasks;
+}
+
+function reconcilePendingRuntimeTask(payload) {
+  const pending = state.pendingRuntimeTask;
+  if (state.runtimeBurstAction === "stop-monitor" && !Number(payload?.active_count || 0)) {
+    endRuntimeBurst();
+  }
+  if (!pending) return;
+  const earliestStart = Date.parse(pending.started_at) - 2000;
+  const matchingTask = state.runtimeTasks.find((task) => {
+    if (task.status !== "running" || Date.parse(task.started_at || 0) < earliestStart) return false;
+    if (state.runtimeBurstAction === "generate-watchcode") return task.task_name === "watchcode_ma5";
+    if (state.runtimeBurstAction === "generate-premarket-watchcode") return task.task_name === "watchcode_premarket";
+    if (state.runtimeBurstAction === "start-premarket-monitor") {
+      return ["watchcode_premarket", "monitor_premarket"].includes(task.task_name);
+    }
+    return ["watchcode_ma5", "monitor_auto", "monitor_ma5"].includes(task.task_name);
+  });
+  if (matchingTask) {
+    clearPendingRuntimeTask();
+    state.selectedRuntime = matchingTask.instance_id;
+    endRuntimeBurst();
+    return;
+  }
+  if (Date.now() >= state.runtimeBurstUntil) {
+    clearPendingRuntimeTask();
+    endRuntimeBurst();
+  }
+}
+
+function startRuntimeBurst(action, durationMs) {
+  state.runtimeBurstAction = action;
+  state.runtimeBurstUntil = Date.now() + durationMs;
+  state.runtimeBurstIndex = 0;
+}
+
+function endRuntimeBurst() {
+  state.runtimeBurstAction = "";
+  state.runtimeBurstUntil = 0;
+  state.runtimeBurstIndex = 0;
+}
+
+function nextRuntimeRefreshDelay(activeCount) {
+  if (document.hidden) return RUNTIME_POLL.hidden;
+  if (state.runtimeBurstUntil > Date.now()) {
+    const index = Math.min(state.runtimeBurstIndex, RUNTIME_POLL.burst.length - 1);
+    state.runtimeBurstIndex += 1;
+    return RUNTIME_POLL.burst[index];
+  }
+  if (state.runtimeBurstAction) endRuntimeBurst();
+  return Number(activeCount || 0) > 0 ? RUNTIME_POLL.active : RUNTIME_POLL.idle;
+}
+
+function triggerRuntimeRefresh(delay = 0) {
+  scheduleRuntimeRefresh(Math.max(0, Number(delay) || 0));
+}
+
+async function runDashboardAction(action) {
+  if (state.actionLoading) return;
+  if (action === "start-monitor") {
+    const mode = String(state.data?.broker?.mode || "LIVE").toUpperCase();
+    const dependency = state.actionStatus?.watchcode?.ready ? "WatchCode 已就绪。" : "WatchCode 尚未就绪，系统会先生成，成功后再启动。";
+    if (!window.confirm(`${dependency}\n\n即将启动 ${mode} 自动盯盘任务，可能执行真实订单。确认继续？`)) return;
+  }
+  if (action === "start-premarket-monitor") {
+    const dependency = state.actionStatus?.premarket_watchcode?.ready
+      ? "盘前 WatchCode 已就绪。"
+      : "盘前 WatchCode 尚未就绪，系统会先生成，成功后再启动。";
+    if (!window.confirm(`${dependency}\n\n盘前监控仅在 04:00–09:30 ET 运行，只发送推荐提醒，不会提交买单。确认继续？`)) return;
+  }
+  if (action === "stop-monitor") {
+    if (!window.confirm("确认结束当前 MA5 盯盘任务？\n\n正在生成的 WatchCode 也会停止；已经提交到券商的订单不会被撤销。")) return;
+  }
+  state.actionLoading = action;
+  if (["generate-watchcode", "start-monitor", "generate-premarket-watchcode", "start-premarket-monitor"].includes(action)) {
+    beginPendingRuntimeTask(action);
+  }
+  if (action === "stop-monitor") {
+    startRuntimeBurst(action, 10000);
+    triggerRuntimeRefresh(50);
+  }
+  renderActionStatus();
+  try {
+    const url = {
+      "generate-watchcode": API.generateWatchcode,
+      "start-monitor": API.startMonitor,
+      "generate-premarket-watchcode": API.generatePremarketWatchcode,
+      "start-premarket-monitor": API.startPremarketMonitor,
+      "stop-monitor": API.stopMonitor,
+    }[action];
+    const payload = await fetchJSON(url, { method: "POST", headers: { "X-MA5-Action": "1" }, timeoutMs: 15000 });
+    if (payload.status === "started") markPendingRuntimeStarted(payload);
+    if (payload.status === "already_running") {
+      clearPendingRuntimeTask();
+      endRuntimeBurst();
+    }
+    const fallbackMessage = action === "stop-monitor" ? "盯盘任务已结束。" : "任务已启动。";
+    showToast(payload.message || fallbackMessage, ["already_running", "not_running"].includes(payload.status) ? "warning" : "success");
+    announce(payload.message || fallbackMessage);
+  } catch (error) {
+    clearPendingRuntimeTask();
+    endRuntimeBurst();
+    renderRuntimeDashboard(state.runtimePayload);
+    const operation = action === "stop-monitor" ? "结束" : "启动";
+    showToast(`任务${operation}失败：${error.message}`, "critical");
+  } finally {
+    state.actionLoading = "";
+    try {
+      await loadActionStatus();
+    } catch (error) {
+      renderActionStatusError(error);
+    }
+    triggerRuntimeRefresh(0);
   }
 }
 
@@ -218,7 +511,7 @@ function scheduleRuntimeRefresh(delay) {
   window.clearTimeout(state.runtimeTimer);
   state.runtimeTimer = window.setTimeout(() => {
     if (document.hidden) {
-      scheduleRuntimeRefresh(15000);
+      scheduleRuntimeRefresh(RUNTIME_POLL.hidden);
       return;
     }
     loadRuntimeTasks();
@@ -226,51 +519,154 @@ function scheduleRuntimeRefresh(delay) {
 }
 
 function renderRuntimeDashboard(payload = null) {
-  const tasks = state.runtimeTasks;
-  const activeCount = payload?.active_count ?? tasks.filter((task) => task.status === "running").length;
+  const tasks = runtimeTasksForDisplay();
+  const activeCount = tasks.filter((task) => ["running", "starting"].includes(task.status)).length;
   el["runtime-status"].className = `status-indicator ${activeCount ? "success" : "neutral"}`;
   el["runtime-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${activeCount ? `${activeCount} 个任务运行中` : "当前无运行任务"}</span>`;
   el["runtime-summary"].textContent = activeCount
-    ? "运行中每 2 秒同步；默认只展示状态变化，完整输出保留在原始日志。"
-    : "空闲时每 15 秒发现一次任务；启动任一盯盘入口后会自动切换为实时模式。";
+    ? "运行中每 1 秒同步；网页启动后立即显示，并自动追踪真实进程。"
+    : "空闲时每 3 秒发现一次任务；网页启动任务会立即显示。";
 
   if (!tasks.length) {
-    el["runtime-task-list"].innerHTML = '<div class="runtime-empty"><svg aria-hidden="true"><use href="#icon-terminal"></use></svg><strong>没有发现盯盘任务</strong><span>任务启动后无需额外绑定，网页会自动显示。</span></div>';
+    const emptyTaskListMarkup = '<div class="runtime-empty"><svg aria-hidden="true"><use href="#icon-terminal"></use></svg><strong>没有发现盯盘任务</strong><span>任务启动后无需额外绑定，网页会自动显示。</span></div>';
+    if (state.runtimeTaskListMarkup !== emptyTaskListMarkup) {
+      state.runtimeTaskListMarkup = emptyTaskListMarkup;
+      el["runtime-task-list"].innerHTML = emptyTaskListMarkup;
+    }
     el["runtime-console-title"].textContent = "等待盯盘任务";
     el["runtime-updated-at"].textContent = formatClock(payload?.generated_at);
-    el["runtime-console"].textContent = "尚未发现由本项目入口启动的盯盘任务。\n\n支持入口：\n  • monitor_auto.py\n  • monitor_ma5_forever.py\n  • monitor_premarket_ma5.py\n  • monitor_afterhours.py";
+    renderRuntimeLinks(null);
+    renderRuntimeConsole("尚未发现由本项目入口启动的盯盘任务。\n\n支持入口：\n  • monitor_auto.py\n  • monitor_ma5_forever.py\n  • monitor_premarket_ma5.py\n  • monitor_afterhours.py");
     el["runtime-event-summary"].textContent = "当前没有运行中的盯盘任务";
     el["runtime-event-list"].innerHTML = '<div class="runtime-event-empty"><strong>等待状态变化</strong><span>任务启动后，这里优先显示买点、订单、异常与关键阈值变化。</span></div>';
     renderRuntimeView();
     return;
   }
 
-  el["runtime-task-list"].innerHTML = tasks.map((task) => {
+  const taskListMarkup = tasks.map((task) => {
     const selected = task.instance_id === state.selectedRuntime;
     const running = task.status === "running";
-    const statusLabel = running ? "运行中" : task.status === "failed" ? "异常结束" : "已结束";
-    return `<button class="runtime-task ${selected ? "selected" : ""}" type="button" role="option" aria-selected="${selected}" data-runtime-id="${escapeAttr(task.instance_id)}">
+    const starting = task.status === "starting";
+    const statusLabel = starting ? "正在启动" : running ? "运行中" : task.status === "failed" ? "异常结束" : "已结束";
+    const processLabel = task.pid ? `PID ${num(task.pid)}` : "PID 正在分配";
+    return `<button class="runtime-task ${task.pending ? "pending" : ""} ${selected ? "selected" : ""}" type="button" role="option" aria-selected="${selected}" data-runtime-id="${escapeAttr(task.instance_id)}">
       <span class="runtime-task-head"><span class="runtime-task-name">${escapeHTML(task.task_label)}</span><span class="runtime-state ${escapeAttr(task.status)}"><span class="status-dot" aria-hidden="true"></span>${statusLabel}</span></span>
-      <span class="runtime-task-meta">${escapeHTML(task.phase_label)} · PID ${num(task.pid)}</span>
+      <span class="runtime-task-meta">${escapeHTML(task.phase_label)} · ${processLabel}</span>
       <span class="runtime-task-meta">${escapeHTML(task.source)} · ${formatDateTime(task.started_at)}</span>
     </button>`;
   }).join("");
+  if (state.runtimeTaskListMarkup !== taskListMarkup) {
+    state.runtimeTaskListMarkup = taskListMarkup;
+    el["runtime-task-list"].innerHTML = taskListMarkup;
+  }
 
   const selected = tasks.find((task) => task.instance_id === state.selectedRuntime) || tasks[0];
   el["runtime-console-title"].textContent = `${selected.task_label} · ${selected.phase_label}`;
   el["runtime-updated-at"].textContent = `更新 ${formatClock(payload?.generated_at || selected.heartbeat_at)}`;
   const prefix = selected.log_truncated ? "… 已省略较早输出，仅显示最近内容 …\n\n" : "";
-  const log = selected.log || (selected.status === "running" ? "任务已启动，等待第一行控制台输出…" : "该任务没有留下控制台输出。");
+  const log = selected.log || (["running", "starting"].includes(selected.status) ? "任务已启动，等待第一行控制台输出…" : "该任务没有留下控制台输出。");
   const consoleNode = el["runtime-console"];
   const nearBottom = consoleNode.scrollHeight - consoleNode.scrollTop - consoleNode.clientHeight < 48;
-  consoleNode.textContent = `${prefix}${log}`;
+  renderRuntimeLinks(selected);
+  renderRuntimeConsole(`${prefix}${log}`);
   if (state.runtimeFollow || nearBottom) scrollRuntimeConsole();
   renderRuntimeEvents(selected);
   renderRuntimeView();
 }
 
 function selectedRuntimeTask() {
-  return state.runtimeTasks.find((task) => task.instance_id === state.selectedRuntime) || state.runtimeTasks[0] || null;
+  const tasks = runtimeTasksForDisplay();
+  return tasks.find((task) => task.instance_id === state.selectedRuntime) || tasks[0] || null;
+}
+
+function runtimeLinkMatches(value) {
+  const text = String(value || "");
+  const pattern = new RegExp(RUNTIME_LINK_PATTERN.source, RUNTIME_LINK_PATTERN.flags);
+  const matches = [];
+  for (const match of text.matchAll(pattern)) {
+    const token = String(match[0] || "").replace(/[),.;!?，。；：！？】》]+$/u, "");
+    const link = runtimeLinkFromToken(token);
+    if (!token || !link) continue;
+    matches.push({ start: match.index, end: match.index + token.length, token, link });
+  }
+  return matches;
+}
+
+function runtimeLinkFromToken(token) {
+  const chartMatch = String(token || "").match(WATCHCODE_CHART_NAME_PATTERN);
+  if (chartMatch) {
+    const fileName = chartMatch[0].toLowerCase();
+    const dateMatch = fileName.match(/\d{4}-\d{2}-\d{2}/);
+    return {
+      href: `/charts/${encodeURIComponent(fileName)}`,
+      label: dateMatch ? `打开 K 线图 · ${dateMatch[0]}` : "打开最新 K 线图",
+      kind: "chart",
+      source: token,
+    };
+  }
+  if (!/^https?:\/\//i.test(token)) return null;
+  try {
+    const parsed = new URL(token);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    return {
+      href: parsed.href,
+      label: `打开网页 · ${parsed.hostname}`,
+      kind: "web",
+      source: token,
+    };
+  } catch {
+    return null;
+  }
+}
+
+function extractRuntimeLinks(value) {
+  const seen = new Set();
+  return runtimeLinkMatches(value).map((match) => match.link).filter((link) => {
+    if (seen.has(link.href)) return false;
+    seen.add(link.href);
+    return true;
+  });
+}
+
+function configureRuntimeAnchor(anchor, link, text) {
+  anchor.href = link.href;
+  anchor.target = "_blank";
+  anchor.rel = "noopener noreferrer";
+  anchor.textContent = text;
+  anchor.title = link.source === text ? `${link.label}（新窗口）` : `${link.label}\n识别自：${link.source}`;
+}
+
+function renderRuntimeLinks(task) {
+  const links = extractRuntimeLinks(task?.log);
+  el["runtime-links"].replaceChildren();
+  el["runtime-link-bar"].hidden = links.length === 0;
+  links.forEach((link) => {
+    const anchor = document.createElement("a");
+    anchor.className = `runtime-link-chip ${link.kind}`;
+    configureRuntimeAnchor(anchor, link, `${link.label} ↗`);
+    el["runtime-links"].append(anchor);
+  });
+}
+
+function renderRuntimeConsole(value) {
+  const text = String(value || "");
+  const matches = runtimeLinkMatches(text);
+  if (!matches.length) {
+    el["runtime-console"].textContent = text;
+    return;
+  }
+  const fragment = document.createDocumentFragment();
+  let cursor = 0;
+  matches.forEach((match) => {
+    fragment.append(document.createTextNode(text.slice(cursor, match.start)));
+    const anchor = document.createElement("a");
+    anchor.className = "runtime-console-link";
+    configureRuntimeAnchor(anchor, match.link, match.token);
+    fragment.append(anchor);
+    cursor = match.end;
+  });
+  fragment.append(document.createTextNode(text.slice(cursor)));
+  el["runtime-console"].replaceChildren(fragment);
 }
 
 function renderRuntimeEvents(task) {
@@ -284,7 +680,8 @@ function renderRuntimeEvents(task) {
     return filter === "changed" ? event.kind !== "observation" : true;
   });
   const significantCount = sourceEvents.filter((event) => event.kind !== "observation").length;
-  el["runtime-event-summary"].innerHTML = `<strong>${events.length}</strong> 条事件 · <span>${significantCount} 条状态变化</span>${task.status === "running" ? " · 正在监控" : " · 任务已结束"}`;
+  const lifecycleLabel = task.status === "starting" ? " · 正在创建进程" : task.status === "running" ? " · 正在监控" : " · 任务已结束";
+  el["runtime-event-summary"].innerHTML = `<strong>${events.length}</strong> 条事件 · <span>${significantCount} 条状态变化</span>${lifecycleLabel}`;
   el["runtime-event-list"].innerHTML = events.length ? events.map((event) => `
     <article class="runtime-event severity-${severityClass(event.severity)}">
       <span class="runtime-event-marker" aria-hidden="true"></span>
@@ -335,7 +732,7 @@ function setWorkspaceMode(mode) {
 }
 
 function renderWorkspaceMode() {
-  const activeRuntime = state.runtimeTasks.some((task) => task.status === "running");
+  const activeRuntime = runtimeTasksForDisplay().some((task) => ["running", "starting"].includes(task.status));
   state.resolvedMode = state.mode === "smart" ? (activeRuntime ? "live" : "review") : state.mode;
   document.body.classList.toggle("mode-live", state.resolvedMode === "live");
   document.body.classList.toggle("mode-review", state.resolvedMode === "review");
@@ -367,7 +764,8 @@ function renderFreshness() {
   const activeTask = state.runtimeTasks.find((task) => task.status === "running") || null;
   const sources = Array.isArray(data.sources) ? data.sources : [];
   const missingSources = sources.filter((source) => source.status === "missing").length;
-  const healthySources = sources.filter((source) => ["healthy", "present"].includes(source.status)).length;
+  const explainedSources = sources.filter((source) => source.status === "manual_assumed").length;
+  const healthySources = sources.filter((source) => ["healthy", "present", "manual_assumed"].includes(source.status)).length;
   setFreshnessItem("freshness-page", state.runtimePayload?.generated_at || data.generated_at, "success", "刚刚刷新");
 
   if (activeTask) {
@@ -388,6 +786,7 @@ function renderFreshness() {
   const sourceTone = missingSources ? "critical" : healthySources ? "success" : "warning";
   const sourceText = isFallbackView(data) ? `参考日文件 ${healthySources}/${sources.length}` : `正常 ${healthySources}/${sources.length}`;
   setFreshnessItem("freshness-source", null, sourceTone, missingSources ? `${sourceText} · 缺 ${missingSources}` : sourceText);
+  if (explainedSources && !missingSources) el["freshness-source"].title = `${explainedSources} 个策略账本缺口已按手动交易解释`;
   setFreshnessItem("freshness-environment", null, broker.mode === "live" ? "warning" : broker.mode ? "success" : "neutral", broker.mode ? String(broker.mode).toUpperCase() : "—");
 }
 
@@ -482,13 +881,14 @@ function renderHeader() {
   if (!data) return;
   const fallback = isFallbackView(data);
   const requestedTradingDay = data.market_day?.requested_is_trading_day !== false;
+  const hasRecords = data.market_day?.has_records !== false;
   const viewingToday = state.viewDate === todayISO();
   el["review-date"].value = state.viewDate || data.review_date || "";
   const complete = (data.summary?.rounds?.intraday || 0) > 0;
-  const reviewLabel = fallback
-    ? (requestedTradingDay ? (viewingToday ? "今日待数据" : "所选日待数据") : (viewingToday ? "今日休市" : "所选日休市"))
-    : (complete ? "复盘已完成" : "数据不完整");
-  el["review-status"].className = `status-indicator ${fallback ? "warning" : complete ? "success" : "warning"}`;
+  const reviewLabel = !requestedTradingDay
+    ? (viewingToday ? "今日休市" : "所选日休市")
+    : (!hasRecords ? (viewingToday ? "今日无记录" : "所选日无记录") : (complete ? "复盘已完成" : "数据不完整"));
+  el["review-status"].className = `status-indicator ${complete ? "success" : "warning"}`;
   el["review-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${reviewLabel}</span>`;
   const phaseRanges = data.phases || [];
   const first = phaseRanges.find((item) => item.start_at)?.start_at;
@@ -519,14 +919,14 @@ function renderHeader() {
 
 function renderHeadline() {
   const data = state.data || {};
-  if (isFallbackView(data)) {
+  if (data.market_day?.has_records === false || data.market_day?.requested_is_trading_day === false) {
     const viewingToday = state.viewDate === todayISO();
     const requestedTradingDay = data.market_day?.requested_is_trading_day !== false;
     const dateLabel = viewingToday ? "今日" : state.viewDate;
     el["headline-title"].textContent = requestedTradingDay
-      ? `${dateLabel}复盘数据尚未生成`
-      : `${dateLabel}休市，当前没有当日交易复盘`;
-    el["headline-detail"].textContent = `实时盯盘仍显示本机当前输出；下方保留最近交易日 ${data.review_date} 的复盘数据作为参考。`;
+      ? `${dateLabel}暂无复盘记录`
+      : `${dateLabel}休市`;
+    el["headline-detail"].textContent = "页面只展示所选日期的数据，不会引用或混入其他日期的交易记录。";
     return;
   }
   const headline = state.data?.headline || {};
@@ -584,7 +984,8 @@ function renderQuickFilters() {
     ["buy_unfilled", "买入未成", symbols.filter((item) => item.bucket === "buy_unfilled").length],
     ["strategy", "策略未买", symbols.filter((item) => ["not_bought", "window_outside_closest", "excluded"].includes(item.bucket)).length],
     ["excluded", excludedLabel, symbols.filter((item) => item.bucket === "excluded").length],
-    ["data_conflict", "数据冲突", symbols.filter((item) => ["missing", "partial", "unmatched"].includes(item.local_ledger_match)).length],
+    ["manual_activity", "疑似手动", symbols.filter((item) => item.local_ledger_match === "missing").length],
+    ["data_conflict", "数据冲突", symbols.filter((item) => ["partial", "unmatched"].includes(item.local_ledger_match)).length],
   ];
   el["quick-filters"].innerHTML = definitions.map(([key, label, count]) => `
     <button type="button" data-bucket="${key}" class="${state.bucket === key ? "active" : ""}" aria-pressed="${state.bucket === key}">
@@ -672,16 +1073,21 @@ function renderTimeline() {
 
 function renderAttention() {
   const items = state.data?.attention || [];
+  const hasCritical = items.some((item) => item.severity === "critical");
+  const hasWarning = items.some((item) => item.severity === "warning");
+  el["attention-title"].textContent = hasCritical ? "必须核对" : "复盘提示";
+  el["attention-panel"].classList.toggle("has-critical", hasCritical);
+  el["attention-panel"].classList.toggle("only-info", !hasCritical && !hasWarning);
   el["attention-count"].textContent = String(items.length);
   el["attention-empty"].hidden = items.length > 0;
   el["attention-list"].hidden = items.length === 0;
   el["attention-list"].innerHTML = items.map((item) => `
     <li class="attention-item severity-${severityClass(item.severity)}">
-      ${icon(item.severity === "critical" ? "alert" : "info")}
+      ${icon(item.severity === "info" ? "info" : "alert")}
       <div><strong>${escapeHTML(item.title)}</strong><p>${escapeHTML(item.message)}</p><button type="button" data-attention="${escapeAttr(item.code)}">${escapeHTML(item.action_label || "查看相关证据")}</button></div>
     </li>`).join("");
   el["attention-list"].querySelectorAll("button").forEach((button) => button.addEventListener("click", () => {
-    if (button.dataset.attention === "BROKER_ACTIVITY_NOT_IN_LOCAL_LEDGER") {
+    if (["BROKER_ACTIVITY_NOT_IN_LOCAL_LEDGER", "OPEN_BUY_ORDER_WITHOUT_LOCAL_LEDGER", "UNMATCHED_POSITION_CHANGES"].includes(button.dataset.attention)) {
       state.bucket = "broker_activity";
       renderMetrics(); renderQuickFilters(); renderDecisionTable();
       el["decision-workspace"].scrollIntoView({ behavior: "smooth" });
@@ -752,7 +1158,14 @@ function renderPhases() {
 function renderHealth() {
   const sources = state.data?.sources || [];
   const broker = state.data?.broker || {};
-  const rows = sources.map((source) => ({ label: source.label, detail: `${source.file} · ${bytes(source.bytes)} · ${source.modified_at ? formatDateTime(source.modified_at) : "未生成"}`, value: source.status, status: source.status === "healthy" || source.status === "present" ? "success" : (source.status === "empty" ? "warning" : "critical") }));
+  const rows = sources.map((source) => ({
+    label: source.label,
+    detail: source.status === "manual_assumed"
+      ? "策略账本未生成 · 券商独立成交默认按手动交易处理"
+      : `${source.file} · ${bytes(source.bytes)} · ${source.modified_at ? formatDateTime(source.modified_at) : "未生成"}`,
+    value: source.status,
+    status: source.status === "healthy" || source.status === "present" ? "success" : (source.status === "manual_assumed" ? "info" : (source.status === "empty" ? "warning" : "critical")),
+  }));
   rows.push({ label: "Alpaca Trading API（只读）", detail: broker.synced_at ? `同步 ${formatDateTime(broker.synced_at)}` : (broker.error || "尚未核对"), value: broker.status || "not_requested", status: broker.status === "verified" ? "success" : "warning" });
   el["health-content"].innerHTML = `<div class="health-list">${rows.map((row) => `
     <div class="health-row"><span class="health-icon severity-${row.status}">${icon(row.status === "success" ? "check" : "alert")}</span><span class="health-main"><strong>${escapeHTML(row.label)}</strong><span>${escapeHTML(row.detail)}</span></span><span class="health-value severity-${row.status}">${escapeHTML(healthStatus(row.value))}</span></div>`).join("")}</div>`;
@@ -821,13 +1234,14 @@ function renderDrawerTimeline(item) {
 }
 
 function renderDrawerChecklist(item) {
+  const manualAssumed = item.local_ledger_match === "missing";
   const checks = [
     [item.buy_filled_qty > 0, "Alpaca 买入成交已确认"],
     [(item.position_events || []).some((event) => ["added_observed", "existing_at_open"].includes(event.event_type)), "监控日志观察到持仓"],
     [item.sell_filled_qty > 0, "Alpaca 卖出成交已确认"],
     [float(item.current_position_qty) === 0, "当前券商持仓为 0"],
-    [item.local_ledger_match === "matched", item.local_ledger_match === "missing" ? "本地订单账本缺失" : `本地账本${matchLabel(item.local_ledger_match).label}`],
-    [false, "下单来源/操作者/策略需要以 order_id 继续归因"],
+    [item.local_ledger_match === "matched" || manualAssumed, manualAssumed ? "策略账本无记录，默认按手动交易处理" : `本地账本${matchLabel(item.local_ledger_match).label}`],
+    [manualAssumed, manualAssumed ? "手动交易不计入策略执行异常" : "下单来源/操作者/策略需要以 order_id 继续归因"],
   ];
   el["drawer-checklist"].innerHTML = checks.map(([ok, label]) => `<li class="${ok ? "severity-success" : "severity-warning"}">${icon(ok ? "check" : "alert")}<span>${escapeHTML(label)}</span></li>`).join("");
 }
@@ -852,8 +1266,11 @@ function renderDrawerStrategy(item) {
     ["日终/最后状态", item.latest_priced || item.latest],
   ];
   const membership = (item.source_labels || []).includes("策略观察");
+  const originText = item.local_ledger_match === "missing"
+    ? (membership ? "该股在 MA5 观察池内，但没有策略 order_id；按当前规则默认归类为手动交易。" : "该股不在当天 MA5 观察池且没有策略 order_id，默认归类为手动交易。")
+    : (membership ? "该股在 MA5 策略观察池内；是否由策略下单仍需匹配本地 order_id。" : "该股不在当天 14 只 MA5 观察池；不能从现有证据确认是本策略下单。");
   el["drawer-strategy-context"].innerHTML = `
-    <article class="snapshot-card"><h4>归因边界</h4><p class="muted">${membership ? "该股在 MA5 策略观察池内；是否由策略下单仍需匹配本地 order_id。" : "该股不在当天 14 只 MA5 观察池；不能从现有证据确认是本策略下单。"}</p></article>
+    <article class="snapshot-card"><h4>归因边界</h4><p class="muted">${escapeHTML(originText)}</p></article>
     ${snapshots.map(([title, snapshot]) => snapshotCard(title, snapshot)).join("")}`;
 }
 
@@ -979,7 +1396,8 @@ function matchesBucket(item) {
     case "excluded": return item.bucket === "excluded";
     case "current_position": return float(item.current_position_qty) !== 0;
     case "cash_flow": return item.net_cash_flow !== null && item.net_cash_flow !== undefined;
-    case "data_conflict": return ["missing", "partial", "unmatched"].includes(item.local_ledger_match);
+    case "manual_activity": return item.local_ledger_match === "missing";
+    case "data_conflict": return ["partial", "unmatched"].includes(item.local_ledger_match);
     default: return true;
   }
 }
@@ -1090,12 +1508,26 @@ function showError(message) {
 }
 function hideError() { el["page-error"].hidden = true; }
 
-async function fetchJSON(url) {
-  const response = await fetch(url, { headers: { Accept: "application/json" }, cache: "no-store" });
-  let payload;
-  try { payload = await response.json(); } catch { payload = null; }
-  if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
-  return payload;
+async function fetchJSON(url, options = {}) {
+  const { timeoutMs = 45000, headers: suppliedHeaders = {}, signal: upstreamSignal, ...requestOptions } = options;
+  const controller = new AbortController();
+  const abortFromUpstream = () => controller.abort(upstreamSignal?.reason);
+  if (upstreamSignal) upstreamSignal.addEventListener("abort", abortFromUpstream, { once: true });
+  const timeoutId = window.setTimeout(() => controller.abort(), Math.max(1, Number(timeoutMs) || 45000));
+  try {
+    const headers = { Accept: "application/json", ...suppliedHeaders };
+    const response = await fetch(url, { ...requestOptions, headers, cache: "no-store", signal: controller.signal });
+    let payload;
+    try { payload = await response.json(); } catch { payload = null; }
+    if (!response.ok) throw new Error(payload?.error || `HTTP ${response.status}`);
+    return payload;
+  } catch (error) {
+    if (error?.name === "AbortError") throw new Error("请求超时，请稍后重试");
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+    if (upstreamSignal) upstreamSignal.removeEventListener("abort", abortFromUpstream);
+  }
 }
 
 function handleGlobalKeys(event) {
@@ -1141,7 +1573,7 @@ function setSelectOptions(select, allLabel, options, selected) {
 function matchLabel(value) {
   const values = {
     matched: { label: "已匹配", className: "number-positive", icon: "check" },
-    missing: { label: "本地无记录", className: "number-negative", icon: "alert" },
+    missing: { label: "疑似手动", className: "number-info", icon: "info" },
     partial: { label: "部分匹配", className: "number-warning", icon: "alert" },
     unmatched: { label: "未匹配", className: "number-warning", icon: "alert" },
     not_applicable: { label: "策略证据", className: "number-info", icon: "info" },
@@ -1157,9 +1589,9 @@ function symbolTime(item) {
 }
 
 function sourceName(value) { return value === "alpaca" ? "Alpaca API" : value === "monitor_auto" ? "监控日志" : value === "buy_exclusions" ? "排除记录" : value === "local" ? "本地账本" : String(value || "本地证据"); }
-function healthStatus(value) { return ({ healthy: "正常", present: "正常", empty: "空文件", missing: "缺失", verified: "已核对", unavailable: "不可用", not_requested: "未核对" })[value] || String(value || "未知"); }
+function healthStatus(value) { return ({ healthy: "正常", present: "正常", empty: "空文件", missing: "缺失", manual_assumed: "按手动交易", verified: "已核对", unavailable: "不可用", not_requested: "未核对" })[value] || String(value || "未知"); }
 function bucketPriority(value) { return ({ broker_closed: 0, broker_bought: 1, buy_unfilled: 2, position_unreconciled: 3, excluded: 4, window_outside_closest: 5, not_bought: 6, broker_activity: 7 })[value] ?? 99; }
-function bucketLabel(value) { return ({ broker_filled: "券商已成交", broker_closed: "已全部卖出", broker_activity: "券商订单", buy_unfilled: "买入未成", strategy: "策略未买", excluded: isFallbackView(state.data) ? "参考日排除" : "今日排除", current_position: "当前持仓", cash_flow: "有成交净现金流", data_conflict: "数据冲突" })[value] || "全部"; }
+function bucketLabel(value) { return ({ broker_filled: "券商已成交", broker_closed: "已全部卖出", broker_activity: "券商订单", buy_unfilled: "买入未成", strategy: "策略未买", excluded: isFallbackView(state.data) ? "参考日排除" : "今日排除", current_position: "当前持仓", cash_flow: "有成交净现金流", manual_activity: "疑似手动", data_conflict: "数据冲突" })[value] || "全部"; }
 function severityClass(value) { return ["success", "warning", "critical", "info", "neutral"].includes(value) ? value : "neutral"; }
 function cashTone(value) { return value === null || value === undefined ? "neutral" : (Number(value) >= 0 ? "success" : "danger"); }
 function money(value) { return value === null || value === undefined || Number.isNaN(Number(value)) ? "—" : `${Number(value) >= 0 ? "+" : "-"}$${Math.abs(Number(value)).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`; }
