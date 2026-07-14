@@ -4,6 +4,8 @@ from alpaca_ma5_service.entrypoint import ensure_local_venv
 
 ensure_local_venv()
 
+from alpaca_ma5_service.config import build_settings
+from alpaca_ma5_service.monitor_runtime import monitor_runtime
 from alpaca_ma5_service.premarket_watchlist import generate_premarket_watch_codes
 
 
@@ -17,13 +19,16 @@ FEED = "sip"
 
 def generate_premarket_watchcode() -> None:
     """Click-run entry: generate watch_codes_premarket.txt."""
-    generate_premarket_watch_codes(
-        max_symbols=MAX_SYMBOLS,
-        top_count=TOP_COUNT,
-        lookback_days=LOOKBACK_DAYS,
-        batch_size=BATCH_SIZE,
-        feed=FEED,
-    )
+    settings = build_settings()
+    with monitor_runtime(settings.output_dir, "watchcode_premarket", "prepare"):
+        generate_premarket_watch_codes(
+            settings=settings,
+            max_symbols=MAX_SYMBOLS,
+            top_count=TOP_COUNT,
+            lookback_days=LOOKBACK_DAYS,
+            batch_size=BATCH_SIZE,
+            feed=FEED,
+        )
 
 
 if __name__ == "__main__":

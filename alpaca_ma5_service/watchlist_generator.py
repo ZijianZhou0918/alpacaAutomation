@@ -5,6 +5,7 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from time import perf_counter
 from zoneinfo import ZoneInfo
 
 from .alpaca_connection import build_trading_connection, load_alpaca_credentials
@@ -16,6 +17,9 @@ from .market_time import daily_request_end, stale_sip_daily_end
 from . import strategy_ma5_dip
 from .watchlist import read_watch_codes, to_alpaca_symbol
 from .watchlist_charts import ensure_watchlist_chart_server_running, watchlist_chart_http_url, write_watchlist_chart_page
+
+
+DAILY_BARS_REQUEST_TIMEOUT = (10.0, 45.0)
 
 
 MIN_SIGNAL_GAIN_PCT = WATCHLIST_SIGNAL_PARAMS["MIN_SIGNAL_GAIN_PCT"]
@@ -234,11 +238,20 @@ def fetch_daily_bars(
 
     api_key, secret_key = load_alpaca_credentials()
     client = StockHistoricalDataClient(api_key, secret_key)
+    _apply_daily_bars_request_timeout(client)
     end = request_end_datetime(now_et, feed)
     start = end - timedelta(days=lookback_days)
     bars_by_symbol: dict[str, list[DailyBar]] = {}
+    total_batches = (len(symbols) + batch_size - 1) // batch_size if symbols else 0
+    fetch_started = perf_counter()
 
-    for batch in batched(symbols, batch_size):
+    for batch_number, batch in enumerate(batched(symbols, batch_size), start=1):
+        batch_started = perf_counter()
+        print(
+            f"日线读取进度：{batch_number}/{total_batches} | "
+            f"请求 {batch[0]}...{batch[-1]} | 已获取 {len(bars_by_symbol)} 只",
+            flush=True,
+        )
         try:
             raw_bars = client.get_stock_bars(
                 _bars_request(StockBarsRequest, TimeFrame, Adjustment, DataFeed, batch, start, end, lookback_days, feed)
@@ -261,7 +274,33 @@ def fetch_daily_bars(
         for symbol, bars in raw_bars.items():
             bars_by_symbol[symbol.upper()] = [daily_bar_from_alpaca(symbol.upper(), bar, now_et) for bar in bars]
 
+        print(
+            f"日线读取进度：{batch_number}/{total_batches} 完成 | "
+            f"本批返回 {len(raw_bars)} 只 | 累计 {len(bars_by_symbol)} 只 | "
+            f"耗时 {perf_counter() - batch_started:.1f}s",
+            flush=True,
+        )
+
+    print(
+        f"日线读取完成：{len(bars_by_symbol)}/{len(symbols)} 只 | "
+        f"总耗时 {perf_counter() - fetch_started:.1f}s",
+        flush=True,
+    )
     return bars_by_symbol
+
+
+def _apply_daily_bars_request_timeout(client) -> None:
+    """Bound Alpaca SDK requests because this installed SDK sends them without a timeout."""
+    session = getattr(client, "_session", None)
+    request = getattr(session, "request", None)
+    if session is None or not callable(request):
+        return
+
+    def request_with_timeout(method, url, **kwargs):
+        kwargs.setdefault("timeout", DAILY_BARS_REQUEST_TIMEOUT)
+        return request(method, url, **kwargs)
+
+    session.request = request_with_timeout
 
 
 def _bars_request(StockBarsRequest, TimeFrame, Adjustment, DataFeed, batch, start, end, lookback_days: int, feed: str):

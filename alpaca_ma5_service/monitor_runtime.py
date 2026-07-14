@@ -17,6 +17,8 @@ from typing import Any, Iterator, TextIO
 RUNTIME_DIRECTORY_NAME = "monitor_runtime"
 HEARTBEAT_SECONDS = 2.0
 STALE_AFTER_SECONDS = 15.0
+STATE_WRITE_ATTEMPTS = 6
+STATE_WRITE_RETRY_SECONDS = 0.05
 MAX_TASKS = 8
 MAX_LOG_BYTES = 160_000
 MAX_LOG_LINES = 220
@@ -31,10 +33,13 @@ TASK_LABELS = {
     "monitor_ma5": "盘中 MA5 盯盘",
     "monitor_premarket": "盘前 MA5 盯盘",
     "monitor_afterhours": "盘后 High / Low 盯盘",
+    "watchcode_ma5": "生成盘中 WatchCode",
+    "watchcode_premarket": "生成盘前 WatchCode",
 }
 
 PHASE_LABELS = {
     "auto": "自动判断时段",
+    "prepare": "准备 WatchCode",
     "premarket": "盘前监控",
     "intraday": "盘中监控",
     "afterhours": "盘后监控",
@@ -94,6 +99,7 @@ class MonitorRuntimeSession:
         self._original_stdout: TextIO | None = None
         self._original_stderr: TextIO | None = None
         self._heartbeat: threading.Thread | None = None
+        self._state_write_failures = 0
 
     def start(self) -> None:
         self._log_file = self.log_path.open("a", encoding="utf-8", buffering=1)
@@ -125,22 +131,28 @@ class MonitorRuntimeSession:
         self.error = f"{type(error).__name__}: {error}" if error is not None else None
         self.ended_at = _utc_now()
         self._stop.set()
-        if self._heartbeat is not None:
-            self._heartbeat.join(timeout=HEARTBEAT_SECONDS + 0.5)
-        self._write_state()
-        if self._original_stdout is not None:
-            sys.stdout = self._original_stdout
-        if self._original_stderr is not None:
-            sys.stderr = self._original_stderr
-        if self._log_file is not None:
-            self._log_file.flush()
-            self._log_file.close()
+        try:
+            if self._heartbeat is not None:
+                self._heartbeat.join(timeout=HEARTBEAT_SECONDS + 0.5)
+            self._write_state()
+        finally:
+            if self._original_stdout is not None:
+                sys.stdout = self._original_stdout
+            if self._original_stderr is not None:
+                sys.stderr = self._original_stderr
+            if self._log_file is not None:
+                self._log_file.flush()
+                self._log_file.close()
 
     def _heartbeat_loop(self) -> None:
         while not self._stop.wait(HEARTBEAT_SECONDS):
-            self._write_state()
+            try:
+                self._write_state()
+            except Exception as exc:
+                # Runtime telemetry must never terminate the trading task's heartbeat.
+                self._report_state_write_failure(exc)
 
-    def _write_state(self) -> None:
+    def _write_state(self) -> bool:
         with self._state_lock:
             now = _utc_now()
             payload = {
@@ -160,9 +172,40 @@ class MonitorRuntimeSession:
                 "log_file": self.log_path.name,
                 "error": self.error,
             }
-            temporary = self.state_path.with_suffix(".json.tmp")
-            temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-            os.replace(temporary, self.state_path)
+            encoded = json.dumps(payload, ensure_ascii=False)
+            last_error: Exception | None = None
+            for attempt in range(1, STATE_WRITE_ATTEMPTS + 1):
+                temporary = self.runtime_dir / (
+                    f".{self.instance_id}.{threading.get_ident()}.{uuid.uuid4().hex[:8]}.tmp"
+                )
+                try:
+                    temporary.write_text(encoded, encoding="utf-8")
+                    os.replace(temporary, self.state_path)
+                    self._state_write_failures = 0
+                    return True
+                except OSError as exc:
+                    last_error = exc
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    if attempt < STATE_WRITE_ATTEMPTS:
+                        time.sleep(STATE_WRITE_RETRY_SECONDS * attempt)
+
+            self._report_state_write_failure(last_error or OSError("unknown state write failure"))
+            return False
+
+    def _report_state_write_failure(self, error: BaseException) -> None:
+        self._state_write_failures += 1
+        if self._state_write_failures == 1 or self._state_write_failures % 10 == 0:
+            try:
+                print(
+                    f"[网页看板] 状态同步暂时失败（已重试 {STATE_WRITE_ATTEMPTS} 次），"
+                    f"任务继续运行：{type(error).__name__}: {error}",
+                    flush=True,
+                )
+            except Exception:
+                pass
 
 
 @contextlib.contextmanager
@@ -301,6 +344,16 @@ def _extract_runtime_events(log_text: str) -> list[dict[str, Any]]:
 
 def _classify_runtime_line(line: str) -> dict[str, str] | None:
     upper = line.upper()
+    if "开始生成 WATCH_CODES" in upper:
+        return _event_definition("warning", "generation", "开始生成 WatchCode", "等待生成完成")
+    if "日线读取完成" in line:
+        return _event_definition("success", "generation_progress", "WatchCode 日线读取完成", "等待筛选候选")
+    if "日线读取进度" in line:
+        return _event_definition("info", "generation_progress", "WatchCode 日线读取进度", "查看最新批次")
+    if "生成完成" in line and "候选" in line:
+        return _event_definition("success", "generation", "WatchCode 生成完成", "可以启动盯盘")
+    if "状态同步暂时失败" in line:
+        return _event_definition("warning", "runtime_sync", "网页状态同步正在重试", "任务仍在本地运行")
     if "[网页看板]" in line or "任务启动" in line or "开始监控" in line:
         return _event_definition("info", "lifecycle", "盯盘任务已启动", "确认运行范围")
     if any(keyword in upper for keyword in ("REJECTED", "ERROR", "EXCEPTION", "TRACEBACK")) or any(
@@ -372,6 +425,8 @@ def _pid_is_running(pid: int) -> bool:
 
 
 def _runtime_source() -> str:
+    if os.environ.get("MA5_DASHBOARD_ACTION") == "1":
+        return "网页看板"
     if os.environ.get("PYCHARM_HOSTED") or "pydevd" in sys.modules:
         return "PyCharm / IDE"
     if os.environ.get("VSCODE_PID"):

@@ -60,7 +60,7 @@ from alpaca_ma5_service.trade_notifications import render_order_submitted_messag
 from alpaca_ma5_service.trading_calendar import offline_trading_day_decision, us_equity_holiday_name
 from alpaca_ma5_service.watchlist import read_watch_codes
 from alpaca_ma5_service.watchlist_charts import delete_watch_codes_from_watchlist, ensure_watchlist_chart_server_running, write_watchlist_chart_page
-from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, generate_watch_codes, is_common_stock_asset, refresh_watchlist_chart_from_watch_codes, request_end_datetime, screen_candidates, validate_candidates, watchlist_screen_rules, write_watch_codes
+from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, fetch_daily_bars, generate_watch_codes, is_common_stock_asset, refresh_watchlist_chart_from_watch_codes, request_end_datetime, screen_candidates, validate_candidates, watchlist_screen_rules, write_watch_codes
 from alpaca_ma5_service.afterhours_monitor import (
     AFTERHOURS_DROP_SIGNAL_THRESHOLD,
     AFTERHOURS_RANGE_RATIO_THRESHOLD,
@@ -76,6 +76,7 @@ from monitor_afterhours import monitor_afterhours
 from monitor_auto import (
     afterhours_watchcode_ready_for_session,
     ensure_afterhours_watchcode,
+    ensure_current_session_watchcode,
     expected_signal_date,
     monitor_auto as run_monitor_auto,
     watchcode_ready_for_session,
@@ -2785,6 +2786,27 @@ class ServiceTests(unittest.TestCase):
             self.assertIs(fake_generate.call_args.kwargs["settings"], settings)
             self.assertEqual(fake_generate.call_args.kwargs["now_et"], now_et)
 
+    def test_auto_monitor_prepares_watchcode_for_current_session(self):
+        timezone = ZoneInfo("America/New_York")
+        cases = [
+            (datetime(2026, 5, 28, 8, 0, tzinfo=timezone), "premarket", "ensure_premarket_watchcode"),
+            (datetime(2026, 5, 28, 10, 0, tzinfo=timezone), "intraday", "ensure_intraday_watchcode"),
+            (datetime(2026, 5, 28, 17, 0, tzinfo=timezone), "afterhours", "ensure_afterhours_watchcode"),
+        ]
+        for now_et, expected_session, expected_function in cases:
+            with self.subTest(session=expected_session):
+                with patch("monitor_auto.ensure_premarket_watchcode") as premarket:
+                    with patch("monitor_auto.ensure_intraday_watchcode") as intraday:
+                        with patch("monitor_auto.ensure_afterhours_watchcode") as afterhours:
+                            actual = ensure_current_session_watchcode(now_et)
+                functions = {
+                    "ensure_premarket_watchcode": premarket,
+                    "ensure_intraday_watchcode": intraday,
+                    "ensure_afterhours_watchcode": afterhours,
+                }
+                self.assertEqual(actual, expected_session)
+                functions[expected_function].assert_called_once_with(now_et)
+
     def test_auto_monitor_routes_afterhours_session(self):
         """16:00-20:00 ET 的统一入口进入盘后 high/low 监控。"""
         with TemporaryDirectory() as tmp:
@@ -3309,6 +3331,30 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("图表链接：http://10.0.0.168:8877/watch_code_daily_kline_latest.html", notify_message)
             self.assertEqual(notify_mock.call_args.kwargs["context"], "watchcode generated")
             self.assertEqual(notify_mock.call_args.kwargs["settings"], settings)
+
+    def test_fetch_daily_bars_prints_batch_progress(self):
+        output = StringIO()
+        now_et = datetime(2026, 7, 10, 16, 30, tzinfo=ZoneInfo("America/New_York"))
+
+        with patch("alpaca_ma5_service.watchlist_generator.load_alpaca_credentials", return_value=("key", "secret")):
+            with patch("alpaca.data.historical.StockHistoricalDataClient") as client_class:
+                original_request = client_class.return_value._session.request
+                client_class.return_value.get_stock_bars.return_value.data = {}
+                with redirect_stdout(output):
+                    result = fetch_daily_bars(["AAA", "BBB", "CCC"], now_et, 60, 2, "sip")
+
+                client_class.return_value._session.request("GET", "https://data.example.test")
+
+        self.assertEqual(result, {})
+        self.assertEqual(client_class.return_value.get_stock_bars.call_count, 2)
+        original_request.assert_called_once_with(
+            "GET",
+            "https://data.example.test",
+            timeout=(10.0, 45.0),
+        )
+        self.assertIn("日线读取进度：1/2", output.getvalue())
+        self.assertIn("日线读取进度：2/2 完成", output.getvalue())
+        self.assertIn("日线读取完成：0/3 只", output.getvalue())
 
     def test_watchlist_chart_server_uses_alternate_port_when_default_is_stale(self):
         """默认端口被其它服务占用时，应启动当前图表服务到新端口并返回该端口。"""

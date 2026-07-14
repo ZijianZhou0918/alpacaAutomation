@@ -153,13 +153,15 @@ function Start-Ma5LogTailWindow {
         return
     }
 
-    $arguments = @("-NoExit", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tailScript, "-Title", $Title, "-Path") + $LogPath
+    $arguments = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $tailScript, "-Title", $Title, "-Path") + $LogPath
     $argumentList = ConvertTo-Ma5ArgumentList $arguments
     try {
-        Start-Process -FilePath "powershell.exe" -ArgumentList $argumentList -WindowStyle Normal | Out-Null
-        Write-Ma5TaskLog $LogDir $LogFile "Opened visible log tail window: $Title -> $($LogPath -join ', ')"
+        $process = Start-Process -FilePath "powershell.exe" -ArgumentList $argumentList -WindowStyle Normal -PassThru
+        Write-Ma5TaskLog $LogDir $LogFile "Opened visible log tail window: $Title -> $($LogPath -join ', ') (PID: $($process.Id))"
+        return $process
     } catch {
         Write-Ma5TaskLog $LogDir $LogFile "Could not open log tail window for $($LogPath -join ', '): $($_.Exception.Message)"
+        return $null
     }
 }
 

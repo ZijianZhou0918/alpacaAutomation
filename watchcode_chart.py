@@ -57,4 +57,4 @@ def refresh_current_watchcode_chart(
 
 if __name__ == "__main__":
     # 点箭头运行只刷新 CHART_SESSION 对应的 HTML 页面，不重新生成 watch code。
-    refresh_current_watchcode_chart(session="盘前")
+    refresh_current_watchcode_chart(session="盘中")

@@ -138,7 +138,9 @@ def build_daily_review(
     now_et = datetime.now(ET)
     requested = _coerce_date(requested_date) if requested_date is not None else now_et.date()
     available = [date.fromisoformat(value) for value in list_review_dates(root)]
-    review_day, fallback = _resolve_review_date(requested, available)
+    review_day = requested
+    fallback = False
+    has_local_records = requested in available
     previous_value, next_value = _neighbor_dates(review_day, available)
     trading = offline_trading_day_decision(requested)
 
@@ -152,8 +154,9 @@ def build_daily_review(
     local_orders_path = output_dir / f"orders_{review_day:%Y-%m-%d}.csv"
     error_log_path = output_dir / "logs" / f"monitor_auto_{review_day:%Y%m%d}.err.log"
 
-    intraday_candidates = _read_csv(intraday_candidates_path)
-    premarket_candidates = _read_csv(premarket_candidates_path)
+    load_signal_candidates = has_local_records and trading.is_trading_day
+    intraday_candidates = _read_csv(intraday_candidates_path) if load_signal_candidates else []
+    premarket_candidates = _read_csv(premarket_candidates_path) if load_signal_candidates else []
     afterhours_candidates = _read_csv(afterhours_candidates_path)
     exclusions = _read_csv(exclusion_path)
     local_orders, local_file_state = _load_local_orders(local_orders_path)
@@ -280,6 +283,7 @@ def build_daily_review(
             }
 
     all_orders = _normalized_local_orders(local_orders) + broker_orders
+    has_day_records = has_local_records or bool(broker_orders)
     attention = _build_attention(
         local_file_state=local_file_state,
         local_orders=local_orders,
@@ -288,31 +292,41 @@ def build_daily_review(
         parsed=parsed,
         position_events=position_events,
     )
-    timeline = _build_timeline(
-        review_day,
-        parsed,
-        exclusions,
-        broker_orders,
-        position_events,
-        global_buy_window_best,
-        global_all_day_closest,
-        required_drop,
-        log_path,
+    timeline = (
+        _build_timeline(
+            review_day,
+            parsed,
+            exclusions,
+            broker_orders,
+            position_events,
+            global_buy_window_best,
+            global_all_day_closest,
+            required_drop,
+            log_path,
+        )
+        if has_day_records
+        else []
     )
     phases = _phase_payloads(parsed, len(premarket_symbols), len(candidate_symbols), len(afterhours_symbols))
+    source_paths = {
+        "monitor_auto": log_path,
+        "monitor_error": error_log_path,
+        "local_orders": local_orders_path,
+        "buy_exclusions": exclusion_path,
+        "afterhours_candidates": afterhours_candidates_path,
+    }
+    if load_signal_candidates:
+        source_paths["intraday_candidates"] = intraday_candidates_path
+        source_paths["premarket_candidates"] = premarket_candidates_path
     source_manifest = _source_manifest(
-        {
-            "monitor_auto": log_path,
-            "monitor_error": error_log_path,
-            "local_orders": local_orders_path,
-            "buy_exclusions": exclusion_path,
-            "intraday_candidates": intraday_candidates_path,
-            "premarket_candidates": premarket_candidates_path,
-            "afterhours_candidates": afterhours_candidates_path,
-        },
+        source_paths,
         parsed,
         local_file_state,
     )
+    if broker.get("status") == "verified" and broker_orders and local_file_state in {"missing", "empty"}:
+        for source in source_manifest:
+            if source["id"] == "local_orders":
+                source["status"] = "manual_assumed"
     broker_groups = _broker_symbol_groups(broker_orders)
     net_cash = sum((_decimal(order.get("filled_value")) or Decimal(0)) * (Decimal(1) if order.get("side") == "SELL" else Decimal(-1)) for order in broker_orders)
     has_broker_fills = any((_decimal(order.get("filled_qty")) or Decimal(0)) > 0 for order in broker_orders)
@@ -325,9 +339,10 @@ def build_daily_review(
     broker_status = broker.get("status", "not_requested")
 
     market_banner = ""
-    if fallback:
-        reason = "今日休市" if not trading.is_trading_day else "当天尚无完整复盘数据"
-        market_banner = f"{reason}，展示最近交易日 {review_day:%Y-%m-%d}"
+    if not trading.is_trading_day:
+        market_banner = f"{requested:%Y-%m-%d} 休市；本页只展示当天记录，不会加载其他日期。"
+    elif not has_day_records:
+        market_banner = f"{requested:%Y-%m-%d} 暂无复盘记录；本页不会加载其他日期。"
     headline = _headline(
         broker_status,
         broker_bought,
@@ -351,6 +366,7 @@ def build_daily_review(
             "is_trading_day": offline_trading_day_decision(review_day).is_trading_day,
             "requested_is_trading_day": trading.is_trading_day,
             "is_fallback": fallback,
+            "has_records": has_day_records,
             "banner": market_banner,
             "previous_date": previous_value.isoformat() if previous_value else None,
             "next_date": next_value.isoformat() if next_value else None,
@@ -405,7 +421,7 @@ def build_daily_review(
         "position_events": position_events,
         "timeline": timeline,
         "sources": source_manifest,
-        "chart_url": f"/charts/{chart_name}" if chart_path.exists() else None,
+        "chart_url": f"/charts/{chart_name}" if has_local_records and trading.is_trading_day and chart_path.exists() else None,
         "broker": broker,
     }
     return result
@@ -637,17 +653,6 @@ def normalize_symbol(value: object) -> str:
     if not text:
         return ""
     return text if text.startswith("US.") else f"US.{text}"
-
-
-def _resolve_review_date(requested: date, available: list[date]) -> tuple[date, bool]:
-    if requested in available:
-        return requested, False
-    earlier = [value for value in available if value <= requested]
-    if earlier:
-        return max(earlier), True
-    if available:
-        return max(available), True
-    return requested, False
 
 
 def _neighbor_dates(review_day: date, values: list[date]) -> tuple[date | None, date | None]:
@@ -1166,10 +1171,10 @@ def _build_attention(
         items.append(
             {
                 "code": "BROKER_ACTIVITY_NOT_IN_LOCAL_LEDGER",
-                "severity": "critical",
-                "title": "本地记录与券商数据严重不一致",
-                "message": f"本地订单账本{('缺失' if local_file_state == 'missing' else '为空')}，但 Alpaca 返回 {len(broker_orders)} 笔订单；{len(filled_symbols)} 只股票有成交，来源尚未归因。",
-                "facts": {"local_file_state": local_file_state, "broker_order_count": len(broker_orders), "filled_symbols": filled_symbols},
+                "severity": "info",
+                "title": "券商成交未写入策略账本（按手动交易处理）",
+                "message": f"Alpaca 返回 {len(broker_orders)} 笔订单、{len(filled_symbols)} 只股票有成交；本地策略账本{('未生成' if local_file_state == 'missing' else '为空')}，默认视为手动下单，不影响策略复盘。",
+                "facts": {"local_file_state": local_file_state, "broker_order_count": len(broker_orders), "filled_symbols": filled_symbols, "assumed_origin": "manual"},
                 "action_label": "查看券商订单",
             }
         )
@@ -1187,10 +1192,11 @@ def _build_attention(
         items.append(
             {
                 "code": "OPEN_BUY_ORDER_WITHOUT_LOCAL_LEDGER",
-                "severity": "critical",
-                "title": "检测到未落盘的开放买单",
-                "message": f"监控日志有 {parsed.open_buy_pause_rounds} 轮因 Alpaca 开放买单暂停，但本地账本没有对应订单。",
-                "facts": {"pause_rounds": parsed.open_buy_pause_rounds, "affected_rows": parsed.open_buy_pause_rows},
+                "severity": "warning",
+                "title": "券商存在开放买单，监控已主动避让",
+                "message": f"监控日志有 {parsed.open_buy_pause_rounds} 轮因 Alpaca 开放买单暂停；该订单默认按手动订单处理，这是防止重复下单的正常保护行为。",
+                "facts": {"pause_rounds": parsed.open_buy_pause_rounds, "affected_rows": parsed.open_buy_pause_rows, "assumed_origin": "manual"},
+                "action_label": "查看券商订单",
             }
         )
     unmatched = [event for event in position_events if event["event_type"] in {"added_observed", "removed_observed"}]
@@ -1198,10 +1204,11 @@ def _build_attention(
         items.append(
             {
                 "code": "UNMATCHED_POSITION_CHANGES",
-                "severity": "critical",
-                "title": "持仓增减缺少本地订单证据",
-                "message": "监控日志观察到持仓增减；不能从现有本地文件确认下单来源、数量或成交价。",
-                "facts": {"events": unmatched},
+                "severity": "info",
+                "title": "监控观察到持仓变化（按手动交易处理）",
+                "message": "监控日志观察到券商持仓增减，但策略账本没有对应订单；默认归类为手动交易，仅保留在复盘证据中。",
+                "facts": {"events": unmatched, "assumed_origin": "manual"},
+                "action_label": "查看券商订单",
             }
         )
     return items
@@ -1363,7 +1370,10 @@ def _headline(
         title = "券商核对暂不可用；当前仅显示本地监控与账本证据。"
     else:
         title = "本地复盘已加载，正在等待只读券商核对。"
-    local_text = "本地订单记录缺失" if local_file_state == "missing" else ("本地订单记录为空" if local_file_state == "empty" else "本地订单记录已读取")
+    if broker_status == "verified" and broker_order_count and local_file_state in {"missing", "empty"}:
+        local_text = "策略订单账本未生成；券商独立成交默认按手动交易展示"
+    else:
+        local_text = "本地订单记录缺失" if local_file_state == "missing" else ("本地订单记录为空" if local_file_state == "empty" else "本地订单记录已读取")
     details = [local_text]
     if window_best:
         snap = _snapshot(window_best, required_drop)

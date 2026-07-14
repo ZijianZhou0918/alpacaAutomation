@@ -5,6 +5,8 @@ from tempfile import TemporaryDirectory
 from unittest import TestCase
 
 from alpaca_ma5_service.review_data import (
+    ParsedMonitorLog,
+    _build_attention,
     _merge_broker_symbols,
     build_daily_review,
     evidence_context,
@@ -84,10 +86,10 @@ class ReviewDataTests(TestCase):
                 encoding="utf-8",
             )
 
-            review = build_daily_review("2026-07-11", base_dir=root)
+            review = build_daily_review("2026-07-10", base_dir=root)
 
             self.assertEqual(review["review_date"], "2026-07-10")
-            self.assertTrue(review["market_day"]["is_fallback"])
+            self.assertFalse(review["market_day"]["is_fallback"])
             self.assertEqual(review["summary"]["rounds"]["intraday"], 3)
             self.assertEqual(review["strategy"]["buy_window_best"]["observed_at"], "2026-07-10T11:59:30-04:00")
             self.assertEqual(review["strategy"]["buy_window_best"]["current_gain_pct"], -0.1056)
@@ -101,6 +103,74 @@ class ReviewDataTests(TestCase):
                 self.assertEqual(event_ids, list(dict.fromkeys(event_ids)))
             self.assertEqual(review["summary"]["local_order_file_state"], "missing")
             self.assertTrue(any(item["code"] == "UNMATCHED_POSITION_CHANGES" for item in review["attention"]))
+
+    def test_missing_or_closed_date_never_reuses_another_days_records(self):
+        with TemporaryDirectory() as temp:
+            root = self.make_root(Path(temp))
+            (root / "outputs" / "logs" / "monitor_auto_20260710.out.log").write_text(
+                round_text(
+                    "2026-07-10 10:00:00",
+                    ["US.OLD | 观察 | 10 | 11 | 9 | 10 | 20% | -9% | 9.9 | - | 旧记录"],
+                ),
+                encoding="utf-8",
+            )
+            (root / "outputs" / "watch_candidates_2026-07-10.csv").write_text(
+                "symbol,signal_date,gain_pct\nOLD,2026-07-10,0.20\n",
+                encoding="utf-8",
+            )
+            (root / "outputs" / "orders_2026-07-10.csv").write_text(
+                "symbol,side,status,quantity\nUS.OLD,BUY,FILLED,1\n",
+                encoding="utf-8",
+            )
+
+            review = build_daily_review("2026-07-11", base_dir=root)
+
+            self.assertEqual(review["requested_date"], "2026-07-11")
+            self.assertEqual(review["review_date"], "2026-07-11")
+            self.assertFalse(review["market_day"]["is_fallback"])
+            self.assertFalse(review["market_day"]["has_records"])
+            self.assertFalse(review["market_day"]["requested_is_trading_day"])
+            self.assertIn("不会加载其他日期", review["market_day"]["banner"])
+            self.assertEqual(review["symbols"], [])
+            self.assertEqual(review["orders"], [])
+            self.assertEqual(review["timeline"], [])
+            self.assertIsNone(review["chart_url"])
+            self.assertFalse(any(source["file"].endswith("2026-07-10.csv") for source in review["sources"]))
+
+    def test_broker_only_activity_defaults_to_manual_without_critical_alarm(self):
+        parsed = ParsedMonitorLog(
+            observations=(),
+            rounds=(),
+            phase_round_counts={"premarket": 0, "intraday": 0, "afterhours": 0},
+            phase_ranges={},
+            premarket_notification_count=0,
+            premarket_notification_symbols=(),
+            open_buy_pause_rounds=3,
+            open_buy_pause_rows=12,
+            line_count=20,
+        )
+        broker_orders = [
+            {"symbol": "US.HAO", "side": "BUY", "status": "FILLED", "filled_qty": 100.0},
+        ]
+        position_events = [
+            {"event_type": "added_observed", "symbol": "US.HAO"},
+        ]
+
+        attention = _build_attention(
+            local_file_state="missing",
+            local_orders=[],
+            broker={"status": "verified"},
+            broker_orders=broker_orders,
+            parsed=parsed,
+            position_events=position_events,
+        )
+
+        self.assertFalse(any(item["severity"] == "critical" for item in attention))
+        by_code = {item["code"]: item for item in attention}
+        self.assertEqual(by_code["BROKER_ACTIVITY_NOT_IN_LOCAL_LEDGER"]["severity"], "info")
+        self.assertEqual(by_code["BROKER_ACTIVITY_NOT_IN_LOCAL_LEDGER"]["facts"]["assumed_origin"], "manual")
+        self.assertEqual(by_code["OPEN_BUY_ORDER_WITHOUT_LOCAL_LEDGER"]["severity"], "warning")
+        self.assertIn("手动交易", by_code["UNMATCHED_POSITION_CHANGES"]["title"])
 
     def test_parse_monitor_log_caches_complete_rounds_and_source_lines(self):
         with TemporaryDirectory() as temp:

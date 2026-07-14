@@ -10,6 +10,7 @@ import mimetypes
 import os
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -45,6 +46,12 @@ def _review_data_api():
     return review_data
 
 
+def _dashboard_actions_api():
+    from . import dashboard_actions
+
+    return dashboard_actions
+
+
 class ReviewHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
@@ -54,6 +61,12 @@ class ReviewHTTPServer(ThreadingHTTPServer):
         self.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         super().__init__(server_address, handler_class)
 
+    def handle_error(self, request, client_address) -> None:
+        _error_type, error, _traceback = sys.exc_info()
+        if isinstance(error, (BrokenPipeError, ConnectionResetError)):
+            return
+        super().handle_error(request, client_address)
+
 
 def create_review_server(
     *,
@@ -61,10 +74,11 @@ def create_review_server(
     host: str = DEFAULT_HOST,
     port: int = DEFAULT_PORT_START,
     review_api=None,
+    action_api=None,
 ) -> ReviewHTTPServer:
     """Create one bound server. Tests may use port=0 for an ephemeral port."""
     root = Path(base_dir or PROJECT_ROOT).resolve()
-    handler = make_review_handler(root, review_api=review_api)
+    handler = make_review_handler(root, review_api=review_api, action_api=action_api)
     return ReviewHTTPServer((host, int(port)), handler, base_dir=root)
 
 
@@ -75,13 +89,14 @@ def bind_review_server(
     port_start: int = DEFAULT_PORT_START,
     port_end: int = DEFAULT_PORT_END,
     review_api=None,
+    action_api=None,
 ) -> ReviewHTTPServer:
     """Bind the first available port in the configured, bounded range."""
     _validate_port_range(port_start, port_end)
     last_error: OSError | None = None
     for port in range(port_start, port_end + 1):
         try:
-            return create_review_server(base_dir=base_dir, host=host, port=port, review_api=review_api)
+            return create_review_server(base_dir=base_dir, host=host, port=port, review_api=review_api, action_api=action_api)
         except OSError as exc:
             if not _is_address_in_use(exc):
                 raise
@@ -90,7 +105,7 @@ def bind_review_server(
     raise RuntimeError(f"No available review dashboard port in {port_start}-{port_end}{detail}")
 
 
-def make_review_handler(base_dir: Path, *, review_api=None):
+def make_review_handler(base_dir: Path, *, review_api=None, action_api=None):
     root = base_dir.resolve()
     web_root = (root / "web" / "review_dashboard").resolve()
     chart_root = (root / "outputs" / "watchlist_charts").resolve()
@@ -110,7 +125,7 @@ def make_review_handler(base_dir: Path, *, review_api=None):
             self._dispatch(send_body=False)
 
         def do_POST(self) -> None:
-            self._method_not_allowed()
+            self._dispatch_post()
 
         def do_PUT(self) -> None:
             self._method_not_allowed()
@@ -125,29 +140,8 @@ def make_review_handler(base_dir: Path, *, review_api=None):
             self._method_not_allowed()
 
         def _dispatch(self, *, send_body: bool) -> None:
-            if len(self.path) > MAX_REQUEST_TARGET_LENGTH:
-                self._json_error(HTTPStatus.REQUEST_URI_TOO_LONG, "request target is too long", send_body=send_body)
-                return
-
-            # A local browser app still needs a Host check: without it, DNS rebinding
-            # could make broker/order data readable from an unrelated web origin.
-            host_headers = self.headers.get_all("Host", [])
-            if len(host_headers) > 1 or not _host_header_allowed(
-                host_headers[0] if host_headers else None,
-                server_host=str(self.server.server_address[0]),
-                server_port=int(self.server.server_address[1]),
-                require_host=self.request_version == "HTTP/1.1",
-            ):
-                self._json_error(HTTPStatus.BAD_REQUEST, "invalid Host header", send_body=send_body)
-                return
-
-            try:
-                parsed = urllib.parse.urlsplit(self.path)
-            except ValueError:
-                self._json_error(HTTPStatus.BAD_REQUEST, "invalid request target", send_body=send_body)
-                return
-            if parsed.scheme or parsed.netloc or parsed.fragment:
-                self._json_error(HTTPStatus.BAD_REQUEST, "invalid request target", send_body=send_body)
+            parsed = self._validated_request_target(send_body=send_body)
+            if parsed is None:
                 return
 
             path = parsed.path or "/"
@@ -170,6 +164,10 @@ def make_review_handler(base_dir: Path, *, review_api=None):
                     self._require_query_keys(parsed.query, set())
                     self._serve_runtime_tasks(send_body=send_body)
                     return
+                if path == "/api/actions/status":
+                    self._require_query_keys(parsed.query, set())
+                    self._serve_action_status(send_body=send_body)
+                    return
                 if path.startswith("/api/"):
                     self._json_error(HTTPStatus.NOT_FOUND, "API endpoint not found", send_body=send_body)
                     return
@@ -186,6 +184,79 @@ def make_review_handler(base_dir: Path, *, review_api=None):
             except Exception as exc:
                 print(f"Review dashboard request failed: {type(exc).__name__}: {exc}", flush=True)
                 self._json_error(HTTPStatus.INTERNAL_SERVER_ERROR, "review data is temporarily unavailable", send_body=send_body)
+
+        def _dispatch_post(self) -> None:
+            parsed = self._validated_request_target(send_body=True)
+            if parsed is None:
+                return
+            path = parsed.path or "/"
+            actions = {
+                "/api/actions/generate-watchcode": "generate-watchcode",
+                "/api/actions/start-monitor": "start-monitor",
+                "/api/actions/generate-premarket-watchcode": "generate-premarket-watchcode",
+                "/api/actions/start-premarket-monitor": "start-premarket-monitor",
+                "/api/actions/stop-monitor": "stop-monitor",
+            }
+            action = actions.get(path)
+            if action is None:
+                self._method_not_allowed()
+                return
+            try:
+                self._require_query_keys(parsed.query, set())
+                self._require_local_action_request()
+                api = action_api if action_api is not None else _dashboard_actions_api()
+                payload = api.launch_action(action, base_dir=root)
+                response_status = HTTPStatus.ACCEPTED if payload.get("status") == "started" else HTTPStatus.OK
+                self._send_json(response_status, payload, send_body=True)
+            except ValueError as exc:
+                self._json_error(HTTPStatus.BAD_REQUEST, str(exc) or "invalid action request", send_body=True)
+            except PermissionError as exc:
+                self._json_error(HTTPStatus.FORBIDDEN, str(exc) or "action request is not allowed", send_body=True)
+            except Exception as exc:
+                print(f"Review dashboard action failed: {type(exc).__name__}: {exc}", flush=True)
+                self._json_error(HTTPStatus.INTERNAL_SERVER_ERROR, "dashboard action could not be started", send_body=True)
+
+        def _validated_request_target(self, *, send_body: bool):
+            if len(self.path) > MAX_REQUEST_TARGET_LENGTH:
+                self._json_error(HTTPStatus.REQUEST_URI_TOO_LONG, "request target is too long", send_body=send_body)
+                return None
+            host_headers = self.headers.get_all("Host", [])
+            if len(host_headers) > 1 or not _host_header_allowed(
+                host_headers[0] if host_headers else None,
+                server_host=str(self.server.server_address[0]),
+                server_port=int(self.server.server_address[1]),
+                require_host=self.request_version == "HTTP/1.1",
+            ):
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid Host header", send_body=send_body)
+                return None
+            try:
+                parsed = urllib.parse.urlsplit(self.path)
+            except ValueError:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid request target", send_body=send_body)
+                return None
+            if parsed.scheme or parsed.netloc or parsed.fragment:
+                self._json_error(HTTPStatus.BAD_REQUEST, "invalid request target", send_body=send_body)
+                return None
+            return parsed
+
+        def _require_local_action_request(self) -> None:
+            try:
+                if not ipaddress.ip_address(str(self.client_address[0])).is_loopback:
+                    raise PermissionError("actions are only available from this computer")
+            except ValueError as exc:
+                raise PermissionError("actions are only available from this computer") from exc
+            if self.headers.get("X-MA5-Action") != "1":
+                raise PermissionError("missing dashboard action confirmation header")
+            fetch_site = self.headers.get("Sec-Fetch-Site")
+            if fetch_site and fetch_site != "same-origin":
+                raise PermissionError("cross-origin action request is not allowed")
+            raw_length = self.headers.get("Content-Length", "0")
+            try:
+                content_length = int(raw_length)
+            except ValueError as exc:
+                raise ValueError("invalid Content-Length") from exc
+            if content_length != 0:
+                raise ValueError("action request body must be empty")
 
         def _serve_health(self, *, send_body: bool) -> None:
             host, port = self.server.server_address[:2]
@@ -212,6 +283,10 @@ def make_review_handler(base_dir: Path, *, review_api=None):
             from .monitor_runtime import read_monitor_tasks
 
             self._send_json(HTTPStatus.OK, read_monitor_tasks(root), send_body=send_body)
+
+        def _serve_action_status(self, *, send_body: bool) -> None:
+            api = action_api if action_api is not None else _dashboard_actions_api()
+            self._send_json(HTTPStatus.OK, api.action_status(root), send_body=send_body)
 
         def _serve_review(self, query: str, *, send_body: bool) -> None:
             params = self._require_query_keys(query, {"date", "broker"})
@@ -381,7 +456,7 @@ def make_review_handler(base_dir: Path, *, review_api=None):
                 HTTPStatus.METHOD_NOT_ALLOWED,
                 {"ok": False, "error": "method not allowed"},
                 send_body=True,
-                extra_headers={"Allow": "GET, HEAD"},
+                extra_headers={"Allow": "GET, HEAD, POST"},
             )
 
         @staticmethod

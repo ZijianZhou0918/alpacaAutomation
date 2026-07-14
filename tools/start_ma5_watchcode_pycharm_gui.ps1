@@ -62,6 +62,9 @@ function Invoke-Ma5WatchcodeScript {
     Write-Ma5TaskLog $LogDir $LogFile "Direct $ScriptName run completed and updated $OutputFile."
 }
 
+$logTailProcess = $null
+$exitCode = 0
+
 try {
     $startedAt = Get-Date
     Write-Ma5TaskLog $LogDir $LogFile "Starting direct watchcode task for intraday and premarket."
@@ -73,14 +76,29 @@ try {
     Write-Ma5TaskLog $LogDir $LogFile "Using python fallback: $($python.Label) at $($python.FilePath)"
 
     Start-Ma5PyCharm $ProjectDir $IntradayRunScript $LogDir $LogFile | Out-Null
-    Start-Ma5LogTailWindow $DirectRunLog "MA5 watchcode logs" $LogDir $LogFile
+    $logTailProcess = Start-Ma5LogTailWindow $DirectRunLog "MA5 watchcode logs" $LogDir $LogFile
 
     Invoke-Ma5WatchcodeScript $python $IntradayRunScript "watchcode_ma5.py" $WatchCodesFile "intraday watchcode" $startedAt
     Invoke-Ma5WatchcodeScript $python $PremarketRunScript "watchcode_premarket.py" $PremarketWatchCodesFile "premarket watchcode" $startedAt
 
     Write-Ma5TaskLog $LogDir $LogFile "Direct watchcode task completed for intraday and premarket."
-    exit 0
 } catch {
     Write-Ma5TaskLog $LogDir $LogFile "ERROR: $($_.Exception.Message)"
-    exit 1
+    $exitCode = 1
+} finally {
+    if ($null -ne $logTailProcess) {
+        Start-Sleep -Seconds 2
+        try {
+            $logTailProcess.Refresh()
+            if (-not $logTailProcess.HasExited) {
+                Stop-Process -Id $logTailProcess.Id -Force
+                $logTailProcess.WaitForExit(3000) | Out-Null
+            }
+            Write-Ma5TaskLog $LogDir $LogFile "Closed watchcode log tail window after task completion. PID: $($logTailProcess.Id)"
+        } catch {
+            Write-Ma5TaskLog $LogDir $LogFile "Could not close watchcode log tail window PID $($logTailProcess.Id): $($_.Exception.Message)"
+        }
+    }
 }
+
+exit $exitCode

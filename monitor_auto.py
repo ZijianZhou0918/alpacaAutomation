@@ -112,6 +112,22 @@ def monitor_auto(*, now_provider=None, sleep=time.sleep) -> None:
             run_lock.close()
 
 
+def ensure_current_session_watchcode(now_et: datetime) -> str:
+    """Prepare the watchcode for the session that monitor_auto will enter."""
+    now_time = now_et.time()
+    if now_time < REGULAR_OPEN:
+        ensure_premarket_watchcode(now_et)
+        return "premarket"
+    if now_time < REGULAR_CLOSE:
+        ensure_intraday_watchcode(now_et)
+        return "intraday"
+    if now_time < REALTIME_ORDER_CLOSE:
+        ensure_afterhours_watchcode(now_et)
+        return "afterhours"
+    print("当前已到 20:00 ET，本次启动不再生成 WatchCode。", flush=True)
+    return "closed"
+
+
 def ensure_intraday_watchcode(now_et: datetime) -> None:
     settings = build_settings()
     watch_path = settings.watch_codes_file

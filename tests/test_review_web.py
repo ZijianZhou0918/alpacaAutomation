@@ -72,6 +72,20 @@ class StubReviewAPI:
         return {"date": review_date, "source": source_id, "line": line, "radius": radius}
 
 
+class StubActionAPI:
+    def __init__(self) -> None:
+        self.calls: list[tuple] = []
+
+    def action_status(self, base_dir: Path) -> dict:
+        self.calls.append(("status", base_dir))
+        return {"ok": True, "watchcode": {"ready": False}, "monitor_running": False, "generator_running": False, "pending_actions": []}
+
+    def launch_action(self, action: str, *, base_dir: Path) -> dict:
+        self.calls.append(("launch", action, base_dir))
+        status = "stopped" if action == "stop-monitor" else "started"
+        return {"ok": True, "status": status, "action": action, "message": status}
+
+
 class ReviewWebHTTPTests(TestCase):
     def setUp(self) -> None:
         self.temporary = TemporaryDirectory()
@@ -90,11 +104,13 @@ class ReviewWebHTTPTests(TestCase):
         (self.root / ".env").write_text("ALPACA_SECRET=never-serve-this", encoding="utf-8")
 
         self.api = StubReviewAPI()
+        self.action_api = StubActionAPI()
         self.server = create_review_server(
             base_dir=self.root,
             host="127.0.0.1",
             port=0,
             review_api=self.api,
+            action_api=self.action_api,
         )
         self.port = int(self.server.server_address[1])
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -198,6 +214,54 @@ class ReviewWebHTTPTests(TestCase):
         self.assertEqual(payload["active_count"], 0)
         self.assertEqual(payload["tasks"][0]["instance_id"], instance_id)
         self.assertIn("hello dashboard", payload["tasks"][0]["log"])
+
+    def test_dashboard_actions_require_confirmation_header_and_use_allowlist(self):
+        status, _headers, payload = self.request_json("/api/actions/status")
+        self.assertEqual(status, HTTPStatus.OK)
+        self.assertFalse(payload["watchcode"]["ready"])
+
+        status, _headers, body = self.request("POST", "/api/actions/start-monitor")
+        self.assertEqual(status, HTTPStatus.FORBIDDEN)
+        self.assertIn(b"confirmation header", body)
+
+        status, _headers, body = self.request(
+            "POST",
+            "/api/actions/start-monitor",
+            headers={"X-MA5-Action": "1", "Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(status, HTTPStatus.ACCEPTED)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["action"], "start-monitor")
+        self.assertIn(("launch", "start-monitor", self.root), self.action_api.calls)
+
+        for target, action in [
+            ("/api/actions/generate-premarket-watchcode", "generate-premarket-watchcode"),
+            ("/api/actions/start-premarket-monitor", "start-premarket-monitor"),
+        ]:
+            status, _headers, body = self.request(
+                "POST",
+                target,
+                headers={"X-MA5-Action": "1", "Sec-Fetch-Site": "same-origin"},
+            )
+            self.assertEqual(status, HTTPStatus.ACCEPTED)
+            payload = json.loads(body.decode("utf-8"))
+            self.assertEqual(payload["action"], action)
+            self.assertIn(("launch", action, self.root), self.action_api.calls)
+
+        status, _headers, body = self.request(
+            "POST",
+            "/api/actions/stop-monitor",
+            headers={"X-MA5-Action": "1", "Sec-Fetch-Site": "same-origin"},
+        )
+        self.assertEqual(status, HTTPStatus.OK)
+        payload = json.loads(body.decode("utf-8"))
+        self.assertEqual(payload["action"], "stop-monitor")
+        self.assertIn(("launch", "stop-monitor", self.root), self.action_api.calls)
+
+        status, headers, body = self.request("POST", "/api/review", headers={"X-MA5-Action": "1"})
+        self.assertEqual(status, HTTPStatus.METHOD_NOT_ALLOWED)
+        self.assertEqual(headers["Allow"], "GET, HEAD, POST")
+        self.assertIn(b"method not allowed", body)
 
     def test_api_rejects_invalid_or_ambiguous_query_values(self):
         invalid_targets = [
@@ -309,7 +373,7 @@ class ReviewWebHTTPTests(TestCase):
 
         status, headers, body = self.request("POST", "/api/review")
         self.assertEqual(status, HTTPStatus.METHOD_NOT_ALLOWED)
-        self.assertEqual(headers["Allow"], "GET, HEAD")
+        self.assertEqual(headers["Allow"], "GET, HEAD, POST")
         self.assertIn(b"method not allowed", body)
 
 
