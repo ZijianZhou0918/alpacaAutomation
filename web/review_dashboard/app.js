@@ -53,10 +53,12 @@ const state = {
   runtimeBurstIndex: 0,
   pendingRuntimeTask: null,
   actionStatus: null,
+  actionStatusError: false,
   actionLoading: "",
   viewDate: "",
   mode: "smart",
   resolvedMode: "review",
+  runtimeWasActive: false,
 };
 
 const el = {};
@@ -68,6 +70,7 @@ async function init() {
   initializeViewState();
   bindEvents();
   renderMetricSkeletons();
+  renderDailyReadiness();
   loadRuntimeTasks();
   try {
     const response = await fetchJSON(API.dates);
@@ -84,11 +87,12 @@ function cacheElements() {
   const ids = [
     "menu-button", "section-nav", "previous-date", "next-date", "today-button", "review-date", "review-status",
     "coverage-status", "broker-status", "refresh-button", "chart-link", "market-banner", "headline-title",
-    "headline-detail", "generated-at", "conflict-banner", "conflict-title", "conflict-detail",
+    "headline-detail", "generated-at", "daily-readiness", "daily-readiness-title", "daily-readiness-overall",
+    "daily-readiness-items", "tomorrow-plan-date", "tomorrow-plan-text", "conflict-banner", "conflict-title", "conflict-detail",
     "jump-to-attention", "metric-rail", "page-error", "page-error-message", "retry-button", "decision-workspace",
     "mode-switcher", "data-context-title", "data-context-detail", "freshness-strip", "freshness-page",
     "freshness-runtime", "freshness-broker", "freshness-source", "freshness-environment",
-    "runtime-dashboard", "runtime-status", "runtime-summary", "premarket-watchcode-status", "watchcode-status",
+    "runtime-shell", "runtime-shell-status", "runtime-dashboard", "runtime-status", "runtime-summary", "premarket-watchcode-status", "watchcode-status",
     "generate-premarket-watchcode", "start-premarket-monitor", "generate-watchcode", "start-monitor", "stop-monitor",
     "runtime-follow", "runtime-refresh", "runtime-task-list",
     "runtime-view-switcher", "runtime-events-panel", "runtime-console-panel", "runtime-event-filter",
@@ -254,6 +258,8 @@ async function loadRuntimeTasks() {
     state.runtimeFailureCount += 1;
     el["runtime-status"].className = "status-indicator warning";
     el["runtime-status"].innerHTML = '<span class="status-dot" aria-hidden="true"></span><span>状态读取失败</span>';
+    el["runtime-shell-status"].className = "disclosure-status warning";
+    el["runtime-shell-status"].innerHTML = '<span class="status-dot" aria-hidden="true"></span>状态读取失败';
     el["runtime-summary"].textContent = `无法读取本机盯盘状态：${error.message}`;
     const retryDelay = Math.min(8000, 500 * (2 ** Math.min(state.runtimeFailureCount - 1, 4)));
     scheduleRuntimeRefresh(retryDelay);
@@ -264,6 +270,7 @@ async function loadRuntimeTasks() {
 
 async function loadActionStatus() {
   state.actionStatus = await fetchJSON(API.actionStatus, { timeoutMs: 5000 });
+  state.actionStatusError = false;
   renderActionStatus();
 }
 
@@ -294,6 +301,129 @@ function renderActionStatus() {
   el["start-premarket-monitor"].querySelector("span").textContent = premarketMonitorRunning ? "盘前监控运行中" : (startingPremarketMonitor ? "正在启动" : "启动盘前监控");
   el["start-monitor"].querySelector("span").textContent = monitorRunning ? "盯盘运行中" : (startingMonitor ? "正在启动" : "启动自动盯盘");
   el["stop-monitor"].querySelector("span").textContent = state.actionLoading === "stop-monitor" ? "正在结束" : "结束盯盘";
+  renderDailyReadiness();
+}
+
+function renderDailyReadiness() {
+  if (!el["daily-readiness-items"]) return;
+  const status = state.actionStatus || {};
+  const watchcode = status.watchcode || {};
+  const premarketWatchcode = status.premarket_watchcode || {};
+  const activeTasks = runtimeTasksForDisplay().filter((task) => ["running", "starting"].includes(task.status));
+  const taskState = (taskNames) => {
+    const matches = activeTasks.filter((task) => taskNames.includes(task.task_name));
+    return {
+      running: matches.some((task) => task.status === "running"),
+      starting: matches.some((task) => task.status === "starting"),
+    };
+  };
+  const premarketTask = taskState(["monitor_premarket"]);
+  const intradayTask = taskState(["monitor_auto", "monitor_ma5"]);
+  const premarketGenerator = taskState(["watchcode_premarket"]);
+  const intradayGenerator = taskState(["watchcode_ma5"]);
+  const pendingActions = Array.isArray(status.pending_actions) ? status.pending_actions : [];
+  const actionKnown = Boolean(state.actionStatus);
+  const runtimeKnown = Boolean(state.runtimePayload);
+
+  const watchcodeItem = (label, data, generating) => {
+    if (data.ready) {
+      return {
+        label,
+        stateLabel: "当日已生成",
+        detail: `${num(data.symbol_count)} 只 · 信号日 ${data.signal_date || "—"}`,
+        done: true,
+        tone: "success",
+      };
+    }
+    if (generating) {
+      return { label, stateLabel: "正在生成", detail: "当前进度会同步到实时任务输出", tone: "warning", pending: true };
+    }
+    if (!actionKnown) {
+      return {
+        label,
+        stateLabel: state.actionStatusError ? "状态不可用" : "正在检查",
+        detail: state.actionStatusError ? "任务状态读取失败，稍后自动重试" : "正在核对当日文件与信号日",
+        tone: "neutral",
+      };
+    }
+    const expected = data.expected_signal_date || "当日信号日";
+    const detail = data.exists
+      ? `现有信号日 ${data.signal_date || "未知"}，需要更新至 ${expected}`
+      : `需要生成信号日 ${expected} 的文件`;
+    return { label, stateLabel: "待生成", detail, tone: "warning" };
+  };
+
+  const monitorItem = (label, running, starting) => {
+    if (running) {
+      return { label, stateLabel: "监控已开启", detail: "运行进程已连接到网页看板", done: true, tone: "success" };
+    }
+    if (starting) {
+      return { label, stateLabel: "正在启动", detail: "任务已提交，正在等待进程心跳", tone: "warning", pending: true };
+    }
+    if (!actionKnown && !runtimeKnown) {
+      return {
+        label,
+        stateLabel: state.actionStatusError ? "状态不可用" : "正在检查",
+        detail: state.actionStatusError ? "任务状态读取失败，稍后自动重试" : "正在发现本机运行进程",
+        tone: "neutral",
+      };
+    }
+    return { label, stateLabel: "未开启", detail: "当前没有运行中的监控进程", tone: "neutral" };
+  };
+
+  const premarketGenerating = Boolean(
+    status.premarket_generator_running
+      || pendingActions.includes("generate-premarket-watchcode")
+      || premarketGenerator.running
+      || premarketGenerator.starting
+  );
+  const intradayGenerating = Boolean(
+    status.intraday_generator_running
+      || pendingActions.includes("generate-watchcode")
+      || intradayGenerator.running
+      || intradayGenerator.starting
+  );
+  const premarketMonitorRunning = Boolean(status.premarket_monitor_running || premarketTask.running);
+  const premarketMonitorStarting = Boolean(pendingActions.includes("start-premarket-monitor") || premarketTask.starting);
+  const intradayMonitorRunning = Boolean(
+    intradayTask.running
+      || (status.monitor_running && !status.premarket_monitor_running)
+      || activeTasks.some((task) => task.status === "running" && task.task_name === "monitor_auto")
+  );
+  const intradayMonitorStarting = Boolean(pendingActions.includes("start-monitor") || intradayTask.starting);
+  const items = [
+    watchcodeItem("盘前 WatchCode", premarketWatchcode, premarketGenerating),
+    watchcodeItem("盘中 WatchCode", watchcode, intradayGenerating),
+    monitorItem("盘前监控", premarketMonitorRunning, premarketMonitorStarting),
+    monitorItem("盘中监控", intradayMonitorRunning, intradayMonitorStarting),
+  ];
+  const completed = items.filter((item) => item.done).length;
+  const pending = items.some((item) => item.pending);
+  const known = actionKnown || runtimeKnown;
+  const allDone = completed === items.length;
+
+  el["daily-readiness"].setAttribute("aria-busy", String(!known));
+  el["daily-readiness-title"].textContent = "今日准备进度";
+  el["daily-readiness-overall"].className = `daily-readiness-overall ${allDone ? "success" : pending ? "warning" : "neutral"}`;
+  el["daily-readiness-overall"].textContent = !known
+    ? "检查中"
+    : allDone ? "✓ 全部完成" : `${completed} / ${items.length} 已完成`;
+  el["daily-readiness-items"].innerHTML = items.map((item) => `
+    <article class="readiness-item ${escapeAttr(item.tone)}">
+      <span class="readiness-mark" aria-hidden="true">${item.done ? "✓" : item.pending ? "…" : "—"}</span>
+      <div class="readiness-copy">
+        <span class="readiness-label">${escapeHTML(item.label)}</span>
+        <strong>${escapeHTML(item.stateLabel)}</strong>
+        <small>${escapeHTML(item.detail)}</small>
+      </div>
+    </article>`).join("");
+
+  const tomorrow = addDaysISO(todayISO(), 1);
+  const weekend = isoWeekday(tomorrow) === 0 || isoWeekday(tomorrow) === 6;
+  el["tomorrow-plan-date"].textContent = formatShortDate(tomorrow, true);
+  el["tomorrow-plan-text"].textContent = weekend
+    ? "周末通常休市；下一交易日前依次生成盘前 WatchCode、启动盘前监控、生成盘中 WatchCode、启动自动盯盘。"
+    : "生成盘前 WatchCode → 启动盘前监控 → 生成盘中 WatchCode → 启动自动盯盘";
 }
 
 function renderWatchcodeStatus(elementId, sessionLabel, watchcode, generating) {
@@ -314,10 +444,13 @@ function renderWatchcodeStatus(elementId, sessionLabel, watchcode, generating) {
 }
 
 function renderActionStatusError(error) {
+  state.actionStatus = null;
+  state.actionStatusError = true;
   ["premarket-watchcode-status", "watchcode-status"].forEach((elementId) => {
     el[elementId].className = "runtime-control-status warning";
     el[elementId].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>任务控制状态读取失败：${escapeHTML(error.message)}</span>`;
   });
+  renderDailyReadiness();
 }
 
 function beginPendingRuntimeTask(action) {
@@ -521,11 +654,15 @@ function scheduleRuntimeRefresh(delay) {
 function renderRuntimeDashboard(payload = null) {
   const tasks = runtimeTasksForDisplay();
   const activeCount = tasks.filter((task) => ["running", "starting"].includes(task.status)).length;
+  const runtimeLabel = activeCount ? `${activeCount} 个任务运行中` : "当前无运行任务";
   el["runtime-status"].className = `status-indicator ${activeCount ? "success" : "neutral"}`;
-  el["runtime-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${activeCount ? `${activeCount} 个任务运行中` : "当前无运行任务"}</span>`;
+  el["runtime-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span><span>${runtimeLabel}</span>`;
+  el["runtime-shell-status"].className = `disclosure-status ${activeCount ? "success" : "neutral"}`;
+  el["runtime-shell-status"].innerHTML = `<span class="status-dot" aria-hidden="true"></span>${runtimeLabel}`;
   el["runtime-summary"].textContent = activeCount
     ? "运行中每 1 秒同步；网页启动后立即显示，并自动追踪真实进程。"
     : "空闲时每 3 秒发现一次任务；网页启动任务会立即显示。";
+  renderDailyReadiness();
 
   if (!tasks.length) {
     const emptyTaskListMarkup = '<div class="runtime-empty"><svg aria-hidden="true"><use href="#icon-terminal"></use></svg><strong>没有发现盯盘任务</strong><span>任务启动后无需额外绑定，网页会自动显示。</span></div>';
@@ -733,6 +870,7 @@ function setWorkspaceMode(mode) {
 
 function renderWorkspaceMode() {
   const activeRuntime = runtimeTasksForDisplay().some((task) => ["running", "starting"].includes(task.status));
+  const previousResolvedMode = state.resolvedMode;
   state.resolvedMode = state.mode === "smart" ? (activeRuntime ? "live" : "review") : state.mode;
   document.body.classList.toggle("mode-live", state.resolvedMode === "live");
   document.body.classList.toggle("mode-review", state.resolvedMode === "review");
@@ -740,10 +878,14 @@ function renderWorkspaceMode() {
     button.setAttribute("aria-pressed", String(button.dataset.mode === state.mode));
   });
   el["runtime-dashboard"].classList.toggle("runtime-quiet", state.resolvedMode === "review" && !activeRuntime);
+  if ((activeRuntime && !state.runtimeWasActive) || (state.resolvedMode === "live" && previousResolvedMode !== "live")) {
+    el["runtime-shell"].open = true;
+  }
+  state.runtimeWasActive = activeRuntime;
   if (state.resolvedMode === "live") {
-    document.querySelector(".headline-panel").before(el["runtime-dashboard"]);
+    el["daily-readiness"].after(el["runtime-shell"]);
   } else {
-    el["metric-rail"].after(el["runtime-dashboard"]);
+    el["metric-rail"].after(el["runtime-shell"]);
   }
 
   const data = state.data;
@@ -949,19 +1091,16 @@ function metricDefinitions() {
   const label = (currentLabel, referenceLabel) => referenceDate ? referenceLabel : currentLabel;
   const subtitle = (value) => referenceDate ? `${value} · ${referenceDate}` : value;
   return [
-    { label: label("券商买入股票", "参考日券商买入"), value: num(s.broker_bought_symbols), subtitle: subtitle("至少有部分成交"), icon: "bag", tone: "success", bucket: "broker_filled" },
-    { label: label("已全部卖出", "参考日已全部卖出"), value: num(s.broker_closed_symbols), subtitle: subtitle("按复盘日买卖成交量"), icon: "check", tone: "success", bucket: "broker_closed" },
-    { label: label("券商订单", "参考日券商订单"), value: num(s.broker_order_count), subtitle: subtitle("含成交、取消与部分成交"), icon: "order", tone: "info", bucket: "broker_activity" },
-    { label: label("未成交买入", "参考日未成交买入"), value: num(s.broker_unfilled_buy_symbols), subtitle: subtitle("按股票去重"), icon: "hourglass", tone: "warning", bucket: "buy_unfilled" },
-    { label: label("策略候选", "参考日策略候选"), value: num(s.watch_counts?.intraday), subtitle: subtitle("盘中 MA5 观察池"), icon: "users", tone: "neutral", bucket: "strategy" },
-    { label: label("今日排除", "参考日排除"), value: num(s.excluded_count), subtitle: subtitle("当天不再考虑买入"), icon: "ban", tone: "warning", bucket: "excluded" },
-    { label: "当前持仓", value: num(s.current_positions), subtitle: "只读券商当前快照", icon: "wallet", tone: "neutral", bucket: "current_position" },
-    { label: label("当日成交净现金流", "参考日成交净现金流"), value: money(s.net_cash_flow), subtitle: subtitle("按成交额计算，未含费用"), icon: "database", tone: cashTone(s.net_cash_flow), bucket: "cash_flow" },
+    { label: label("买入", "参考日买入"), value: num(s.broker_bought_symbols), subtitle: subtitle("有成交股票"), icon: "bag", tone: "neutral", bucket: "broker_filled" },
+    { label: label("已卖清", "参考日已卖清"), value: num(s.broker_closed_symbols), subtitle: subtitle("完成买卖闭环"), icon: "check", tone: "neutral", bucket: "broker_closed" },
+    { label: label("未成交", "参考日未成交"), value: num(s.broker_unfilled_buy_symbols), subtitle: subtitle("需要确认或重评"), icon: "hourglass", tone: "warning", bucket: "buy_unfilled" },
+    { label: label("待买观察", "参考日观察池"), value: num(s.watch_counts?.intraday), subtitle: subtitle("盘中 MA5 候选"), icon: "users", tone: "neutral", bucket: "strategy" },
+    { label: "当前持仓", value: num(s.current_positions), subtitle: "券商当前快照", icon: "wallet", tone: "neutral", bucket: "current_position" },
   ];
 }
 
 function renderMetricSkeletons() {
-  el["metric-rail"].innerHTML = Array.from({ length: 8 }, () => `<div class="metric-skeleton skeleton"></div>`).join("");
+  el["metric-rail"].innerHTML = Array.from({ length: 5 }, () => `<div class="metric-skeleton skeleton"></div>`).join("");
 }
 
 function renderMetrics() {
@@ -1040,6 +1179,9 @@ function decisionRow(item) {
 
 function valueCell(item) {
   if (item.net_cash_flow !== null && item.net_cash_flow !== undefined) {
+    if (Number(item.sell_filled_qty) > 0 && Number(item.buy_filled_qty) <= 0) {
+      return { text: `卖出回款 ${money(item.net_cash_flow)}`, className: "number-flow" };
+    }
     return { text: money(item.net_cash_flow), className: Number(item.net_cash_flow) >= 0 ? "number-positive" : "number-negative" };
   }
   const snapshot = item.bucket === "window_outside_closest"
@@ -1609,6 +1751,25 @@ function todayISO() {
   const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date());
   const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
   return `${values.year}-${values.month}-${values.day}`;
+}
+function addDaysISO(value, days) {
+  const [year, month, day] = String(value).split("-").map(Number);
+  const date = new Date(Date.UTC(year, month - 1, day + days));
+  return date.toISOString().slice(0, 10);
+}
+function isoWeekday(value) {
+  const [year, month, day] = String(value).split("-").map(Number);
+  return new Date(Date.UTC(year, month - 1, day)).getUTCDay();
+}
+function formatShortDate(value, includeWeekday = false) {
+  const [year, month, day] = String(value).split("-").map(Number);
+  if (![year, month, day].every(Number.isFinite)) return String(value || "—");
+  return new Intl.DateTimeFormat("zh-CN", {
+    timeZone: "UTC",
+    month: "numeric",
+    day: "numeric",
+    ...(includeWeekday ? { weekday: "short" } : {}),
+  }).format(new Date(Date.UTC(year, month - 1, day)));
 }
 function localeCompare(a, b) { return a.localeCompare(b, "zh-CN", { numeric: true, sensitivity: "base" }); }
 function emptyText(text) { return `<div class="section-empty compact-empty">${icon("info")}<span>${escapeHTML(text)}</span></div>`; }

@@ -7,7 +7,7 @@
   <meta name="theme-color" content="#071016">
   <meta name="description" content="MA5 每日交易复盘与证据核对工作台">
   <title>MA5 每日复盘</title>
-  <link rel="stylesheet" href="./styles.css?v=20260712-ux-polish1">
+  <link rel="stylesheet" href="./styles.css?v=20260715-progress2">
 </head>
 <body>
   <a class="skip-link" href="#main-content">跳到复盘内容</a>
@@ -79,12 +79,6 @@
       <span id="review-status" class="status-indicator neutral">
         <span class="status-dot" aria-hidden="true"></span><span>等待数据</span>
       </span>
-      <span id="coverage-status" class="status-indicator neutral">
-        <svg aria-hidden="true"><use href="#icon-clock"></use></svg><span>覆盖时间待定</span>
-      </span>
-      <span id="broker-status" class="status-indicator neutral">
-        <span class="status-dot" aria-hidden="true"></span><span>券商未核对</span>
-      </span>
     </div>
 
     <div class="header-actions">
@@ -100,26 +94,40 @@
   <main id="main-content" tabindex="-1">
     <div id="market-banner" class="market-banner" role="status" hidden></div>
 
-    <section class="workspace-control-bar" aria-label="看板工作模式与数据上下文">
-      <div id="mode-switcher" class="mode-switcher" role="group" aria-label="工作模式">
-        <button type="button" data-mode="smart" aria-pressed="true">智能布局</button>
-        <button type="button" data-mode="live" aria-pressed="false">盘中监控</button>
-        <button type="button" data-mode="review" aria-pressed="false">盘后复盘</button>
+    <details id="system-details" class="section-disclosure system-disclosure">
+      <summary>
+        <span class="disclosure-copy"><strong>系统与显示</strong><small>数据状态、券商核对与布局模式</small></span>
+        <span class="disclosure-action" aria-hidden="true"></span>
+      </summary>
+      <div class="system-statuses" aria-label="数据状态">
+        <span id="coverage-status" class="status-indicator neutral">
+          <svg aria-hidden="true"><use href="#icon-clock"></use></svg><span>覆盖时间待定</span>
+        </span>
+        <span id="broker-status" class="status-indicator neutral">
+          <span class="status-dot" aria-hidden="true"></span><span>券商未核对</span>
+        </span>
       </div>
-      <div id="data-context" class="data-context">
-        <span class="context-label">数据上下文</span>
-        <strong id="data-context-title">正在确认日期…</strong>
-        <span id="data-context-detail">实时任务与复盘证据将分别标注</span>
-      </div>
-    </section>
+      <section class="workspace-control-bar" aria-label="看板工作模式与数据上下文">
+        <div id="mode-switcher" class="mode-switcher" role="group" aria-label="工作模式">
+          <button type="button" data-mode="smart" aria-pressed="true">智能布局</button>
+          <button type="button" data-mode="live" aria-pressed="false">盘中监控</button>
+          <button type="button" data-mode="review" aria-pressed="false">盘后复盘</button>
+        </div>
+        <div id="data-context" class="data-context">
+          <span class="context-label">数据上下文</span>
+          <strong id="data-context-title">正在确认日期…</strong>
+          <span id="data-context-detail">实时任务与复盘证据将分别标注</span>
+        </div>
+      </section>
 
-    <section id="freshness-strip" class="freshness-strip" aria-label="数据新鲜度与连接状态">
-      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>页面</span><strong id="freshness-page">加载中</strong></div>
-      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>盯盘心跳</span><strong id="freshness-runtime">未发现</strong></div>
-      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>Alpaca</span><strong id="freshness-broker">待核对</strong></div>
-      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>本地证据</span><strong id="freshness-source">待读取</strong></div>
-      <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>环境</span><strong id="freshness-environment">—</strong></div>
-    </section>
+      <section id="freshness-strip" class="freshness-strip" aria-label="数据新鲜度与连接状态">
+        <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>页面</span><strong id="freshness-page">加载中</strong></div>
+        <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>盯盘心跳</span><strong id="freshness-runtime">未发现</strong></div>
+        <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>Alpaca</span><strong id="freshness-broker">待核对</strong></div>
+        <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>本地证据</span><strong id="freshness-source">待读取</strong></div>
+        <div class="freshness-item neutral"><span class="status-dot" aria-hidden="true"></span><span>环境</span><strong id="freshness-environment">—</strong></div>
+      </section>
+    </details>
 
     <section class="headline-panel" aria-labelledby="headline-title">
       <div>
@@ -127,6 +135,26 @@
         <p id="headline-detail">先加载本地事实，随后自动进行只读券商核对。</p>
       </div>
       <div id="generated-at" class="generated-at" aria-label="数据生成时间">—</div>
+    </section>
+
+    <section id="daily-readiness" class="daily-readiness" aria-labelledby="daily-readiness-title" aria-busy="true">
+      <header class="daily-readiness-header">
+        <div>
+          <span class="section-kicker">今日准备进度</span>
+          <h2 id="daily-readiness-title">正在检查 WatchCode 与监控</h2>
+        </div>
+        <strong id="daily-readiness-overall" class="daily-readiness-overall neutral">检查中</strong>
+      </header>
+      <div id="daily-readiness-items" class="daily-readiness-items">
+        <div class="readiness-skeleton skeleton"></div>
+        <div class="readiness-skeleton skeleton"></div>
+        <div class="readiness-skeleton skeleton"></div>
+        <div class="readiness-skeleton skeleton"></div>
+      </div>
+      <div class="tomorrow-plan">
+        <div class="tomorrow-plan-label"><span>明日待办</span><strong id="tomorrow-plan-date">—</strong></div>
+        <p id="tomorrow-plan-text">正在整理明日执行顺序…</p>
+      </div>
     </section>
 
     <section id="conflict-banner" class="conflict-banner" aria-labelledby="conflict-title" hidden>
@@ -140,6 +168,11 @@
 
     <section id="metric-rail" class="metric-rail" aria-label="今日关键指标" aria-busy="true"></section>
 
+    <details id="runtime-shell" class="section-disclosure runtime-disclosure">
+      <summary>
+        <span class="disclosure-copy"><strong>实时任务与输出</strong><small>启动、结束任务，查看运行日志</small></span>
+        <span id="runtime-shell-status" class="disclosure-status neutral"><span class="status-dot" aria-hidden="true"></span>当前无运行任务</span>
+      </summary>
     <section id="runtime-dashboard" class="panel runtime-dashboard" aria-labelledby="runtime-title">
       <div class="panel-header runtime-header">
         <div>
@@ -209,6 +242,7 @@
         </div>
       </div>
     </section>
+    </details>
 
     <div id="page-error" class="page-state error-state" role="alert" hidden>
       <svg aria-hidden="true"><use href="#icon-alert"></use></svg>
@@ -220,7 +254,7 @@
       <section id="decision-workspace" class="panel decision-panel" aria-labelledby="decision-title">
         <div class="panel-header decision-header">
           <div>
-            <h2 id="decision-title">统一决策视图</h2>
+            <h2 id="decision-title">股票结果</h2>
             <p id="decision-count" class="muted">等待数据</p>
           </div>
           <button id="clear-filters" class="text-button" type="button" hidden>清除全部筛选</button>
@@ -258,7 +292,7 @@
                 <th data-sort="status"><button type="button">主状态<span class="sort-mark" aria-hidden="true"></span></button></th>
                 <th data-sort="buy"><button type="button">买入成交<span class="sort-mark" aria-hidden="true"></span></button></th>
                 <th data-sort="sell"><button type="button">卖出成交<span class="sort-mark" aria-hidden="true"></span></button></th>
-                <th data-sort="value"><button type="button">净现金流 / 条件距离<span class="sort-mark" aria-hidden="true"></span></button></th>
+                <th data-sort="value"><button type="button">成交差额 / 条件距离<span class="sort-mark" aria-hidden="true"></span></button></th>
                 <th data-sort="time"><button type="button">时间<span class="sort-mark" aria-hidden="true"></span></button></th>
                 <th data-sort="match"><button type="button">记录一致性<span class="sort-mark" aria-hidden="true"></span></button></th>
                 <th>详情</th>
@@ -279,17 +313,6 @@
       </section>
 
       <aside id="evidence-column" class="evidence-column" aria-label="证据与核对">
-        <section class="panel timeline-panel" aria-labelledby="timeline-title">
-          <div class="panel-header">
-            <div><h2 id="timeline-title">证据时间线</h2><p class="muted">按事件时间排序</p></div>
-            <button id="timeline-order" class="icon-button compact" type="button" aria-label="切换时间线排序" title="切换排序">
-              <svg aria-hidden="true"><use href="#icon-down"></use></svg>
-            </button>
-          </div>
-          <ol id="timeline-list" class="timeline-list"></ol>
-          <div id="timeline-empty" class="section-empty compact-empty" hidden><span>当天没有可显示的证据事件。</span></div>
-        </section>
-
         <section id="attention-panel" class="panel attention-panel" aria-labelledby="attention-title">
           <div class="panel-header attention-heading">
             <div>
@@ -303,9 +326,31 @@
             <svg aria-hidden="true"><use href="#icon-check"></use></svg><span>当前没有待核对事项。</span>
           </div>
         </section>
+
+        <details class="evidence-disclosure">
+          <summary>
+            <span class="disclosure-copy"><strong>证据时间线</strong><small>按事件时间查看完整过程</small></span>
+            <span class="disclosure-action" aria-hidden="true"></span>
+          </summary>
+        <section class="panel timeline-panel" aria-labelledby="timeline-title">
+          <div class="panel-header">
+            <div><h2 id="timeline-title">证据时间线</h2><p class="muted">按事件时间排序</p></div>
+            <button id="timeline-order" class="icon-button compact" type="button" aria-label="切换时间线排序" title="切换排序">
+              <svg aria-hidden="true"><use href="#icon-down"></use></svg>
+            </button>
+          </div>
+          <ol id="timeline-list" class="timeline-list"></ol>
+          <div id="timeline-empty" class="section-empty compact-empty" hidden><span>当天没有可显示的证据事件。</span></div>
+        </section>
+        </details>
       </aside>
     </div>
 
+    <details id="review-details" class="section-disclosure review-disclosure">
+      <summary>
+        <span class="disclosure-copy"><strong>更多复盘明细</strong><small>决策漏斗、订单流水、三时段与数据健康</small></span>
+        <span class="disclosure-action" aria-hidden="true"></span>
+      </summary>
     <section id="review-sections" class="review-grid" aria-label="详细复盘区">
       <article class="panel review-panel" aria-labelledby="funnel-title">
         <div class="panel-header"><h2 id="funnel-title">策略决策漏斗</h2></div>
@@ -332,6 +377,7 @@
         <div id="health-content" class="panel-content"></div>
       </article>
     </section>
+    </details>
   </main>
 
   <div id="drawer-backdrop" class="drawer-backdrop" hidden></div>
@@ -420,6 +466,6 @@
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
   <div id="app-live-region" class="sr-only" role="status" aria-live="polite"></div>
 
-  <script src="./app.js?v=20260713-task-switch1" defer></script>
+  <script src="./app.js?v=20260715-progress2" defer></script>
 </body>
 </html>
