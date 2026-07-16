@@ -59,7 +59,7 @@ MA5_DIP_WATCHLIST_RULES = WatchlistScreenRules(
     1.0,
     999.0,
     0.0,
-    True,
+    False,
 )
 
 
@@ -71,7 +71,7 @@ def ma5_dip_watchlist_rules() -> WatchlistScreenRules:
         1.0,
         999.0,
         0.0,
-        True,
+        False,
     )
 
 

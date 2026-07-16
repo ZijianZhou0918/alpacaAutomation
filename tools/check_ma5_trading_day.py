@@ -9,10 +9,17 @@ PROJECT_DIR = Path(__file__).resolve().parents[1]
 if str(PROJECT_DIR) not in sys.path:
     sys.path.insert(0, str(PROJECT_DIR))
 
-from alpaca_ma5_service.trading_calendar import trading_day_decision
+from alpaca_ma5_service.trading_calendar import latest_trading_day_on_or_before, trading_day_decision
 
 
 def main() -> int:
+    if len(sys.argv) >= 2 and sys.argv[1] == "--latest-on-or-before":
+        if len(sys.argv) < 3 or not sys.argv[2].strip():
+            raise SystemExit("--latest-on-or-before requires YYYY-MM-DD")
+        target_date = datetime.strptime(sys.argv[2].strip(), "%Y-%m-%d").date()
+        print(latest_trading_day_on_or_before(target_date).isoformat(), flush=True)
+        return 0
+
     target_date = parse_target_date()
     decision = trading_day_decision(target_date)
     print(

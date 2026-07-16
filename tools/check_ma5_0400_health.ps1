@@ -56,7 +56,7 @@ function Get-WatchCodesSignalDate {
     return $null
 }
 
-function Get-LatestWeekdaySignalDate {
+function Get-LatestTradingSignalDate {
     try {
         $eastern = [System.TimeZoneInfo]::FindSystemTimeZoneById("Eastern Standard Time")
         $now = [System.TimeZoneInfo]::ConvertTime((Get-Date), $eastern)
@@ -70,10 +70,17 @@ function Get-LatestWeekdaySignalDate {
         $candidate = $now.Date.AddDays(-1)
     }
 
-    while ($candidate.DayOfWeek -in @([DayOfWeek]::Saturday, [DayOfWeek]::Sunday)) {
-        $candidate = $candidate.AddDays(-1)
+    $checker = Join-Path $ProjectDir "tools\check_ma5_trading_day.py"
+    $python = Resolve-Ma5Python $ProjectDir
+    $pythonArgs = @($python.Args + @($checker, "--latest-on-or-before", $candidate.ToString("yyyy-MM-dd")))
+    $output = & $python.FilePath @pythonArgs 2>&1
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0) {
+        throw "Could not resolve latest trading signal date (exit code $exitCode): $($output -join ' | ')"
     }
-    return $candidate
+
+    $resolved = [string]($output | Select-Object -Last 1)
+    return [datetime]::ParseExact($resolved.Trim(), "yyyy-MM-dd", $null).Date
 }
 
 function Test-WatchCodesFresh {
@@ -90,10 +97,10 @@ function Test-WatchCodesFresh {
     $item = Get-Item $Path
     $ageHours = ((Get-Date) - $item.LastWriteTime).TotalHours
     $signalDate = Get-WatchCodesSignalDate $Path
-    $expectedDate = Get-LatestWeekdaySignalDate
+    $expectedDate = Get-LatestTradingSignalDate
     $signalText = if ($signalDate) { $signalDate.ToString("yyyy-MM-dd") } else { "missing" }
 
-    Write-Ma5TaskLog $LogDir $LogFile ("{0} LastWriteTime={1}; age={2:N2}h; signal_date={3}; expected_weekday_signal={4}" -f $Label, $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $ageHours, $signalText, $expectedDate.ToString("yyyy-MM-dd"))
+    Write-Ma5TaskLog $LogDir $LogFile ("{0} LastWriteTime={1}; age={2:N2}h; signal_date={3}; expected_trading_signal={4}" -f $Label, $item.LastWriteTime.ToString("yyyy-MM-dd HH:mm:ss"), $ageHours, $signalText, $expectedDate.ToString("yyyy-MM-dd"))
 
     if ($ageHours -le $FreshHours) {
         return $true

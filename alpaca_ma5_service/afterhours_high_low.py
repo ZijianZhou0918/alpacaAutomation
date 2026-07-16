@@ -15,6 +15,7 @@ from .errors import short_error
 from .models import OrderResult
 from .order_guard import normalize_order_status, wait_for_fill_or_cancel
 from .state import append_order, orders_file
+from .trading_calendar import latest_trading_day_on_or_before, offline_trading_day_decision
 from .watchlist import normalize_symbol, to_alpaca_symbol
 from .watchlist_generator import batched, load_tradable_symbols
 
@@ -452,27 +453,24 @@ def scan_afterhours_candidates(
 
 def is_regular_session(now_et: datetime) -> bool:
     """判断当前是否处于常规盘；本策略在这段时间不买。"""
-    return now_et.weekday() < 5 and REGULAR_OPEN <= now_et.time() < REGULAR_CLOSE
+    return offline_trading_day_decision(now_et.date()).is_trading_day and REGULAR_OPEN <= now_et.time() < REGULAR_CLOSE
 
 
 def is_afterhours_buy_time(now_et: datetime) -> bool:
     """盘后真实监控/挂单窗口：16:00 <= t < 20:00 ET。"""
-    return now_et.weekday() < 5 and REGULAR_CLOSE <= now_et.time() < AFTERHOURS_DATA_CLOSE
+    return offline_trading_day_decision(now_et.date()).is_trading_day and REGULAR_CLOSE <= now_et.time() < AFTERHOURS_DATA_CLOSE
 
 
 def afterhours_signal_day(now_et: datetime) -> date:
     """返回最近一个已经完成常规盘的交易日；周末运行时回看上一个周五。"""
-    if now_et.weekday() < 5 and now_et.time() >= REGULAR_CLOSE:
+    if offline_trading_day_decision(now_et.date()).is_trading_day and now_et.time() >= REGULAR_CLOSE:
         return now_et.date()
-    day = now_et.date() - timedelta(days=1)
-    while day.weekday() >= 5:
-        day -= timedelta(days=1)
-    return day
+    return latest_trading_day_on_or_before(now_et.date() - timedelta(days=1))
 
 
 def afterhours_idle_status(now_et: datetime) -> tuple[str, str]:
     """给等待状态打印准确原因，避免周末或 20:00 后还显示等待当天收盘。"""
-    if now_et.weekday() >= 5:
+    if not offline_trading_day_decision(now_et.date()).is_trading_day:
         return "非交易日", "等待下一个交易日常规盘收盘"
     if now_et.time() < REGULAR_OPEN:
         return "常规盘未开盘", "等待今天常规盘收盘"

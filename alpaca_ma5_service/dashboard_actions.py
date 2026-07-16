@@ -28,6 +28,7 @@ ALLOWED_ACTIONS = {
     ACTION_STOP_MONITOR,
 }
 STOPPABLE_TASK_NAMES = {"monitor_auto", "monitor_ma5", "monitor_premarket", "watchcode_ma5", "watchcode_premarket"}
+WATCHCODE_TASK_NAMES = {"watchcode_ma5", "watchcode_premarket"}
 
 _ACTION_LOCK = threading.RLock()
 _ACTION_PROCESSES: dict[str, subprocess.Popen] = {}
@@ -348,7 +349,8 @@ def _wait_for_watchcode_generation(root: Path, *, timeout_seconds: float = 7200.
     while time.monotonic() < deadline:
         tasks = read_monitor_tasks(root)["tasks"]
         generator_running = any(
-            task["status"] == "running" and (task.get("task_name") == "watchcode_ma5" or task.get("phase") == "prepare")
+            task["status"] == "running"
+            and (task.get("task_name") in WATCHCODE_TASK_NAMES or task.get("phase") == "prepare")
             for task in tasks
         )
         if generator_running:

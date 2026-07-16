@@ -1032,15 +1032,21 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(settings.strategy_name, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
         self.assertEqual(settings.max_daily_buys, 3)
 
-    def test_old_ma5_dip_watchlist_requires_ma_order(self):
+    def test_old_ma5_dip_watchlist_does_not_require_ma_order(self):
         original = strategy_ma5_dip.MIN_SIGNAL_DAY_GAIN_PCT
         try:
             strategy_ma5_dip.configure(min_signal_day_gain_pct=0.12)
 
             rules = watchlist_screen_rules("ma5_dip")
+            candidates = screen_candidates(
+                {"WEAK_MA_ORDER": make_weak_ma_order_bars()},
+                datetime(2026, 1, 21, 10, 0),
+                rules=rules,
+            )
 
-            self.assertTrue(rules.require_ma5_gt_ma10_gt_ma20)
+            self.assertFalse(rules.require_ma5_gt_ma10_gt_ma20)
             self.assertEqual(rules.min_signal_gain_pct, 0.12)
+            self.assertEqual([candidate.symbol for candidate in candidates], ["WEAK_MA_ORDER"])
         finally:
             strategy_ma5_dip.configure(min_signal_day_gain_pct=original)
 
@@ -2578,6 +2584,18 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(next_poll_seconds(settings, datetime(2026, 5, 29, 16, 30)), settings.idle_poll_seconds)
         self.assertEqual(next_poll_seconds(settings, datetime(2026, 5, 30, 10, 0)), settings.idle_poll_seconds)
 
+    def test_market_holiday_never_enters_order_windows(self):
+        labor_day = datetime(2026, 9, 7, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+        near_regular_open = labor_day.replace(hour=9, minute=29, second=45)
+        settings = make_settings(Path("."))
+
+        self.assertFalse(is_regular_market_time(labor_day))
+        self.assertFalse(is_realtime_order_time(labor_day))
+        self.assertFalse(is_premarket_time(labor_day.replace(hour=8)))
+        self.assertFalse(is_buy_order_time(labor_day))
+        self.assertFalse(regular_open_has_started(labor_day))
+        self.assertEqual(next_poll_seconds(settings, near_regular_open), settings.idle_poll_seconds)
+
     def test_watchlist_generator_filters_strategy_rules(self):
         """选股生成器使用最终策略的涨幅、MA、收盘位置和开盘过滤。"""
         now_et = datetime(2026, 1, 21, 10, 0)
@@ -2754,6 +2772,11 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(expected_signal_date(datetime(2026, 5, 28, 8, 0)), date(2026, 5, 27))
             self.assertTrue(watchcode_ready_for_session(path, datetime(2026, 5, 28, 8, 0)))
             self.assertFalse(watchcode_ready_for_session(path, datetime(2026, 5, 29, 8, 0)))
+
+    def test_auto_monitor_skips_market_holiday_when_resolving_signal_date(self):
+        now_et = datetime(2026, 9, 8, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        self.assertEqual(expected_signal_date(now_et), date(2026, 9, 4))
 
     def test_auto_monitor_checks_afterhours_watchcode_signal_date_and_threshold(self):
         """自动入口只复用当天盘后 high/low 阈值一致的观察池。"""
@@ -3481,6 +3504,13 @@ class AfterHoursHighLowTests(unittest.TestCase):
         self.assertEqual(afterhours_signal_day(friday_after_close), date(2026, 6, 12))
         self.assertEqual(afterhours_signal_day(saturday_evening), date(2026, 6, 12))
         self.assertEqual(afterhours_signal_day(monday_morning), date(2026, 6, 12))
+
+    def test_afterhours_windows_and_signal_day_skip_market_holiday(self):
+        labor_day_after_close = datetime(2026, 9, 7, 16, 30, tzinfo=ZoneInfo("America/New_York"))
+
+        self.assertFalse(is_regular_session(labor_day_after_close.replace(hour=10)))
+        self.assertFalse(is_afterhours_buy_time(labor_day_after_close))
+        self.assertEqual(afterhours_signal_day(labor_day_after_close), date(2026, 9, 4))
 
     def test_afterhours_screen_uses_regular_high_low_ratio(self):
         """常规盘 high/low > 1.8 才进入盘后候选，并按 close*0.8 算买入价。"""

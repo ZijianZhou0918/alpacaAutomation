@@ -102,6 +102,20 @@ class DashboardActionsTests(TestCase):
         self.assertLess(calls.index("wait"), calls.index("premarket_watchcode"))
         self.assertLess(calls.index("premarket_watchcode"), calls.index("premarket_monitor"))
 
+    def test_wait_for_watchcode_generation_tracks_premarket_generator_until_finished(self):
+        running = {
+            "tasks": [
+                {"status": "running", "task_name": "watchcode_premarket", "phase": "screen"},
+            ]
+        }
+        with patch.object(dashboard_actions, "read_monitor_tasks", side_effect=[running, {"tasks": []}]) as reader:
+            with patch.object(dashboard_actions.time, "monotonic", side_effect=[0.0, 0.0, 1.0]):
+                with patch.object(dashboard_actions.time, "sleep") as sleep:
+                    dashboard_actions._wait_for_watchcode_generation(Path("."))
+
+        self.assertEqual(reader.call_count, 2)
+        sleep.assert_called_once_with(2.0)
+
     def test_stop_monitor_action_ends_tracked_and_runtime_processes(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -24,6 +24,7 @@ from alpaca_ma5_service.market_time import DAILY_BAR_READY, REALTIME_ORDER_CLOSE
 from alpaca_ma5_service.monitor_runtime import monitor_runtime
 from alpaca_ma5_service.premarket_watchlist import premarket_watch_codes_path
 from alpaca_ma5_service.run_lock import acquire_run_lock
+from alpaca_ma5_service.trading_calendar import latest_trading_day_on_or_before
 from alpaca_ma5_service.watchlist import read_watch_codes
 from monitor_afterhours import monitor_afterhours
 from monitor_ma5_forever import monitor_ma5_forever
@@ -203,9 +204,7 @@ def read_watchcode_signal_date(path: Path):
 
 def expected_signal_date(now_et: datetime):
     candidate = now_et.date() if now_et.time() >= DAILY_BAR_READY else now_et.date() - timedelta(days=1)
-    while candidate.weekday() >= 5:
-        candidate -= timedelta(days=1)
-    return candidate
+    return latest_trading_day_on_or_before(candidate)
 
 
 if __name__ == "__main__":

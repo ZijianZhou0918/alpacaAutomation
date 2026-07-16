@@ -74,6 +74,14 @@ def offline_trading_day_decision(target_date: date) -> TradingDayDecision:
     return TradingDayDecision(target_date, True, "offline", "Weekday and not a standard US equity market holiday")
 
 
+def latest_trading_day_on_or_before(target_date: date) -> date:
+    """Return the latest standard US equity trading day on or before ``target_date``."""
+    candidate = target_date
+    while not offline_trading_day_decision(candidate).is_trading_day:
+        candidate -= timedelta(days=1)
+    return candidate
+
+
 def us_equity_holiday_name(target_date: date) -> str:
     holidays: dict[date, str] = {}
     for year in (target_date.year - 1, target_date.year, target_date.year + 1):

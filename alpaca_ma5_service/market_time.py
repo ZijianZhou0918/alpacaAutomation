@@ -5,6 +5,7 @@ from math import ceil
 from zoneinfo import ZoneInfo
 
 from .config import Settings
+from .trading_calendar import offline_trading_day_decision
 
 
 REGULAR_OPEN = time(9, 30)
@@ -15,6 +16,10 @@ REALTIME_ORDER_OPEN = time(4, 0)
 REALTIME_ORDER_CLOSE = time(20, 0)
 
 
+def is_trading_day(now_et: datetime) -> bool:
+    return offline_trading_day_decision(now_et.date()).is_trading_day
+
+
 def now_market_time(settings: Settings) -> datetime:
     """返回配置市场时区下的当前时间。"""
     return datetime.now(ZoneInfo(settings.market_timezone))
@@ -22,17 +27,17 @@ def now_market_time(settings: Settings) -> datetime:
 
 def is_regular_market_time(now_et: datetime) -> bool:
     """判断是否处于美股常规盘：09:30 <= t < 16:00 ET。"""
-    return now_et.weekday() < 5 and REGULAR_OPEN <= now_et.time() < REGULAR_CLOSE
+    return is_trading_day(now_et) and REGULAR_OPEN <= now_et.time() < REGULAR_CLOSE
 
 
 def is_realtime_order_time(now_et: datetime) -> bool:
     """判断是否处于允许使用实时价下单的窗口：04:00 <= t < 20:00 ET。"""
-    return now_et.weekday() < 5 and REALTIME_ORDER_OPEN <= now_et.time() < REALTIME_ORDER_CLOSE
+    return is_trading_day(now_et) and REALTIME_ORDER_OPEN <= now_et.time() < REALTIME_ORDER_CLOSE
 
 
 def is_premarket_time(now_et: datetime) -> bool:
     """判断是否为盘前；本策略盘前不买入。"""
-    return now_et.weekday() < 5 and REALTIME_ORDER_OPEN <= now_et.time() < REGULAR_OPEN
+    return is_trading_day(now_et) and REALTIME_ORDER_OPEN <= now_et.time() < REGULAR_OPEN
 
 
 def is_premarket_monitor_finished(now_et: datetime) -> bool:
@@ -57,12 +62,12 @@ def seconds_until_intraday_monitor_end(now_et: datetime) -> int:
 
 def regular_open_has_started(now_et: datetime) -> bool:
     """常规盘开盘后，今日开盘价才有稳定含义。"""
-    return now_et.weekday() < 5 and now_et.time() >= REGULAR_OPEN
+    return is_trading_day(now_et) and now_et.time() >= REGULAR_OPEN
 
 
 def daily_request_end(now_et: datetime, feed: str = "sip") -> datetime:
     """计算 Alpaca 日线请求 end；SIP 需要避开 recent data 权限窗口。"""
-    if now_et.weekday() < 5 and now_et.time() >= DAILY_BAR_READY:
+    if is_trading_day(now_et) and now_et.time() >= DAILY_BAR_READY:
         end_date = now_et.date() + timedelta(days=1)
     else:
         end_date = now_et.date()
@@ -83,7 +88,7 @@ def stale_sip_daily_end(now_et: datetime, boundary: datetime) -> datetime:
 
 def is_buy_order_time(now_et: datetime) -> bool:
     """真实买入窗口：只允许常规盘开盘后前 2.5 小时，09:30 <= t < 12:00 ET。"""
-    return now_et.weekday() < 5 and REGULAR_OPEN <= now_et.time() < BUY_ORDER_CLOSE
+    return is_trading_day(now_et) and REGULAR_OPEN <= now_et.time() < BUY_ORDER_CLOSE
 
 
 def next_poll_seconds(settings: Settings, now_et: datetime) -> int:
@@ -103,11 +108,11 @@ def seconds_until_next_regular_market_open(now_et: datetime) -> int:
 def next_regular_market_open(now_et: datetime) -> datetime:
     """返回下一个工作日 09:30 ET。"""
     day = now_et.date()
-    if now_et.weekday() < 5 and now_et.time() < REGULAR_OPEN:
+    if is_trading_day(now_et) and now_et.time() < REGULAR_OPEN:
         return datetime.combine(day, REGULAR_OPEN, tzinfo=now_et.tzinfo)
 
     day += timedelta(days=1)
-    while day.weekday() >= 5:
+    while not offline_trading_day_decision(day).is_trading_day:
         day += timedelta(days=1)
     return datetime.combine(day, REGULAR_OPEN, tzinfo=now_et.tzinfo)
 

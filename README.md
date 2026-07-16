@@ -4,6 +4,9 @@
 
 `.env` 里填 Paper key 就连接 Alpaca Paper，填 Live key 就连接 Alpaca Live；程序会自动识别。
 
+> [!IMPORTANT]
+> 运行或排查本项目之前，必须先完整阅读 [`docs/PROJECT_OPERATIONS.md`](docs/PROJECT_OPERATIONS.md)；修改任何代码、脚本、测试、配置或前端文件前，还必须完整阅读 [`CODE_MODIFICATION_RULES.md`](CODE_MODIFICATION_RULES.md)。项目根目录的 `AGENTS.md` 会强制 Codex/代理在每次任务中执行对应门禁。
+
 ## 策略
 
 - 买入：当前价格距离分段买点 `2%` 内时触发。
@@ -169,7 +172,7 @@ NVDA
 ```
 
 只筛选 Alpaca `US_EQUITY` 里的常规普通股；会排除权证、单位、优先股、ETF/基金、ADR/ADS、纯 5 字母 ticker，以及 `Class B`/`Series` 等特殊股本类别。
-筛选规则：最近一个已收盘交易日涨幅 `>20%`，且必须比信号日 `MA5` 涨幅高 `10` 个百分点以上；同时要求信号日收盘价 `close / MA5 > 1.15`，且当天 `open / MA5 > 0.95`。信号日 `MA5` 涨幅按 `信号日 MA5 / 前一交易日 MA5 - 1` 计算，`body_pct` 只写入候选 CSV 作为诊断字段，不再作为筛选条件。
+当前 `ma5_dip` 筛选规则：最近一个已收盘交易日涨幅必须达到运行配置的阈值，并高于信号日 `MA5` 涨幅；信号日收盘价仍须位于 `MA5` 上方，但不再要求 `MA5 > MA10 > MA20`。`MA5`、`MA10`、`MA20` 仍会计算并写入候选 CSV 和图表，供诊断与复盘使用。
 默认日线优先使用 Alpaca `sip` 全市场历史数据，并自动避开最近 15 分钟权限限制；读取失败时降级到 `iex`。
 候选诊断会写入 `outputs/watch_candidates_YYYY-MM-DD.csv`。
 
