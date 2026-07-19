@@ -1,3 +1,9 @@
+"""动态 MA5 回撤买入策略。
+
+本模块只计算买点并产生 BUY/HOLD ``Signal``，不会连接券商或提交订单。
+真正买入由 ``service.run_once`` 读取 ``diagnostics['final_buy_point']`` 后执行。
+"""
+
 from __future__ import annotations
 
 import math
@@ -35,6 +41,7 @@ def configure(
     min_today_open_vs_open_ma5_pct: float | None = None,
     max_buy_today_current_gain_pct: float | None = None,
 ) -> None:
+    """应用监控入口传入的 MA5 参数，并拒绝非数字或无限值配置。"""
     global MIN_SIGNAL_DAY_GAIN_PCT
     global MID_SIGNAL_DAY_GAIN_PCT
     global HIGH_SIGNAL_DAY_GAIN_PCT
@@ -78,6 +85,13 @@ def _finite_config(name: str, value: float) -> float:
 
 
 def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
+    """根据动态 MA5、信号日涨幅、开盘保护和当日回撤产生买入信号。
+
+    关键输出：
+    - ``HOLD``：任何条件未满足，只观察或记录当日排除；
+    - ``BUY``：条件满足，并把实际 BUY LIMIT 价格写入 ``final_buy_point``；
+    - 本函数无外部副作用，不读取账户，也不直接下单。
+    """
     if snapshot.current_price <= 0:
         return Signal(snapshot.symbol, "HOLD", "当前价格无效", snapshot.current_price)
     if len(snapshot.previous_closes) < 4:
@@ -208,6 +222,7 @@ def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
             if snapshot.current_price <= final_buy_point
             else f"当前价在分段买点上方 {_format_pct(BUY_TRIGGER_DISTANCE_PCT)} 内"
         )
+        # 【买入决策，不下单】服务层会读取 final_buy_point 并提交 BUY LIMIT。
         return Signal(
             snapshot.symbol,
             "BUY",

@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from datetime import date, timedelta
 
 
+SPECIAL_US_EQUITY_MARKET_CLOSURES = {
+    date(2025, 1, 9): "National Day of Mourning for President Jimmy Carter",
+}
+
+
 @dataclass(frozen=True)
 class TradingDayDecision:
     target_date: date
@@ -90,7 +95,7 @@ def us_equity_holiday_name(target_date: date) -> str:
 
 
 def us_equity_holidays_for_year(year: int) -> dict[date, str]:
-    return {
+    holidays = {
         observed_fixed_holiday(year, 1, 1): "New Year's Day",
         nth_weekday(year, 1, 0, 3): "Martin Luther King Jr. Day",
         nth_weekday(year, 2, 0, 3): "Presidents' Day",
@@ -102,6 +107,14 @@ def us_equity_holidays_for_year(year: int) -> dict[date, str]:
         nth_weekday(year, 11, 3, 4): "Thanksgiving Day",
         observed_fixed_holiday(year, 12, 25): "Christmas Day",
     }
+    holidays.update(
+        {
+            closure_date: name
+            for closure_date, name in SPECIAL_US_EQUITY_MARKET_CLOSURES.items()
+            if closure_date.year == year
+        }
+    )
+    return holidays
 
 
 def observed_fixed_holiday(year: int, month: int, day: int) -> date:

@@ -1,13 +1,39 @@
 # Alpaca MA5 自动交易服务
 
-这个项目参考 `StockAPI` 的文件观察池思路：买入只读取 `watch_codes.txt`，卖出风控会额外检查当前账户持仓，并通过 Alpaca API 下单。
+这个项目参考 `StockAPI` 的文件观察池思路：买入只读取 `data/watchcodes/watch_codes.txt`，卖出风控会额外检查当前账户持仓，并通过 Alpaca API 下单。
 
 `.env` 里填 Paper key 就连接 Alpaca Paper，填 Live key 就连接 Alpaca Live；程序会自动识别。
 
 > [!IMPORTANT]
 > 运行或排查本项目之前，必须先完整阅读 [`docs/PROJECT_OPERATIONS.md`](docs/PROJECT_OPERATIONS.md)；修改任何代码、脚本、测试、配置或前端文件前，还必须完整阅读 [`CODE_MODIFICATION_RULES.md`](CODE_MODIFICATION_RULES.md)。项目根目录的 `AGENTS.md` 会强制 Codex/代理在每次任务中执行对应门禁。
 
+## 30 秒看懂流程
+
+```text
+monitor_auto.py
+  -> 判断交易日和美股时段
+  -> 生成/确认对应 WatchCode
+  -> 盘前推荐提醒 | 盘中策略交易 | 盘后 high/low 提醒
+  -> 订单记录、通知和每日复盘
+```
+
+盘中策略交易再拆成两条清晰链路：
+
+```text
+WatchCode 内无持仓股票 -> 买入策略 -> Broker -> 撤单/终态确认
+券商当前全部持仓       -> 卖出策略 -> Broker -> 撤单/终态确认
+```
+
+- 全天自动运行从 `monitor_auto.py` 开始。
+- 运行盘中监控从根目录 `monitor_ma5_forever.py` 开始；策略参数在 `alpaca_ma5_service/workflows/monitoring/intraday.py` 顶部配置。
+- 四类策略代码分别在 `strategy_framework/components/watchcode.py`、`buy.py`、`sell.py`、`cancel.py`。
+- 完整流程图见 [`docs/architecture/PROJECT_FLOW.md`](docs/architecture/PROJECT_FLOW.md)。
+- 想直接定位买入、卖出、撤单和真正 Alpaca 写入位置，先看 [`docs/architecture/TRADE_ORDER_FLOW.md`](docs/architecture/TRADE_ORDER_FLOW.md)。
+- 新增策略导航见 [`alpaca_ma5_service/strategy_framework/README.md`](alpaca_ma5_service/strategy_framework/README.md)。
+
 ## 策略
+
+下列规则是默认 `ma5_dip` 组合的当前行为。运行时框架会把 WatchCode、买入、卖出和自动撤单分别解析为独立组件；可整体切换组合，也可只替换某一类策略。
 
 - 买入：当前价格距离分段买点 `2%` 内时触发。
   - 计算方式：`today_ma5 = (前 4 个已完成交易日收盘价之和 + 当前价) / 5`
@@ -26,27 +52,80 @@
   - 最终买点：`today_ma5 * (1 + 基础买点加成 + 开盘加成)`
   - 自动下单使用 BUY LIMIT，限价固定为最终买点，不使用当前价。
   - 真实买入只允许常规盘开盘后前 `2.5` 小时，即 `09:30-12:00 ET`。
-  - `monitor_ma5_forever.py` 里的 `BUY_STOCK_COUNT` 控制本轮最多买入股票数，`BUY_NOTIONAL_USD` 控制每只股票入场金额；如果入口不覆盖金额，默认每只股票 `$1500`；所有买入只提交整数股。
+  - `alpaca_ma5_service/workflows/monitoring/intraday.py` 里的 `BUY_STOCK_COUNT` 控制本轮最多买入股票数，`BUY_NOTIONAL_USD` 控制每只股票入场金额；如果入口不覆盖金额，默认每只股票 `$1500`；所有买入只提交整数股。
   - 同一只股票当天下单错误累计 `3` 次后，当天不再对这只股票继续提交订单。
 - 卖出：
   - 美股常规盘临近收盘，默认 `15:55-16:00 ET`
-  - 持仓亏损 `10%`：按成本价亏损 `8%` 的价格提交 SELL LIMIT 卖出全部；这条会检查当前账户所有持仓，不只限 `watch_codes.txt` 或当天买入的股票
+  - 持仓亏损 `10%`：按成本价亏损 `8%` 的价格提交 SELL LIMIT 卖出全部；这条会检查当前账户所有持仓，不只限 `data/watchcodes/watch_codes.txt` 或当天买入的股票
   - 监控进程启动后第一次检查时，如果某个旧持仓已经亏损 `10%` 或更多，本次监控会话不会自动清仓；监控启动后新出现的持仓，或旧持仓成本/数量变化后，再跌到 `10%` 会触发限价清仓
   - 持仓收益 `10%`：卖出一半；当天已成交过一次后不重复触发
   - 半仓止盈已成交后，剩余仓回落到成本价 `+5%`：用保护 SELL LIMIT 卖出剩余全部
-- 范围：只处理 `watch_codes.txt` 文件中的代码。
+- 范围：买入只处理 `data/watchcodes/watch_codes.txt` 中的代码。
 
-## 文件
+### 动态策略组合
 
-- `watch_codes.txt`：唯一盯盘股票文件。
-- `watch_codes_premarket.txt`：盘前推荐专用股票文件，只给推荐提醒使用，不参与自动下单。
+默认组合和四类策略都在 `alpaca_ma5_service/workflows/monitoring/intraday.py` 顶部配置区选择；根目录 `monitor_ma5_forever.py` 的点击运行/PyCharm 运行方式不变：
+
+```python
+STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
+WATCHLIST_STRATEGY_NAME = STRATEGY_NAME
+BUY_STRATEGY_NAME = STRATEGY_NAME
+SELL_STRATEGY_NAME = DEFAULT_SELL_STRATEGY_NAME
+CANCEL_STRATEGY_NAME = DEFAULT_CANCEL_STRATEGY_NAME
+```
+
+- `STRATEGY_NAME` 是基础组合，提供四类组件和止损/止盈等运行默认值。
+- 四个分类变量可以独立覆盖基础组合；例如 WatchCode 用缺口策略、买入仍用 MA5。
+- `watchcode_ma5.py`、`monitor_auto.py` 和盘中监控共用 `build_monitor_settings()`，不会再分别硬编码两套策略。
+- 所有名称会在行情、账户和订单 I/O 之前统一解析；名称不存在、接口不完整或组合缺组件时直接终止。
+- 也可通过 `.env` 的 `STRATEGY_PROFILE`、`WATCHLIST_STRATEGY`、`BUY_STRATEGY`、`SELL_STRATEGY`、`CANCEL_STRATEGY` 配置；入口显式配置优先。
+- 新策略实现和注册方法见 [`docs/architecture/STRATEGY_FRAMEWORK.md`](docs/architecture/STRATEGY_FRAMEWORK.md)。
+
+## 入口与目录
+
+根目录中的 Python 文件全部是薄运行入口；实现、配置和运行数据分别进入对应目录：
+
+```text
+项目根目录
+├─ monitor_*.py / watchcode_*.py / run_backtest*.py  # 公开运行入口
+├─ open_daily_review.py / open_daily_review.cmd       # 复盘入口
+├─ alpaca_ma5_service/
+│  ├─ workflows/          # 监控、WatchCode、复盘编排
+│  ├─ strategy_framework/ # 四类策略组件和组合
+│  └─ *.py                # 核心服务、行情、Broker、复盘 API
+├─ backtest/
+│  ├─ runners/            # 回测命令实现
+│  ├─ reporting/          # 通用交互式报告模型、模板和静态资源
+│  └─ *.py                # 回测引擎和数据模块
+├─ data/watchcodes/       # 三个时段的 WatchCode 运行数据
+├─ tools/                 # 运维、自检和任务脚本
+├─ tests/                 # 回归测试
+└─ docs/                  # 架构与运行手册
+```
+
+先按目的找入口：
+
+| 目的 | 打开 |
+| --- | --- |
+| 全天自动运行 | `monitor_auto.py` |
+| 只运行盘中监控 | `monitor_ma5_forever.py` |
+| 配置盘中策略 | `alpaca_ma5_service/workflows/monitoring/intraday.py` |
+| 生成盘中 WatchCode | `watchcode_ma5.py` |
+| 查看每日复盘 | `open_daily_review.cmd` |
+| 新增或组合策略 | `alpaca_ma5_service/strategy_framework/` |
+| 找到买入、卖出、撤单真实执行代码 | `docs/architecture/TRADE_ORDER_FLOW.md` |
+| 运行历史回测 | `run_backtest_*.py` |
+
+- `data/watchcodes/watch_codes.txt`：唯一盘中盯盘股票文件。
+- `data/watchcodes/watch_codes_premarket.txt`：盘前推荐专用股票文件，只给推荐提醒使用，不参与自动下单。
 - `watchcode_afterhours.py`：点击运行，生成盘后监控股票池。
 - `monitor_afterhours.py`：点击运行，自动生成盘后股票池并持续监控价格提醒，不提交买单或卖单。
 - `watchcode_premarket.py`：点击运行，生成最近已收盘交易日涨幅前 50 的盘前推荐股票池。
-- `monitor_premarket_ma5.py`：点击运行，盘前监控 `watch_codes_premarket.txt`，靠近动态 MA5 时发送云端推荐提醒，不下单。
+- `monitor_premarket_ma5.py`：点击运行，盘前监控 `data/watchcodes/watch_codes_premarket.txt`，靠近动态 MA5 时发送云端推荐提醒，不下单。
 - `monitor_ma5_forever.py`：MA5 持续轮询工具。
+- `alpaca_ma5_service/strategy_framework/`：四类策略组件、profile、契约、注册表、运行时解析和扩展注册入口。
 - `monitor_auto.py`：每天自动监控的单一入口，自动检查当前是盘前、盘中还是盘后，缺 watchcode 时先生成，再运行对应监控。
-- `watchcode_ma5.py`：用 Alpaca 日线数据生成 `watch_codes.txt`。
+- `watchcode_ma5.py`：用 Alpaca 日线数据生成 `data/watchcodes/watch_codes.txt`。
 - `watchcode_chart.py`：按文件顶部 `CHART_SESSION` 选择盘前/盘中/盘后 watchcode，单独刷新同款 HTML 图表，不重新筛选股票。
 - `tools/start_ma5_monitor_pycharm_gui.ps1`：通过 PyCharm GUI 和 `.venv` 兜底启动 `monitor_auto.py` 单一入口。
 - `tools/start_ma5_watchcode_pycharm_gui.ps1`：通过 PyCharm GUI 和 `.venv` 兜底生成盘中与盘前 watchcode。
@@ -55,7 +134,7 @@
 - `tools/run_test_order.py`：提交一笔很小的 Alpaca 限价测试单，限价为当前价的 90%。
 - `tools/run_self_tests.py`：运行本地测试。
 - `tools/check_alpaca_connection.py`：检查 Alpaca API key 是否能连通。
-- `monitor_ma5_forever.py`：持续监控的常用运行参数都在文件顶部配置区改，不用命令行参数。
+- `alpaca_ma5_service/workflows/monitoring/intraday.py`：持续监控的常用运行参数都在文件顶部配置区改，不用命令行参数。
 - `outputs/orders_YYYY-MM-DD.csv`：订单记录。
 - `open_daily_review.cmd`：双击打开“MA5 每日复盘”网页；服务只读，不会下单或修改观察池。
 
@@ -145,7 +224,7 @@ MOOMOO_PORT=11111
 
 监控实时价格会连接本机 Moomoo OpenD，请先启动并登录 OpenD，确认 API 端口是 `11111`。
 
-5. 编辑 `watch_codes.txt`，一行一个代码，例如：
+5. 编辑 `data/watchcodes/watch_codes.txt`，一行一个代码，例如：
 
 ```text
 US.AAPL
@@ -172,11 +251,11 @@ NVDA
 ```
 
 只筛选 Alpaca `US_EQUITY` 里的常规普通股；会排除权证、单位、优先股、ETF/基金、ADR/ADS、纯 5 字母 ticker，以及 `Class B`/`Series` 等特殊股本类别。
-当前 `ma5_dip` 筛选规则：最近一个已收盘交易日涨幅必须达到运行配置的阈值，并高于信号日 `MA5` 涨幅；信号日收盘价仍须位于 `MA5` 上方，但不再要求 `MA5 > MA10 > MA20`。`MA5`、`MA10`、`MA20` 仍会计算并写入候选 CSV 和图表，供诊断与复盘使用。
+当前 `ma5_dip` 筛选规则：最近一个已收盘交易日涨幅必须达到运行配置的阈值，并高于信号日 `MA5` 涨幅；信号日收盘价必须比包含该日收盘价计算的当日 `MA5` 至少高 15 个点（`close/MA5 >= 1.15`），但不要求 `MA5 > MA10 > MA20`。`MA5`、`MA10`、`MA20` 仍会计算并写入候选 CSV 和图表，供诊断与复盘使用。
 默认日线优先使用 Alpaca `sip` 全市场历史数据，并自动避开最近 15 分钟权限限制；读取失败时降级到 `iex`。
 候选诊断会写入 `outputs/watch_candidates_YYYY-MM-DD.csv`。
 
-只按当前 `watch_codes.txt` 重新制图，不重新筛选股票：
+只按当前 `data/watchcodes/watch_codes.txt` 重新制图，不重新筛选股票：
 
 ```powershell
 .\.venv\Scripts\python.exe watchcode_chart.py
@@ -258,9 +337,9 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 
 安装后会注册三个任务：
 
-- `AlpacaMA5-2200-GenerateWatchcode-PyCharm`：每天本地时间 `22:00` 打开 PyCharm 到 `watchcode_ma5.py`，同时用 `.venv` 直接运行 `watchcode_ma5.py` 和 `watchcode_premarket.py`，生成 `watch_codes.txt` 与 `watch_codes_premarket.txt`。
+- `AlpacaMA5-2200-GenerateWatchcode-PyCharm`：每天本地时间 `22:00` 打开 PyCharm 到 `watchcode_ma5.py`，同时用 `.venv` 直接运行 `watchcode_ma5.py` 和 `watchcode_premarket.py`，生成 `data/watchcodes/watch_codes.txt` 与 `data/watchcodes/watch_codes_premarket.txt`。
 - `AlpacaMA5-0050-EnsureMonitor-PyCharm`：每天本地时间 `00:50` 检查 `monitor_auto.py` 是否已运行；如果没有，就打开 PyCharm 到该文件，同时用 `.venv` 直接启动单一入口，并打开一个 UTF-8 日志跟随窗口显示输出。
-- `AlpacaMA5-0400-HealthCheck-PyCharm`：每天本地时间 `04:00` 再检查 `monitor_auto.py` 是否运行，并检查 `watch_codes.txt` 与 `watch_codes_premarket.txt` 是否足够新；如果监控缺失或 watchcode 过旧，就调用现有脚本重新启动/重新生成。
+- `AlpacaMA5-0400-HealthCheck-PyCharm`：每天本地时间 `04:00` 再检查 `monitor_auto.py` 是否运行，并检查 `data/watchcodes/watch_codes.txt` 与 `data/watchcodes/watch_codes_premarket.txt` 是否足够新；如果监控缺失或 watchcode 过旧，就调用现有脚本重新启动/重新生成。
 
 每个任务真正执行前都会先做交易日判断：`22:00` 生成 watchcode 检查“明天”是否为美股交易日；`00:50` 启动监控和 `04:00` 健康检查检查“今天”是否为美股交易日。若目标日期是周末或节假日，任务会写日志并正常退出，不生成、不启动、不报失败。
 
@@ -272,7 +351,7 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 
 盘前推荐是独立提醒链路，不会提交 Alpaca 订单：
 
-- 先运行 `watchcode_premarket.py`，按最近已收盘交易日涨幅排序，写出前 50 到 `watch_codes_premarket.txt`。
+- 先运行 `watchcode_premarket.py`，按最近已收盘交易日涨幅排序，写出前 50 到 `data/watchcodes/watch_codes_premarket.txt`。
 - 再运行 `monitor_premarket_ma5.py`，只在盘前 `04:00-09:30 ET` 发送云端提醒；到 `09:30 ET` 自动退出。
 - 提醒条件：盘前当前价相对最近已收盘日收盘价跌幅至少 `15%`，且当前价在动态 MA5 上方 `0%` 到 `3%` 内；同一股票同一天按 `3%/2%/1%/0%` 距离档位去重，价格更靠近 MA5 时可再次提醒。
 
@@ -284,9 +363,39 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 - 其他买入路径若需要盘前/盘后保护限价，则为当前价上浮 `0.3%`
 - 非止损盘前/盘后卖出限价 = 当前价下浮 `0.3%`
 
-这些参数在 `monitor_ma5_forever.py` 文件顶部的配置区里改。
+这些参数在 `alpaca_ma5_service/workflows/monitoring/intraday.py` 文件顶部的配置区里改。
 真实监控链路也会在订单提交后最多等待 `order_cancel_after_seconds=600` 秒（10 分钟）；未完全成交时自动请求取消订单。被 Alpaca 拒单不占用每日买入名额，只累计到该股票自己的三次错误保护；未确认撤单或撤单失败仍按风险占用，防止同一轮继续重复买入。
 常规盘按 `regular_poll_seconds=10` 秒轮询；盘前/盘后通常使用 `idle_poll_seconds`，临近 9:30 ET 会自动缩短等待时间。盘中监控到 `16:00 ET` 自动退出。
+
+## 两年全普通股日线数据
+
+使用专用入口重建 `backtest/data/market_data.sqlite`：
+
+```powershell
+.\.venv\Scripts\python.exe run_backtest_daily_history_rebuild.py --start-date 2024-07-17 --end-date 2026-07-16
+```
+
+数据来自 Alpaca SIP，周期为 `1Day`、`split` 复权，保存 OHLC、成交量、VWAP、成交笔数、时间戳和 MA5/10/20。股票池合并当前 active/inactive US equity，先排除 ETF、ETN、权证、权利、单位、优先股、债券、基金、SPAC、非经营性 Trust、结构化证券、OTC 和测试证券，再纳入 NYSE/NASDAQ/AMEX 上其余上市股；不要求证券名称必须显式包含 `Common Stock`。正式库不写入一分钟数据。
+
+以后所有依赖日线的回测均优先读取正式库 `backtest/data/market_data.sqlite`。正式库覆盖不足时必须明确报出缺口；不得静默切换到其他日线库，也不得把分钟线写入正式库。需要分钟数据的策略使用独立分钟缓存。
+
+任务先写 `backtest/data/market_data.sqlite.rebuild`；全部批次下载并校验通过后先备份旧 SQLite，再原子替换正式库。当前证券目录不是权威历史时点主表，因此虽包含 inactive/退市候选，仍不能视为完全消除幸存者偏差。详细替换和校验规则见 [`docs/PROJECT_OPERATIONS.md`](docs/PROJECT_OPERATIONS.md)。
+
+## 通用交互式回测报告
+
+标准回测引擎生成的 HTML 由 `backtest/reporting/` 统一渲染。主报告可直接打开；包含权益曲线、数据可靠性门禁、股票搜索与盈亏筛选、按股票交易轮次、买入日前后日 K、MA5/MA10/MA20、成交量、事件轨、深链和手机布局。逐股证据默认按每只股票最近一次交易时间从新到旧排列，也可以一键切换为最早优先；搜索和筛选不会打乱当前时间顺序。日 K 买卖箭头以实际成交日期和成交价为锚点，并同时显示成交价位于实体、上下影线或日 K 区间外的核验结果；轮次已实现收益和该股票累计收益分开显示。
+
+点击日 K 或事件日期可下钻当天 1 分钟 K，买卖点按完整成交时间和成交价标注。分钟行情按股票写入 `symbol_details/*.minute.js` 并在用户下钻时按需加载，以免把全部分钟数据塞进主 HTML；缺少当天或成交时刻分钟 K 时明确提示，不回退日期，也不把成交点吸附到相邻 K 线。新回测只需把结果适配成 `InteractiveReportDocument`，无需复制整套 HTML/CSS/JavaScript。
+
+报告是历史研究证据，不连接 Paper/Live 账户，也不会提交或取消订单。Plotly 图表默认通过 CDN 加载；网络不可用时，表格和文字证据仍可阅读。
+
+## 信号日强势 + 动态 MA5 回测
+
+双击或在 PyCharm 运行 `run_backtest_signal_dynamic_ma5.py`。策略先从正式全普通股日线库筛选：信号日 `MA5 > MA10 > MA20`、涨幅严格大于 `10%`、阳线实体严格大于 `10%`；下一交易日开盘价相对信号日收盘价严格上涨后，才进入动态 MA5 观察。
+
+买入日的动态 MA5 定义为“前 4 个已完成交易日收盘价 + 当前已完成 1 分钟 K 线收盘价”除以 5。只有当前已完成 1 分钟 K 线收盘价小于或等于动态 MA5，且相对买入日开盘价跌幅严格大于 `15%` 时才触发；为避免前视，统一在下一根 1 分钟 K 线开盘成交，且该实际入场价相对买入日开盘价的跌幅仍须严格大于 `15%`。实际成交时间必须满足 `09:30 <= t < 12:00 ET`，12:00 ET 及以后禁止买入；全天未达到条件就不买。盈利 `5% / 10% / 15%` 时各卖出原始仓位的 `1/3`，亏损 `10%` 清仓，剩余仓位在常规盘最后一分钟收盘清仓；同一分钟同时触发止损和止盈时按止损优先。
+
+候选日分钟线只从 Alpaca SIP 读取并保存到独立缓存 `backtest/data/signal_dynamic_ma5_minute_cache.sqlite`，不会写入正式日线库。结果写入 `backtest/output/signal_dynamic_ma5/`。默认每个候选独立使用 `$10,000` 名义本金、零佣金和零滑点，因此汇总盈亏不是受资金容量与并发持仓约束的组合收益。该入口只读历史行情，不读取账户、持仓或订单，也不启动监控与 WatchCode。
 
 ## 切换 Paper / Live
 
@@ -298,3 +407,15 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 - Alpaca Trading API: https://docs.alpaca.markets/docs/trading-api
 - Alpaca Orders: https://docs.alpaca.markets/docs/working-with-orders
 - Alpaca extended-hours orders: https://docs.alpaca.markets/docs/orders-at-alpaca
+
+# 日内动态涨幅榜回测网页
+
+新增的独立历史研究模块位于 [`intraday_top20`](intraday_top20/README.md)。它实现动态盘中 Top N、VWAP/SMA 状态机、下一根五分钟 K 线成交、成交量参与率、成本、尾盘/停牌处理、稳健性测试和 Streamlit 多页面报告，不连接账户或订单接口。
+
+启动：
+
+```powershell
+.\.venv\Scripts\python.exe -m streamlit run intraday_top20\app.py
+```
+
+仓库当前只附带明确标记的合成验收数据，不能据此判断策略真实收益；真实数据字段、证券主表、拆股表和可信度门禁见模块 README。

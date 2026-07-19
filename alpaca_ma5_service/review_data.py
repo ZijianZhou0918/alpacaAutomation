@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ast
 import csv
-import json
 import re
 import threading
 from collections import Counter, defaultdict
@@ -13,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
+from .paths import intraday_monitor_config_path
 from .trading_calendar import offline_trading_day_decision
 
 
@@ -160,7 +160,7 @@ def build_daily_review(
     afterhours_candidates = _read_csv(afterhours_candidates_path)
     exclusions = _read_csv(exclusion_path)
     local_orders, local_file_state = _load_local_orders(local_orders_path)
-    strategy_config = _read_runtime_config(root / "monitor_ma5_forever.py")
+    strategy_config = _read_runtime_config(intraday_monitor_config_path(root))
     required_drop = abs(float(strategy_config.get("MA5_MAX_BUY_TODAY_CURRENT_GAIN_PCT", -0.12)))
     candidate_symbols = _candidate_symbols(intraday_candidates, parsed)
     premarket_symbols = _candidate_symbols(premarket_candidates, parsed, phase="premarket")

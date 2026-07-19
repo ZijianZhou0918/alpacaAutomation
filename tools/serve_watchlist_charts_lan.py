@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 import urllib.parse
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -139,11 +138,11 @@ def refresh_chart_page(settings, *, require_existing: bool, result: dict | None 
 
 
 def settings_for_watch_file(settings, file_name: str):
-    """把 watch_codes_file 切到项目根目录下的指定文件名。"""
+    """Switch watch_codes_file within the canonical WatchCode data directory."""
     name = (file_name or "watch_codes.txt").strip()
     path = Path(name)
     if path.name != name or path.is_absolute():
-        raise ValueError(f"file_name 只能是项目根目录下的文件名：{file_name}")
+        raise ValueError(f"file_name 只能是 WatchCode 数据目录下的文件名：{file_name}")
     return replace(settings, watch_codes_file=settings.watch_codes_file.with_name(name))
 
 

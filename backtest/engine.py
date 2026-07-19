@@ -20,10 +20,10 @@ from alpaca_ma5_service.errors import short_error
 from alpaca_ma5_service.market_time import is_buy_order_time, is_realtime_order_time
 from alpaca_ma5_service.models import MarketSnapshot, Position
 from alpaca_ma5_service.service import buy_limit_price_from_signal, is_stop_loss_signal, stop_loss_limit_price_from_signal
-from alpaca_ma5_service.strategy import evaluate_buy, evaluate_sell, evaluate_stop_loss, evaluate_take_profit_remainder_stop
+from alpaca_ma5_service.strategy_framework import resolve_strategy_runtime
 from alpaca_ma5_service.watchlist import normalize_symbol, to_alpaca_symbol
 from alpaca_ma5_service.watchlist_generator import DailyBar
-from backtest.data_cache import ADJUSTMENT_SPLIT, MarketDataCache
+from backtest.data_cache import ADJUSTMENT_SPLIT, MarketDataCache, normalize_symbols
 from backtest.daily_sources import (
     MASSIVE_DAILY_ADJUSTMENT,
     MASSIVE_DAILY_FEED,
@@ -42,6 +42,12 @@ from backtest.daily_sources import (
     fetch_yahoo_daily_bars_with_failures,
     filter_daily_bars_to_dates,
     merge_daily_bars,
+)
+from backtest.reporting import (
+    InteractiveReportDocument,
+    ReportBadge,
+    ReportSection,
+    render_interactive_report,
 )
 
 
@@ -107,6 +113,8 @@ class BacktestConfig:
     strategy_variant_name: str = "baseline_current"
     strategy_variant_description: str = "当前 monitor 对齐策略"
     optimization_rules: dict[str, object] = field(default_factory=dict)
+    require_daily_cache_coverage: bool = False
+    data_cache_read_only: bool = False
 
 
 @dataclass
@@ -213,7 +221,7 @@ def run_backtest(
     if config.start_date > config.end_date:
         raise ValueError("start_date must be <= end_date.")
 
-    scan_symbols = normalized_alpaca_symbols(config.symbols)
+    scan_symbols = normalize_symbols(config.symbols)
     if not scan_symbols:
         raise ValueError("At least one symbol is required.")
 
@@ -251,7 +259,7 @@ def run_backtest(
         write_trade_csv(config.output_dir, result.trades)
         report_path = result.report_path
         if config.html_report_name:
-            report_path = write_html_report(result, daily_bars)
+            report_path = write_html_report(result, daily_bars, bars_by_symbol)
         return BacktestResult(
             config=result.config,
             stats=result.stats,
@@ -274,6 +282,7 @@ class BacktestSimulator:
         historical_watchlists: dict[str, list[str]] | None = None,
     ):
         self.config = config
+        self.strategy_runtime = resolve_strategy_runtime(config.strategy_settings)
         self.symbols = symbols
         self.bars_by_symbol = bars_by_symbol
         self.daily_bars = daily_bars
@@ -388,7 +397,7 @@ class BacktestSimulator:
         if not passes_optimization_buy_filters(snapshot, bar.timestamp, self.config.optimization_rules):
             return
 
-        signal = evaluate_buy(snapshot)
+        signal = self.strategy_runtime.buy.evaluate(snapshot)
         if signal.diagnostics.get("daily_buy_exclusion") == "ma5_touch_without_required_drop":
             self.daily_buy_exclusions[bar.timestamp.date()].add(normalized)
             return
@@ -411,15 +420,27 @@ class BacktestSimulator:
             return
 
         strategy_position = position.to_strategy_position()
-        signal = evaluate_sell(strategy_position, snapshot, bar.timestamp, self.config.strategy_settings) if in_watchlist else evaluate_stop_loss(strategy_position, snapshot, self.config.strategy_settings)
+        signal = (
+            self.strategy_runtime.sell.evaluate(
+                strategy_position, snapshot, bar.timestamp, self.config.strategy_settings
+            )
+            if in_watchlist
+            else self.strategy_runtime.sell.evaluate_stop_loss(
+                strategy_position, snapshot, self.config.strategy_settings
+            )
+        )
         half_profit_done = in_watchlist and position.symbol in self.daily_half_sells.setdefault(bar.timestamp.date(), set())
         if half_profit_done:
             if signal.action == "SELL_HALF":
-                signal = evaluate_take_profit_remainder_stop(strategy_position, snapshot, self.config.strategy_settings)
+                signal = self.strategy_runtime.sell.evaluate_take_profit_remainder_stop(
+                    strategy_position, snapshot, self.config.strategy_settings
+                )
                 if signal.action == "HOLD":
                     return
             elif signal.action == "HOLD":
-                signal = evaluate_take_profit_remainder_stop(strategy_position, snapshot, self.config.strategy_settings)
+                signal = self.strategy_runtime.sell.evaluate_take_profit_remainder_stop(
+                    strategy_position, snapshot, self.config.strategy_settings
+                )
         if signal.action not in {"SELL_ALL", "SELL_HALF"}:
             return
 
@@ -599,7 +620,11 @@ class BacktestSimulator:
         if day_key in self.watchlist_by_day:
             return self.watchlist_by_day[day_key]
         now_et = datetime.combine(day, time(9, 30), tzinfo=self.market_tz)
-        candidates = watchlist_module.screen_candidates(self.daily_bars, now_et)
+        candidates = watchlist_module.screen_candidates(
+            self.daily_bars,
+            now_et,
+            rules=self.strategy_runtime.watchlist.screen_rules(),
+        )
         symbols = [normalize_symbol(candidate.symbol) for candidate in candidates]
         self.watchlist_by_day[day_key] = symbols
         return symbols
@@ -677,6 +702,13 @@ def fetch_backtest_daily_bars(config: BacktestConfig, symbols: list[str]) -> dic
         feed=feed_key,
         adjustment=adjustment_key,
     )
+    if missing and config.require_daily_cache_coverage:
+        preview = ", ".join(missing[:10])
+        raise RuntimeError(
+            "Official daily database coverage gap: "
+            f"symbols={len(missing)} sample=[{preview}] "
+            f"range={start_date}->{end_date_exclusive} cache={cache.path}"
+        )
     if missing:
         print(f"Daily cache miss: symbols={len(missing)} cache={cache.path}", flush=True)
         fetched = fetch_backtest_daily_bars_from_source(config, missing, requested_start, request_end)
@@ -1417,7 +1449,10 @@ def fetch_minute_bars_for_range(
 
 
 def market_data_cache(config: BacktestConfig) -> MarketDataCache:
-    return MarketDataCache(config.data_cache_dir / config.data_cache_name)
+    return MarketDataCache(
+        config.data_cache_dir / config.data_cache_name,
+        read_only=config.data_cache_read_only,
+    )
 
 
 def daily_cache_feed(config: BacktestConfig) -> str:
@@ -1534,17 +1569,6 @@ def buy_day_open_below_signal_reference(snapshot: MarketSnapshot) -> bool:
     return snapshot.today_open < reference_price
 
 
-def normalized_alpaca_symbols(symbols: list[str]) -> list[str]:
-    seen: set[str] = set()
-    out: list[str] = []
-    for symbol in symbols:
-        alpaca_symbol = to_alpaca_symbol(symbol)
-        if alpaca_symbol and alpaca_symbol not in seen:
-            seen.add(alpaca_symbol)
-            out.append(alpaca_symbol)
-    return out
-
-
 def apply_buy_slippage(price: float, slippage_pct: float) -> float:
     return round(price * (1.0 + slippage_pct), 4)
 
@@ -1619,6 +1643,23 @@ def traded_symbols(trades: list[TradeRecord]) -> list[str]:
     return out
 
 
+def traded_symbols_by_latest_activity(trades: list[TradeRecord]) -> list[str]:
+    """Return traded symbols ordered by their most recent trade, newest first."""
+
+    latest_by_symbol: dict[str, datetime] = {}
+    for trade in trades:
+        symbol = to_alpaca_symbol(trade.symbol)
+        if not symbol:
+            continue
+        latest = latest_by_symbol.get(symbol)
+        if latest is None or trade.timestamp > latest:
+            latest_by_symbol[symbol] = trade.timestamp
+    return sorted(
+        latest_by_symbol,
+        key=lambda symbol: (-latest_by_symbol[symbol].timestamp(), symbol),
+    )
+
+
 def chronological_trades(trades: list[TradeRecord]) -> list[TradeRecord]:
     side_rank = {"BUY": 0, "SELL": 1}
     return sorted(
@@ -1656,10 +1697,11 @@ def sample_price_points(bars_by_symbol: dict[str, list[MinuteBar]], config: Back
 @contextmanager
 def patched_strategy_params(config: BacktestConfig):
     originals: list[tuple[object, str, object]] = []
-    with strategy_module.use_strategy(config.strategy_name):
+    runtime = resolve_strategy_runtime(config.strategy_settings)
+    with strategy_module.use_strategy(runtime.selection.buy_strategy_name):
         targets = [
             (watchlist_module, config.watchlist_signal_params),
-            (strategy_module.active_buy_module(), config.buy_signal_params),
+            (runtime.buy.legacy_module(), config.buy_signal_params),
         ]
         try:
             for module, params in targets:
@@ -1718,149 +1760,371 @@ def write_trade_csv(output_dir: Path, trades: list[TradeRecord]) -> Path:
     return path
 
 
-def write_html_report(result: BacktestResult, daily_bars: dict[str, list[DailyBar]]) -> Path:
+def write_html_report(
+    result: BacktestResult,
+    daily_bars: dict[str, list[DailyBar]],
+    minute_bars_by_symbol: dict[str, list[MinuteBar]] | None = None,
+) -> Path:
     config = result.config
     config.output_dir.mkdir(parents=True, exist_ok=True)
     detail_dir = config.output_dir / "symbol_details"
     detail_dir.mkdir(parents=True, exist_ok=True)
-    for old_detail in detail_dir.glob("*.html"):
-        old_detail.unlink()
-    write_symbol_detail_reports(result, daily_bars, detail_dir)
+    for pattern in ("*.html", "*.minute.js"):
+        for old_detail in detail_dir.glob(pattern):
+            old_detail.unlink()
+    write_symbol_detail_reports(result, daily_bars, detail_dir, minute_bars_by_symbol)
     path = config.output_dir / config.html_report_name
-    path.write_text(render_html(result), encoding="utf-8")
+    path.write_text(render_html(result, daily_bars, minute_bars_by_symbol), encoding="utf-8")
     return path
 
 
-def render_html(result: BacktestResult) -> str:
+def _render_html_v1(result: BacktestResult, daily_bars: dict[str, list[DailyBar]] | None = None) -> str:
     stats = result.stats
     equity_rows = [
         {"timestamp": point.timestamp.isoformat(timespec="minutes"), "equity": round(point.equity, 2), "cash": round(point.cash, 2)}
         for point in result.equity_curve
     ]
-    payload = json.dumps({"equity": equity_rows}, ensure_ascii=False)
-    return f"""<!doctype html>
+    detail_payload = {
+        to_alpaca_symbol(symbol): build_symbol_detail_payload(symbol, result, daily_bars or {})
+        for symbol in traded_symbols(result.trades)
+    }
+    payload = json_for_html({"equity": equity_rows, "details": detail_payload})
+    cache_path = result.config.data_cache_dir / result.config.data_cache_name
+    generated_at = datetime.now().astimezone().isoformat(timespec="minutes")
+    template = """<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>策略回测报告</title>
+  <title>__TITLE__ · 2026 回测</title>
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
   <style>
-    body {{ font-family: Arial, "Microsoft YaHei", sans-serif; margin: 24px; color: #18202a; }}
-    h1, h2 {{ margin: 0 0 12px; }}
-    section {{ margin: 28px 0; }}
-    table {{ border-collapse: collapse; width: 100%; font-size: 13px; }}
-    th, td {{ border: 1px solid #d7dde6; padding: 7px 8px; text-align: right; }}
-    th {{ background: #f3f6fa; }}
-    td:first-child, th:first-child {{ text-align: left; }}
-    .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }}
-    .metric {{ border: 1px solid #d7dde6; padding: 12px; border-radius: 6px; }}
-    .metric strong {{ display: block; font-size: 20px; margin-top: 6px; }}
-    .chart {{ min-height: 420px; border: 1px solid #d7dde6; border-radius: 6px; }}
-    .detail-button {{ border: 0; background: transparent; color: #0f5f9f; cursor: pointer; padding: 0; font: inherit; }}
-    .detail-button:hover {{ text-decoration: underline; }}
-    .sort-button {{ border: 1px solid #c8d0dc; background: #fff; border-radius: 4px; padding: 3px 8px; cursor: pointer; font: inherit; line-height: 1.2; }}
-    .sort-button:hover {{ background: #eaf2fb; }}
-    .modal {{ position: fixed; inset: 0; z-index: 9999; display: none; background: rgba(10, 18, 30, 0.62); }}
-    .modal.open {{ display: block; }}
-    .modal-panel {{ position: absolute; inset: 4vh 4vw; background: #fff; border-radius: 8px; display: flex; flex-direction: column; overflow: hidden; }}
-    .modal-header {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid #d7dde6; }}
-    .modal-header strong {{ font-size: 16px; }}
-    .modal-actions {{ display: flex; align-items: center; gap: 8px; }}
-    .modal-back {{ border: 1px solid #c8d0dc; background: #fff; border-radius: 4px; padding: 5px 10px; cursor: pointer; font-size: 14px; line-height: 1.2; }}
-    .modal-back:hover {{ background: #f3f6fa; }}
-    .modal-close {{ border: 1px solid #c8d0dc; background: #fff; border-radius: 4px; padding: 4px 9px; cursor: pointer; font-size: 18px; line-height: 1; }}
-    .modal-frame {{ border: 0; width: 100%; height: 100%; flex: 1; }}
-    a {{ color: #0f5f9f; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    .note {{ color: #5d6876; font-size: 13px; }}
-    @media (max-width: 720px) {{
-      body {{ margin: 12px; }}
-      .modal-panel {{ inset: 0; border-radius: 0; }}
-      table {{ font-size: 12px; }}
-    }}
+    :root {
+      --ink: #f4f1e8; --muted: #9ca7ad; --panel: #11171b; --panel-2: #171f24;
+      --line: #2a353b; --amber: #ffb547; --cyan: #4dd7e5; --red: #ff6577;
+      --green: #50d890; --paper: #090d10; --shadow: 0 22px 70px rgba(0,0,0,.42);
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--paper); scroll-behavior: smooth; }
+    body { margin: 0; color: var(--ink); background:
+      linear-gradient(rgba(77,215,229,.032) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(77,215,229,.032) 1px, transparent 1px), var(--paper);
+      background-size: 32px 32px; font-family: Inter, "Segoe UI", "Microsoft YaHei", sans-serif; }
+    button, input { font: inherit; }
+    button:focus-visible, input:focus-visible, a:focus-visible { outline: 2px solid var(--cyan); outline-offset: 3px; }
+    .skip-link { position: fixed; left: 16px; top: -60px; z-index: 10000; background: var(--amber); color: #111; padding: 10px 14px; }
+    .skip-link:focus { top: 12px; }
+    .shell { width: min(1500px, calc(100% - 40px)); margin: 0 auto; padding-bottom: 72px; }
+    .hero { min-height: 50vh; display: grid; align-content: end; padding: 72px 0 40px; border-bottom: 1px solid var(--line); }
+    .eyebrow, .label, th { font-family: "Cascadia Mono", Consolas, monospace; letter-spacing: .08em; text-transform: uppercase; }
+    .eyebrow { color: var(--amber); font-size: 12px; }
+    h1 { font-size: clamp(40px, 7vw, 94px); max-width: 1100px; line-height: .92; letter-spacing: -.055em; margin: 18px 0 24px; overflow-wrap: anywhere; }
+    h2 { font-size: clamp(23px, 3vw, 38px); letter-spacing: -.025em; margin: 0; }
+    h3 { margin: 0; }
+    .lede { max-width: 920px; color: #c3ccd0; font-size: 16px; line-height: 1.7; margin: 0; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 26px; }
+    .chip { border: 1px solid var(--line); background: rgba(17,23,27,.8); color: var(--muted); padding: 7px 10px; font: 12px "Cascadia Mono", Consolas, monospace; }
+    .chip strong { color: var(--ink); font-weight: 500; }
+    section { padding: 44px 0; border-bottom: 1px solid var(--line); }
+    .section-head { display: flex; justify-content: space-between; align-items: end; gap: 24px; margin-bottom: 24px; }
+    .section-no { color: var(--cyan); font: 12px "Cascadia Mono", Consolas, monospace; }
+    .note { color: var(--muted); font-size: 13px; line-height: 1.65; }
+    .callout { display: grid; grid-template-columns: auto 1fr; gap: 14px; border-left: 3px solid var(--amber); background: linear-gradient(90deg, rgba(255,181,71,.12), transparent); padding: 18px 20px; margin-top: 24px; }
+    .callout b { color: var(--amber); font: 12px "Cascadia Mono", Consolas, monospace; }
+    .grid { display: grid; grid-template-columns: repeat(7, minmax(140px, 1fr)); gap: 1px; background: var(--line); border: 1px solid var(--line); }
+    .metric { background: var(--panel); padding: 18px; min-height: 116px; color: var(--muted); font: 11px "Cascadia Mono", Consolas, monospace; }
+    .metric strong { display: block; margin-top: 20px; color: var(--ink); font: 600 22px Inter, "Segoe UI", sans-serif; letter-spacing: -.03em; }
+    .chart { min-height: 440px; border: 1px solid var(--line); background: var(--panel); }
+    .table-wrap { overflow: auto; border: 1px solid var(--line); background: var(--panel); }
+    table { border-collapse: collapse; width: 100%; font-size: 13px; }
+    th, td { border-bottom: 1px solid var(--line); padding: 11px 12px; text-align: right; white-space: nowrap; }
+    th { position: sticky; top: 0; z-index: 1; color: var(--muted); background: #131b20; font-size: 10px; }
+    td:first-child, th:first-child { text-align: left; }
+    tbody tr { transition: background-color .12s ease; }
+    tbody tr:hover { background: rgba(77,215,229,.05); }
+    a, .detail-button { color: var(--cyan); }
+    a { text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    .detail-button { border: 0; background: transparent; cursor: pointer; padding: 0; font-weight: 700; }
+    .sort-button, .ghost-button, .window-tab { border: 1px solid var(--line); background: var(--panel-2); color: var(--ink); padding: 7px 10px; cursor: pointer; }
+    .sort-button:hover, .ghost-button:hover, .window-tab:hover, .window-tab.active { border-color: var(--cyan); color: var(--cyan); }
+    .toolbar { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+    .search { width: min(420px, 100%); border: 1px solid var(--line); background: var(--panel); color: var(--ink); padding: 11px 13px; }
+    .search::placeholder { color: #6f7c82; }
+    .modal { position: fixed; inset: 0; z-index: 9999; display: none; place-items: center; padding: 24px; background: rgba(2,5,7,.88); backdrop-filter: blur(8px); }
+    .modal.open { display: grid; }
+    .modal-panel { width: min(1480px, 100%); height: min(920px, calc(100vh - 48px)); background: var(--panel); border: 1px solid #3b484f; box-shadow: var(--shadow); display: flex; flex-direction: column; overflow: hidden; }
+    .modal-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+    .modal-header strong { font-size: 17px; }
+    .modal-actions, .window-tabs { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .modal-body { min-height: 0; flex: 1; display: grid; grid-template-columns: minmax(230px, 290px) 1fr; }
+    .detail-aside { overflow: auto; border-right: 1px solid var(--line); padding: 18px; background: #0d1316; }
+    .detail-main { overflow: auto; padding: 18px; }
+    .event-rail { position: relative; margin: 22px 0 26px 7px; padding-left: 22px; }
+    .event-rail::before { content: ""; position: absolute; left: 3px; top: 7px; bottom: 8px; width: 1px; background: var(--line); }
+    .event { position: relative; margin-bottom: 18px; }
+    .event::before { content: ""; position: absolute; left: -23px; top: 5px; width: 9px; height: 9px; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 0 4px #0d1316; }
+    .event.signal::before { background: var(--amber); }
+    .event.sell::before { background: var(--red); }
+    .event span { display: block; color: var(--muted); font: 10px "Cascadia Mono", Consolas, monospace; }
+    .event strong { font-size: 13px; }
+    .window-tabs { margin-bottom: 14px; }
+    .window-tab { font: 11px "Cascadia Mono", Consolas, monospace; }
+    .detail-chart { min-height: 590px; }
+    .detail-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border: 1px solid var(--line); margin-bottom: 14px; }
+    .detail-stat { background: #0f161a; padding: 12px; color: var(--muted); font-size: 11px; }
+    .detail-stat strong { display: block; color: var(--ink); font-size: 15px; margin-top: 5px; }
+    .direct-link { display: inline-block; margin-top: 12px; font-size: 12px; }
+    .empty { padding: 28px; color: var(--muted); }
+    @media (max-width: 1100px) { .grid { grid-template-columns: repeat(4, 1fr); } }
+    @media (max-width: 760px) {
+      .shell { width: min(100% - 22px, 1500px); }
+      .hero { min-height: auto; padding-top: 44px; }
+      .grid { grid-template-columns: repeat(2, 1fr); }
+      .section-head, .toolbar { align-items: stretch; flex-direction: column; }
+      .modal { padding: 0; }
+      .modal-panel { height: 100vh; border: 0; }
+      .modal-body { grid-template-columns: 1fr; overflow: auto; }
+      .detail-aside { border-right: 0; border-bottom: 1px solid var(--line); overflow: visible; }
+      .detail-main { overflow: visible; }
+      .detail-summary { grid-template-columns: repeat(2, 1fr); }
+      .detail-chart { min-height: 520px; }
+      th, td { padding: 10px 9px; }
+    }
+    @media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } * { transition: none !important; } }
   </style>
 </head>
 <body>
-  <h1>策略回测报告</h1>
-  <p class="note">交易信号仍基于 1Min K 线回放；主报告只展示汇总。点击股票代码用弹窗查看该股票信号日、买入日、卖出日周围的日 K 线。</p>
-  <section>
-    <h2>收益统计表</h2>
-    {stats_cards(stats, result.minute_bar_count)}
-    {stats_table(stats)}
-  </section>
-  <section>
-    <h2>时间顺序与收益核验</h2>
-    {chronology_audit_table(result)}
-  </section>
-  <section>
-    <h2>资金曲线</h2>
-    <div id="equity-chart" class="chart"></div>
-  </section>
-  <section>
-    <h2>股票 K 线详情</h2>
-    <p class="note">点击股票代码打开弹窗；详情页按每轮交易分段展示信号日、买入日、卖出日及周围日期的日 K 线，并标出买点和卖点。</p>
-    {symbol_detail_table(result.trades)}
-  </section>
-  <section>
-    <h2>每笔交易明细</h2>
-    {trades_table(result.trades)}
-  </section>
-  <section>
-    <h2>当前回测配置摘要</h2>
-    {config_table(result.config)}
-  </section>
+  <a class="skip-link" href="#main">跳到报告正文</a>
+  <div class="shell">
+    <header class="hero">
+      <div class="eyebrow">ALPACA / STRATEGY REPLAY / __DATE_RANGE__</div>
+      <h1>__TITLE__</h1>
+      <p class="lede">2026 年初至本地数据库最新完整交易日的历史回放。点击任意股票即可在本文件内联动查看信号日 → 买入 → 卖出的事件轨道、日 K、MA5 / MA10 / MA20、成交量和成交标记。</p>
+      <div class="chips">
+        <span class="chip">策略 <strong>__TITLE__</strong></span>
+        <span class="chip">日线 <strong>SQLite / 只读</strong></span>
+        <span class="chip">成交回放 <strong>1Min SIP / 内存</strong></span>
+        <span class="chip">生成 <strong>__GENERATED_AT__</strong></span>
+      </div>
+      <div class="callout"><b>DATA GATE</b><span class="note">日线信号来自 <strong>__CACHE_PATH__</strong>，正式库以只读模式打开；候选日 1 分钟行情只用于成交时序回放，不写回 SQLite。收益按 0 手续费、0 滑点计算；当前股票池并非历史逐日成分股，不能消除存续偏差。</span></div>
+    </header>
+    <main id="main">
+      <section>
+        <div class="section-head"><div><span class="section-no">01 / OUTCOME</span><h2>收益统计表</h2></div><p class="note">先看结果，再下钻到每一笔成交。</p></div>
+        __STATS_CARDS__
+        <div class="table-wrap">__STATS_TABLE__</div>
+      </section>
+      <section>
+        <div class="section-head"><div><span class="section-no">02 / EQUITY</span><h2>资金曲线</h2></div><p class="note">权益与现金可在图例中独立开关。</p></div>
+        <div id="equity-chart" class="chart"></div>
+      </section>
+      <section>
+        <div class="section-head"><div><span class="section-no">03 / EVIDENCE</span><h2>股票 K 线详情</h2></div><p class="note">所有成交股票的图表数据均已嵌入当前 HTML。</p></div>
+        <div class="toolbar">
+          <input id="symbol-search" class="search" type="search" autocomplete="off" placeholder="搜索股票代码…" aria-label="搜索股票代码">
+          <span id="symbol-count" class="note"></span>
+        </div>
+        <div class="table-wrap">__SYMBOL_TABLE__</div>
+      </section>
+      <section>
+        <div class="section-head"><div><span class="section-no">04 / LEDGER</span><h2>每笔交易明细</h2></div><p class="note">成交顺序、规则、信号日与已实现收益。</p></div>
+        <div class="table-wrap">__TRADES_TABLE__</div>
+      </section>
+      <section>
+        <div class="section-head"><div><span class="section-no">05 / AUDIT</span><h2>时间顺序与收益核验</h2></div><p class="note">现金流水、权益公式和收益率独立复算。</p></div>
+        <div class="table-wrap">__AUDIT_TABLE__</div>
+      </section>
+      <section>
+        <div class="section-head"><div><span class="section-no">06 / CONFIG</span><h2>当前回测配置摘要</h2></div><p class="note">用于复现本次结果的核心参数。</p></div>
+        <div class="table-wrap">__CONFIG_TABLE__</div>
+      </section>
+    </main>
+  </div>
   <div id="detail-modal" class="modal" aria-hidden="true">
-    <div class="modal-panel">
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="detail-modal-title">
       <div class="modal-header">
         <strong id="detail-modal-title">股票 K 线详情</strong>
         <div class="modal-actions">
-          <button id="detail-modal-back" class="modal-back" type="button">&#36820;&#22238;</button>
-          <button id="detail-modal-close" class="modal-close" type="button">×</button>
+          <button id="detail-modal-back" class="ghost-button" type="button">返回报告</button>
+          <button id="detail-modal-close" class="ghost-button" type="button" aria-label="关闭">关闭 ×</button>
         </div>
       </div>
-      <iframe id="detail-modal-frame" class="modal-frame" title="股票 K 线详情"></iframe>
+      <div class="modal-body">
+        <aside class="detail-aside">
+          <div class="label">EVENT RAIL</div>
+          <div id="detail-event-rail" class="event-rail"></div>
+          <p id="detail-note" class="note"></p>
+          <a id="detail-direct-link" class="direct-link" href="#" target="_blank" rel="noopener">单独打开此股票详情 ↗</a>
+        </aside>
+        <div class="detail-main">
+          <div id="detail-window-tabs" class="window-tabs"></div>
+          <div id="detail-summary" class="detail-summary"></div>
+          <div id="detail-chart" class="chart detail-chart"></div>
+        </div>
+      </div>
     </div>
   </div>
   <script>
-    const payload = {payload};
+    const payload = __PAYLOAD__;
     const equity = payload.equity;
-    Plotly.newPlot("equity-chart", [{{
+    const plotConfig = {responsive: true, displaylogo: false, modeBarButtonsToRemove: ["lasso2d", "select2d"]};
+    const baseLayout = {
+      paper_bgcolor: "#11171b", plot_bgcolor: "#11171b", font: {color: "#cbd4d8", family: "Inter, Segoe UI, sans-serif"},
+      margin: {t: 30, r: 24, b: 54, l: 68}, hovermode: "x unified",
+      xaxis: {gridcolor: "#263138", zerolinecolor: "#263138"},
+      yaxis: {gridcolor: "#263138", zerolinecolor: "#263138"}
+    };
+    Plotly.newPlot("equity-chart", [{
       x: equity.map(row => row.timestamp),
       y: equity.map(row => row.equity),
-      mode: "lines",
-      type: "scatter",
-      name: "Equity"
-    }}], {{margin: {{t: 28}}, yaxis: {{title: "USD"}}, xaxis: {{title: "Time"}}}}, {{responsive: true}});
+      mode: "lines", type: "scatter", name: "Equity",
+      line: {color: "#ffb547", width: 2.4}, fill: "tozeroy", fillcolor: "rgba(255,181,71,.08)"
+    }, {
+      x: equity.map(row => row.timestamp),
+      y: equity.map(row => row.cash),
+      mode: "lines", type: "scatter", name: "Cash",
+      line: {color: "#4dd7e5", width: 1.4, dash: "dot"}
+    }], {...baseLayout, yaxis: {...baseLayout.yaxis, title: "USD"}, xaxis: {...baseLayout.xaxis, title: "Time"}}, plotConfig);
 
     const modal = document.getElementById("detail-modal");
-    const modalFrame = document.getElementById("detail-modal-frame");
     const modalTitle = document.getElementById("detail-modal-title");
-    function closeDetailModal() {{
+    const directLink = document.getElementById("detail-direct-link");
+    let activeSymbol = "";
+    let activeWindow = 0;
+    let lastFocused = null;
+
+    function pctText(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? `${number >= 0 ? "+" : ""}${(number * 100).toFixed(2)}%` : "—";
+    }
+    function moneyText(value) {
+      const number = Number(value);
+      return Number.isFinite(number) ? new Intl.NumberFormat("en-US", {style: "currency", currency: "USD"}).format(number) : "—";
+    }
+    function escapeText(value) {
+      const node = document.createElement("span");
+      node.textContent = value == null ? "" : String(value);
+      return node.innerHTML;
+    }
+    function closeDetailModal() {
       modal.classList.remove("open");
       modal.setAttribute("aria-hidden", "true");
-      modalFrame.removeAttribute("src");
-    }}
-    document.querySelectorAll("[data-detail-url]").forEach(button => {{
-      button.addEventListener("click", () => {{
-        modalTitle.textContent = `${{button.dataset.symbol}} K 线详情`;
-        modalFrame.src = button.dataset.detailUrl;
-        modal.classList.add("open");
-        modal.setAttribute("aria-hidden", "false");
-      }});
-    }});
+      document.body.style.overflow = "";
+      if (lastFocused) lastFocused.focus();
+    }
+    function renderEventRail(windowData) {
+      const events = [];
+      if (windowData.signal_day) events.push({kind: "signal", label: "SIGNAL", value: windowData.signal_day});
+      if (windowData.buy_day) events.push({kind: "buy", label: "BUY", value: windowData.buy_day});
+      (windowData.sell_days || []).forEach(day => events.push({kind: "sell", label: "SELL", value: day}));
+      document.getElementById("detail-event-rail").innerHTML = events.map(event =>
+        `<div class="event ${event.kind}"><span>${event.label}</span><strong>${escapeText(event.value)}</strong></div>`
+      ).join("") || "<p class='note'>无事件日期。</p>";
+    }
+    function makeMaTrace(rows, key, name, color, dash) {
+      const values = rows.filter(row => Number.isFinite(Number(row[key])));
+      return {
+        x: values.map(row => row.timestamp), y: values.map(row => row[key]),
+        type: "scatter", mode: "lines", name, line: {color, width: name === "MA5" ? 2.4 : 1.4, dash},
+        hovertemplate: `${name}: %{y:.4f}<extra></extra>`
+      };
+    }
+    function renderDetailWindow(index) {
+      const detail = payload.details[activeSymbol];
+      const windowData = detail?.windows?.[index];
+      if (!windowData) return;
+      activeWindow = index;
+      document.querySelectorAll(".window-tab").forEach((tab, tabIndex) => tab.classList.toggle("active", tabIndex === index));
+      renderEventRail(windowData);
+      document.getElementById("detail-note").textContent = windowData.title;
+      const rows = windowData.bars || [];
+      const trades = windowData.trades || [];
+      const buys = trades.filter(row => row.side === "BUY");
+      const sells = trades.filter(row => row.side === "SELL");
+      const realized = sells.reduce((sum, row) => sum + Number(row.realized_pnl || 0), 0);
+      const firstBuy = buys[0];
+      document.getElementById("detail-summary").innerHTML = [
+        ["信号日", windowData.signal_day || "—"], ["买入价", firstBuy ? moneyText(firstBuy.price) : "—"],
+        ["已实现收益", moneyText(realized)], ["窗口日 K", String(rows.length)]
+      ].map(([label, value]) => `<div class="detail-stat">${label}<strong>${escapeText(value)}</strong></div>`).join("");
+      const traces = [{
+        x: rows.map(row => row.timestamp), open: rows.map(row => row.open), high: rows.map(row => row.high),
+        low: rows.map(row => row.low), close: rows.map(row => row.close), type: "candlestick", name: `${activeSymbol} 日K`,
+        increasing: {line: {color: "#ff6577"}, fillcolor: "rgba(255,101,119,.30)"},
+        decreasing: {line: {color: "#50d890"}, fillcolor: "rgba(80,216,144,.26)"},
+        hovertext: rows.map(row => `涨跌 ${pctText(row.daily_return_pct)}<br>VWAP ${row.vwap ?? "—"}`),
+        hoverinfo: "x+open+high+low+close+text"
+      },
+      makeMaTrace(rows, "ma5", "MA5", "#ffb547", "solid"),
+      makeMaTrace(rows, "ma10", "MA10", "#4dd7e5", "solid"),
+      makeMaTrace(rows, "ma20", "MA20", "#b894ff", "dot"),
+      {
+        x: rows.map(row => row.timestamp), y: rows.map(row => row.volume), type: "bar", name: "Volume",
+        yaxis: "y2", marker: {color: rows.map(row => row.close >= row.open ? "rgba(255,101,119,.36)" : "rgba(80,216,144,.32)")},
+        hovertemplate: "Volume: %{y:,.0f}<extra></extra>"
+      },
+      {
+        x: buys.map(row => row.timestamp), y: buys.map(row => row.price), mode: "markers+text", type: "scatter", name: "Buy",
+        text: buys.map(row => `BUY ${moneyText(row.price)}`), textposition: "top center", textfont: {color: "#4dd7e5"},
+        marker: {color: "#4dd7e5", size: 13, symbol: "triangle-up", line: {color: "#071013", width: 1}},
+        customdata: buys.map(row => [row.time, row.rule, row.signal_day]),
+        hovertemplate: "%{text}<br>%{customdata[0]}<br>%{customdata[1]}<br>Signal %{customdata[2]}<extra></extra>"
+      },
+      {
+        x: sells.map(row => row.timestamp), y: sells.map(row => row.price), mode: "markers+text", type: "scatter", name: "Sell",
+        text: sells.map(row => `SELL ${pctText(row.price_change_pct)}`), textposition: "bottom center", textfont: {color: "#ff6577"},
+        marker: {color: "#ff6577", size: 13, symbol: "triangle-down", line: {color: "#071013", width: 1}},
+        customdata: sells.map(row => [row.time, row.rule, row.realized_pnl]),
+        hovertemplate: "%{text}<br>%{customdata[0]}<br>%{customdata[1]}<br>PnL $%{customdata[2]:.2f}<extra></extra>"
+      }];
+      const signalShape = windowData.signal_day ? [{
+        type: "line", x0: windowData.signal_day, x1: windowData.signal_day, yref: "paper", y0: 0, y1: 1,
+        line: {color: "#ffb547", width: 1.2, dash: "dot"}
+      }] : [];
+      Plotly.react("detail-chart", traces, {
+        ...baseLayout, margin: {t: 34, r: 70, b: 62, l: 68},
+        xaxis: {...baseLayout.xaxis, type: "category", rangeslider: {visible: false}, tickangle: -25},
+        yaxis: {...baseLayout.yaxis, title: "Price", domain: [.27, 1]},
+        yaxis2: {title: "Volume", domain: [0, .17], gridcolor: "#263138", fixedrange: true},
+        legend: {orientation: "h", x: 0, y: 1.1}, shapes: signalShape,
+        annotations: windowData.signal_day ? [{
+          x: windowData.signal_day, y: 1, yref: "paper", text: "SIGNAL", showarrow: false,
+          xanchor: "left", yanchor: "bottom", font: {color: "#ffb547", size: 10}
+        }] : []
+      }, plotConfig);
+    }
+    function openDetail(button) {
+      activeSymbol = button.dataset.symbol;
+      const detail = payload.details[activeSymbol];
+      if (!detail) return;
+      lastFocused = button;
+      modalTitle.textContent = `${activeSymbol} / K 线证据`;
+      directLink.href = button.dataset.detailUrl;
+      const tabs = document.getElementById("detail-window-tabs");
+      tabs.innerHTML = detail.windows.map((windowData, index) =>
+        `<button class="window-tab" type="button" data-window-index="${index}">ROUND ${String(index + 1).padStart(2, "0")}</button>`
+      ).join("");
+      tabs.querySelectorAll("[data-window-index]").forEach(tab => tab.addEventListener("click", () => renderDetailWindow(Number(tab.dataset.windowIndex))));
+      modal.classList.add("open");
+      modal.setAttribute("aria-hidden", "false");
+      document.body.style.overflow = "hidden";
+      renderDetailWindow(0);
+      document.getElementById("detail-modal-close").focus();
+    }
+    document.querySelectorAll("[data-detail-url]").forEach(button => button.addEventListener("click", () => openDetail(button)));
     document.getElementById("detail-modal-back").addEventListener("click", closeDetailModal);
     document.getElementById("detail-modal-close").addEventListener("click", closeDetailModal);
-    modal.addEventListener("click", event => {{
+    modal.addEventListener("click", event => {
       if (event.target === modal) closeDetailModal();
-    }});
-    window.addEventListener("keydown", event => {{
+    });
+    window.addEventListener("keydown", event => {
       if (event.key === "Escape") closeDetailModal();
-    }});
+    });
 
     const realizedPnlSort = document.querySelector("[data-sort-realized-pnl]");
-    if (realizedPnlSort) {{
-      realizedPnlSort.addEventListener("click", () => {{
+    if (realizedPnlSort) {
+      realizedPnlSort.addEventListener("click", () => {
         const table = document.getElementById("trades-table");
         const tbody = table?.querySelector("tbody");
         if (!tbody) return;
@@ -1875,54 +2139,238 @@ def render_html(result: BacktestResult) -> str:
         realizedPnlSort.dataset.direction = nextDirection;
         realizedPnlSort.textContent = nextDirection === "desc" ? "已实现收益 ↓" : "已实现收益 ↑";
         realizedPnlSort.setAttribute("aria-label", nextDirection === "desc" ? "已按已实现收益从高到低排序" : "已按已实现收益从低到高排序");
-      }});
-    }}
+      });
+    }
+    const symbolSearch = document.getElementById("symbol-search");
+    const symbolRows = Array.from(document.querySelectorAll("#symbol-detail-table tbody tr"));
+    const symbolCount = document.getElementById("symbol-count");
+    function filterSymbols() {
+      const query = symbolSearch.value.trim().toUpperCase();
+      let visible = 0;
+      symbolRows.forEach(row => {
+        const matches = !query || row.dataset.symbol.includes(query);
+        row.hidden = !matches;
+        if (matches) visible += 1;
+      });
+      symbolCount.textContent = `${visible} / ${symbolRows.length} 只股票`;
+    }
+    symbolSearch.addEventListener("input", filterSymbols);
+    filterSymbols();
   </script>
 </body>
 </html>
 """
+    replacements = {
+        "__TITLE__": html.escape(result.config.strategy_variant_name),
+        "__DATE_RANGE__": f"{result.config.start_date} → {result.config.end_date}",
+        "__GENERATED_AT__": html.escape(generated_at),
+        "__CACHE_PATH__": html.escape(str(cache_path)),
+        "__STATS_CARDS__": stats_cards(stats, result.minute_bar_count),
+        "__STATS_TABLE__": stats_table(stats),
+        "__SYMBOL_TABLE__": symbol_detail_table(result.trades),
+        "__TRADES_TABLE__": trades_table(result.trades),
+        "__AUDIT_TABLE__": chronology_audit_table(result),
+        "__CONFIG_TABLE__": config_table(result.config),
+        "__PAYLOAD__": payload,
+    }
+    for token, value in replacements.items():
+        template = template.replace(token, value)
+    return template
 
 
-def write_symbol_detail_reports(result: BacktestResult, daily_bars: dict[str, list[DailyBar]], detail_dir: Path) -> None:
+def render_html(
+    result: BacktestResult,
+    daily_bars: dict[str, list[DailyBar]] | None = None,
+    minute_bars_by_symbol: dict[str, list[MinuteBar]] | None = None,
+) -> str:
+    """Adapt an engine result to the reusable interactive report document."""
+
+    stats = result.stats
+    equity_rows = [
+        {
+            "timestamp": point.timestamp.isoformat(timespec="minutes"),
+            "equity": round(point.equity, 2),
+            "cash": round(point.cash, 2),
+        }
+        for point in result.equity_curve
+    ]
+    detail_payload = {}
     for symbol in traded_symbols(result.trades):
-        detail_path = detail_dir / symbol_detail_filename(symbol)
-        detail_path.write_text(render_symbol_detail(symbol, result, daily_bars), encoding="utf-8")
-
-
-def symbol_detail_filename(symbol: str) -> str:
-    safe = to_alpaca_symbol(symbol).replace("/", "_").replace("\\", "_").replace(":", "_")
-    return f"{safe}.html"
-
-
-def symbol_detail_table(trades: list[TradeRecord]) -> str:
-    symbols = traded_symbols(trades)
-    if not symbols:
-        return "<p class='note'>本次回测没有成交股票。</p>"
-    rows = []
-    for symbol in symbols:
-        symbol_trades = [trade for trade in trades if to_alpaca_symbol(trade.symbol) == to_alpaca_symbol(symbol)]
-        buy_count = sum(1 for trade in symbol_trades if trade.side == "BUY")
-        sell_count = sum(1 for trade in symbol_trades if trade.side == "SELL")
-        realized = sum(trade.realized_pnl for trade in symbol_trades if trade.side == "SELL")
-        first_time = min(trade.timestamp for trade in symbol_trades).isoformat(timespec="minutes")
-        link = f"symbol_details/{html.escape(symbol_detail_filename(symbol))}"
-        label = html.escape(normalize_symbol(symbol))
-        rows.append(
-            "<tr>"
-            f"<td><button class='detail-button' type='button' data-symbol='{label}' data-detail-url='{link}'>{label}</button></td>"
-            f"<td>{buy_count}</td>"
-            f"<td>{sell_count}</td>"
-            f"<td>{html.escape(money(realized))}</td>"
-            f"<td>{html.escape(first_time)}</td>"
-            "</tr>"
+        alpaca_symbol = to_alpaca_symbol(symbol)
+        detail_payload[alpaca_symbol] = build_symbol_detail_payload(
+            symbol,
+            result,
+            daily_bars or {},
+            minute_bars_for_symbol(symbol, minute_bars_by_symbol),
         )
+    cache_path = result.config.data_cache_dir / result.config.data_cache_name
+    generated_at = datetime.now().astimezone().isoformat(timespec="minutes")
+    evidence_controls = (
+        "<div class='research-surface'>"
+        "<div class='research-toolbar'>"
+        "<input id='symbol-search' class='search' type='search' autocomplete='off' "
+        "placeholder='搜索股票代码…' aria-label='搜索股票代码'>"
+        "<div class='filter-group' role='group' aria-label='股票结果筛选'>"
+        "<button class='filter-chip active' type='button' data-symbol-filter='all' aria-pressed='true'>全部</button>"
+        "<button class='filter-chip' type='button' data-symbol-filter='profit' aria-pressed='false'>盈利</button>"
+        "<button class='filter-chip' type='button' data-symbol-filter='loss' aria-pressed='false'>亏损</button>"
+        "<button class='filter-chip' type='button' data-symbol-filter='multi' aria-pressed='false'>多轮交易</button>"
+        "</div>"
+        "<div class='research-sort-cluster'>"
+        "<button class='sort-button symbol-time-sort' type='button' data-sort-symbol-time data-direction='desc' "
+        "aria-label='当前按最近交易时间从新到旧排序'>最新优先 ↓</button>"
+        "<span id='symbol-count' class='note research-count' aria-live='polite'></span>"
+        "</div>"
+        "</div>"
+        f"<div class='table-wrap'>{symbol_detail_table(result.trades)}</div>"
+        "</div>"
+    )
+    sections = (
+        ReportSection(
+            section_id="outcome",
+            index_label="01 / OUTCOME",
+            nav_label="结果",
+            title="收益统计表",
+            note="先看结果，再下钻到每一笔成交。",
+            content_html=stats_cards(stats, result.minute_bar_count)
+            + f"<div class='table-wrap'>{stats_table(stats)}</div>",
+        ),
+        ReportSection(
+            section_id="equity",
+            index_label="02 / EQUITY",
+            nav_label="资金",
+            title="资金曲线",
+            note="权益与现金可在图例中独立开关。",
+            content_html="<div id='equity-chart' class='chart' aria-label='权益与现金曲线'></div>",
+        ),
+        ReportSection(
+            section_id="evidence",
+            index_label="03 / EVIDENCE",
+            nav_label="逐股证据",
+            title="股票 K 线详情",
+            note="默认按最近交易时间从新到旧排列；搜索、筛选后顺序保持不变，点击股票可查看完整 K 线证据。",
+            content_html=evidence_controls,
+        ),
+        ReportSection(
+            section_id="ledger",
+            index_label="04 / LEDGER",
+            nav_label="交易账本",
+            title="每笔交易明细",
+            note="成交顺序、规则、信号日与已实现收益。",
+            content_html=f"<div class='table-wrap'>{trades_table(result.trades)}</div>",
+        ),
+        ReportSection(
+            section_id="audit",
+            index_label="05 / AUDIT",
+            nav_label="核验",
+            title="时间顺序与收益核验",
+            note="现金流水、权益公式和收益率独立复算。",
+            content_html=f"<div class='table-wrap'>{chronology_audit_table(result)}</div>",
+        ),
+        ReportSection(
+            section_id="config",
+            index_label="06 / CONFIG",
+            nav_label="配置",
+            title="当前回测配置摘要",
+            note="用于复现本次结果的核心参数。",
+            content_html=f"<div class='table-wrap'>{config_table(result.config)}</div>",
+        ),
+    )
+    document = InteractiveReportDocument(
+        title=result.config.strategy_variant_name,
+        eyebrow=f"ALPACA / STRATEGY REPLAY / {result.config.start_date} → {result.config.end_date}",
+        lede=(
+            "历史回放研究工作台。可在同一文件内搜索每只成交股票，查看信号日、买入日、"
+            "卖出日、日 K、MA5 / MA10 / MA20、成交量与成交标记，并在多轮交易间快速切换。"
+        ),
+        badges=(
+            ReportBadge("策略", result.config.strategy_variant_name),
+            ReportBadge("日线", "SQLite / 只读"),
+            ReportBadge("成交回放", f"{result.config.timeframe} {result.config.data_feed.upper()}"),
+            ReportBadge("生成", generated_at),
+            ReportBadge("报告内核", "Interactive v2"),
+        ),
+        data_gate_title="DATA GATE",
+        data_gate_body=(
+            f"日线信号来自 {cache_path}，正式库按当前配置只读使用；候选分钟行情不写入正式日线库。"
+            f"收益按每单手续费 {money(result.config.commission_per_order)}、滑点 {pct(result.config.slippage_pct)} 计算；"
+            "当前股票池并非历史逐日成分股，不能完全消除存续偏差。"
+        ),
+        sections=sections,
+        datasets={"equity": equity_rows, "details": detail_payload},
+    )
+    return render_interactive_report(document)
+
+
+def json_for_html(value: object) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+
+
+def minute_bars_for_symbol(
+    symbol: str,
+    minute_bars_by_symbol: dict[str, list[MinuteBar]] | None,
+) -> list[MinuteBar]:
+    if not minute_bars_by_symbol:
+        return []
+    target = to_alpaca_symbol(symbol)
+    matching = [
+        bar
+        for source_symbol, bars in minute_bars_by_symbol.items()
+        if to_alpaca_symbol(source_symbol) == target
+        for bar in bars
+    ]
+    deduped = {bar.timestamp: bar for bar in matching}
+    return [deduped[timestamp] for timestamp in sorted(deduped)]
+
+
+def build_symbol_minute_payload(
+    symbol: str,
+    _trades: list[TradeRecord],
+    minute_bars: list[MinuteBar],
+) -> dict[str, object]:
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    days: dict[str, list[list[object]]] = {}
+    for bar in sorted(minute_bars, key=lambda item: item.timestamp):
+        day = bar.timestamp.date().isoformat()
+        days.setdefault(day, []).append(
+            [
+                bar.timestamp.isoformat(timespec="minutes"),
+                round(float(bar.open), 6),
+                round(float(bar.high), 6),
+                round(float(bar.low), 6),
+                round(float(bar.close), 6),
+            ]
+        )
+    return {
+        "symbol": alpaca_symbol,
+        "days": days,
+    }
+
+
+def render_symbol_minute_script(
+    symbol: str,
+    trades: list[TradeRecord],
+    minute_bars: list[MinuteBar],
+) -> str:
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    payload = json.dumps(
+        build_symbol_minute_payload(symbol, trades, minute_bars),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    symbol_key = json.dumps(alpaca_symbol)
     return (
-        "<table><thead><tr><th>股票</th><th>买入次数</th><th>卖出次数</th><th>已实现收益</th><th>首次交易时间</th></tr></thead>"
-        f"<tbody>{''.join(rows)}</tbody></table>"
+        "window.__BACKTEST_MINUTE_DETAILS__=window.__BACKTEST_MINUTE_DETAILS__||{};"
+        f"window.__BACKTEST_MINUTE_DETAILS__[{symbol_key}]={payload};\n"
     )
 
 
-def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[str, list[DailyBar]]) -> str:
+def build_symbol_detail_payload(
+    symbol: str,
+    result: BacktestResult,
+    daily_bars: dict[str, list[DailyBar]],
+    minute_bars: list[MinuteBar] | None = None,
+) -> dict[str, object]:
     normalized = normalize_symbol(symbol)
     alpaca_symbol = to_alpaca_symbol(symbol)
     symbol_trades = sorted(
@@ -1930,11 +2378,22 @@ def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[s
         key=lambda trade: trade.timestamp,
     )
     bars = sorted(daily_bars.get(alpaca_symbol, []), key=lambda bar: bar.date)
-    windows = symbol_trade_windows(normalized, symbol_trades, result.config)
-    payload = json.dumps(
-        [
+    bar_by_date = {bar.date: bar for bar in bars}
+    minute_bars = sorted(minute_bars or [], key=lambda bar: bar.timestamp)
+    minute_bar_by_time = {
+        bar.timestamp.isoformat(timespec="minutes"): bar
+        for bar in minute_bars
+    }
+    minute_bar_dates = {bar.timestamp.date() for bar in minute_bars}
+    windows = []
+    for window in symbol_trade_windows(normalized, symbol_trades, result.config):
+        window_trades = window["trades"]
+        windows.append(
             {
                 "title": window["title"],
+                "signal_day": window["signal_day"],
+                "buy_day": window["buy_day"],
+                "sell_days": window["sell_days"],
                 "bars": daily_bar_payloads(
                     bars,
                     sample_window_bars(
@@ -1944,12 +2403,114 @@ def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[s
                         result.config.report_max_points_per_series,
                     ),
                 ),
-                "trades": [trade_payload(trade) for trade in window["trades"]],
+                "trades": [
+                    trade_payload(
+                        trade,
+                        bar_by_date.get(trade.timestamp.date()),
+                        minute_bar_by_time.get(trade.timestamp.isoformat(timespec="minutes")),
+                        trade.timestamp.date() in minute_bar_dates,
+                    )
+                    for trade in window_trades
+                ],
+                "realized_pnl": round(
+                    sum(trade.realized_pnl for trade in window_trades if trade.side == "SELL"),
+                    2,
+                ),
             }
-            for window in windows
-        ],
-        ensure_ascii=False,
+        )
+    return {
+        "symbol": normalized,
+        "symbol_realized_pnl": round(
+            sum(trade.realized_pnl for trade in symbol_trades if trade.side == "SELL"),
+            2,
+        ),
+        "minute_days": sorted(
+            day.isoformat()
+            for day in minute_bar_dates
+        ),
+        "windows": windows,
+    }
+
+
+def write_symbol_detail_reports(
+    result: BacktestResult,
+    daily_bars: dict[str, list[DailyBar]],
+    detail_dir: Path,
+    minute_bars_by_symbol: dict[str, list[MinuteBar]] | None = None,
+) -> None:
+    for symbol in traded_symbols(result.trades):
+        minute_bars = minute_bars_for_symbol(symbol, minute_bars_by_symbol)
+        detail_path = detail_dir / symbol_detail_filename(symbol)
+        detail_path.write_text(render_symbol_detail(symbol, result, daily_bars, minute_bars), encoding="utf-8")
+        minute_path = detail_dir / symbol_minute_filename(symbol)
+        minute_path.write_text(
+            render_symbol_minute_script(symbol, result.trades, minute_bars),
+            encoding="utf-8",
+        )
+
+
+def symbol_detail_filename(symbol: str) -> str:
+    safe = to_alpaca_symbol(symbol).replace("/", "_").replace("\\", "_").replace(":", "_")
+    return f"{safe}.html"
+
+
+def symbol_minute_filename(symbol: str) -> str:
+    safe = to_alpaca_symbol(symbol).replace("/", "_").replace("\\", "_").replace(":", "_")
+    return f"{safe}.minute.js"
+
+
+def symbol_detail_table(trades: list[TradeRecord]) -> str:
+    symbols = traded_symbols_by_latest_activity(trades)
+    if not symbols:
+        return "<p class='note'>本次回测没有成交股票。</p>"
+    rows = []
+    for rank, symbol in enumerate(symbols, start=1):
+        symbol_trades = [trade for trade in trades if to_alpaca_symbol(trade.symbol) == to_alpaca_symbol(symbol)]
+        buy_count = sum(1 for trade in symbol_trades if trade.side == "BUY")
+        sell_count = sum(1 for trade in symbol_trades if trade.side == "SELL")
+        realized = sum(trade.realized_pnl for trade in symbol_trades if trade.side == "SELL")
+        latest_time = max(trade.timestamp for trade in symbol_trades).isoformat(timespec="minutes")
+        latest_label = latest_time.replace("T", " ")
+        link = f"symbol_details/{html.escape(symbol_detail_filename(symbol))}"
+        minute_link = f"symbol_details/{html.escape(symbol_minute_filename(symbol))}"
+        label = html.escape(normalize_symbol(symbol))
+        symbol_key = html.escape(to_alpaca_symbol(symbol))
+        rows.append(
+            f"<tr data-symbol='{symbol_key}' data-realized-pnl='{realized:.8f}' data-rounds='{buy_count}' "
+            f"data-latest-time='{html.escape(latest_time)}'>"
+            f"<td class='rank-cell' data-row-rank>{rank:02d}</td>"
+            f"<td class='symbol-cell'><button class='detail-button' type='button' data-symbol='{symbol_key}' "
+            f"data-detail-url='{link}' data-minute-url='{minute_link}' "
+            f"aria-label='打开 {label} 的 K 线和交易证据'>{label}</button></td>"
+            f"<td>{buy_count}</td>"
+            f"<td>{sell_count}</td>"
+            f"<td class='pnl-cell' data-tone='{'positive' if realized > 0 else 'negative' if realized < 0 else 'neutral'}'>"
+            f"{html.escape(money(realized))}</td>"
+            f"<td class='latest-time-cell'><time datetime='{html.escape(latest_time)}'>{html.escape(latest_label)}</time></td>"
+            "</tr>"
+        )
+    return (
+        "<table id='symbol-detail-table'><thead><tr><th class='rank-cell'>#</th><th>股票</th><th>买入次数</th>"
+        "<th>卖出次数</th><th>已实现收益</th><th>最近交易时间</th></tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody></table>"
     )
+
+
+def render_symbol_detail(
+    symbol: str,
+    result: BacktestResult,
+    daily_bars: dict[str, list[DailyBar]],
+    minute_bars: list[MinuteBar] | None = None,
+) -> str:
+    normalized = normalize_symbol(symbol)
+    alpaca_symbol = to_alpaca_symbol(symbol)
+    symbol_trades = sorted(
+        [trade for trade in result.trades if to_alpaca_symbol(trade.symbol) == alpaca_symbol],
+        key=lambda trade: trade.timestamp,
+    )
+    detail_payload = build_symbol_detail_payload(symbol, result, daily_bars, minute_bars)
+    payload = json_for_html(detail_payload["windows"])
+    minute_script = html.escape(symbol_minute_filename(symbol), quote=True)
     return f"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1978,9 +2539,10 @@ def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[s
 </head>
 <body>
   <h1>{html.escape(normalized)} K线详情</h1>
-  <p class="note">每张图对应一轮交易窗口：从买入信号日前后到买入/卖出日前后。K 线为日 K；买点/卖点标在成交日期上，涨跌幅按成交价计算。</p>
+  <p class="note">每张图对应一轮交易窗口：从买入信号日前后到买入/卖出日前后。K 线为日 K，并同时展示 MA5、MA10、MA20；买点/卖点标在成交日期上，涨跌幅按成交价计算。</p>
   {trades_table(symbol_trades)}
   <div id="charts"></div>
+  <script src="{minute_script}"></script>
   <script>
     const windows = {payload};
 
@@ -2010,6 +2572,8 @@ def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[s
       const buyRows = trades.filter(row => row.side === "BUY");
       const sellRows = trades.filter(row => row.side === "SELL");
       const ma5Rows = rows.filter(row => Number.isFinite(Number(row.ma5)));
+      const ma10Rows = rows.filter(row => Number.isFinite(Number(row.ma10)));
+      const ma20Rows = rows.filter(row => Number.isFinite(Number(row.ma20)));
       const traces = [{{
         x: rows.map(row => row.timestamp),
         open: rows.map(row => row.open),
@@ -2028,6 +2592,22 @@ def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[s
         name: "MA5",
         line: {{color: "#2563eb", width: 2}},
         hovertemplate: "MA5: %{{y:.4f}}<extra></extra>"
+      }}, {{
+        x: ma10Rows.map(row => row.timestamp),
+        y: ma10Rows.map(row => row.ma10),
+        mode: "lines",
+        type: "scatter",
+        name: "MA10",
+        line: {{color: "#06b6d4", width: 1.5}},
+        hovertemplate: "MA10: %{{y:.4f}}<extra></extra>"
+      }}, {{
+        x: ma20Rows.map(row => row.timestamp),
+        y: ma20Rows.map(row => row.ma20),
+        mode: "lines",
+        type: "scatter",
+        name: "MA20",
+        line: {{color: "#9333ea", width: 1.5, dash: "dot"}},
+        hovertemplate: "MA20: %{{y:.4f}}<extra></extra>"
       }}];
       traces.push({{
         x: buyRows.map(row => row.timestamp),
@@ -2060,6 +2640,10 @@ def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[s
         yaxis: {{title: "Price"}},
         xaxis: {{title: "Date", type: "category", rangeslider: {{visible: false}}, tickangle: -35, nticks: 8}},
         legend: {{orientation: "h", y: -0.22, x: 0}},
+        shapes: windowData.signal_day ? [{{
+          type: "line", x0: windowData.signal_day, x1: windowData.signal_day,
+          yref: "paper", y0: 0, y1: 1, line: {{color: "#f59e0b", width: 1.5, dash: "dot"}}
+        }}] : [],
         showlegend: true
       }}, {{responsive: true, displaylogo: false}});
     }}
@@ -2076,10 +2660,15 @@ def render_symbol_detail(symbol: str, result: BacktestResult, daily_bars: dict[s
 
 
 def daily_bar_payloads(all_bars: list[DailyBar], selected_bars: list[DailyBar]) -> list[dict[str, object]]:
-    ma5_by_date = daily_ma5_by_date(all_bars)
+    moving_averages = daily_mas_by_date(all_bars)
     rows: list[dict[str, object]] = []
+    ordered_bars = sorted(all_bars, key=lambda item: item.date)
+    previous_closes = {bar.date: previous for previous, bar in zip([None, *ordered_bars[:-1]], ordered_bars)}
     for bar in selected_bars:
-        ma5 = ma5_by_date.get(bar.date)
+        ma_values = moving_averages.get(bar.date, {})
+        previous_bar = previous_closes.get(bar.date)
+        previous_close = previous_bar.close if previous_bar is not None else None
+        daily_return_pct = (bar.close / previous_close - 1.0) if previous_close else None
         rows.append(
             {
                 "timestamp": bar.date.isoformat(),
@@ -2087,20 +2676,37 @@ def daily_bar_payloads(all_bars: list[DailyBar], selected_bars: list[DailyBar]) 
                 "high": round(bar.high, 4),
                 "low": round(bar.low, 4),
                 "close": round(bar.close, 4),
-                "ma5": round(ma5, 4) if ma5 is not None else None,
+                "volume": round(float(bar.volume), 2) if bar.volume is not None else None,
+                "vwap": round(float(bar.vwap), 4) if bar.vwap is not None else None,
+                "transactions": bar.transactions,
+                "daily_return_pct": round(daily_return_pct, 6) if daily_return_pct is not None else None,
+                "ma5": rounded_optional(ma_values.get(5)),
+                "ma10": rounded_optional(ma_values.get(10)),
+                "ma20": rounded_optional(ma_values.get(20)),
             }
         )
     return rows
 
 
 def daily_ma5_by_date(bars: list[DailyBar]) -> dict[date, float]:
+    return {bar_date: values[5] for bar_date, values in daily_mas_by_date(bars).items() if 5 in values}
+
+
+def daily_mas_by_date(bars: list[DailyBar], periods: tuple[int, ...] = (5, 10, 20)) -> dict[date, dict[int, float]]:
     closes: list[float] = []
-    out: dict[date, float] = {}
+    out: dict[date, dict[int, float]] = {}
     for bar in sorted(bars, key=lambda item: item.date):
         closes.append(bar.close)
-        if len(closes) >= 5:
-            out[bar.date] = sum(closes[-5:]) / 5.0
+        values: dict[int, float] = {}
+        for period in periods:
+            if len(closes) >= period:
+                values[period] = sum(closes[-period:]) / period
+        out[bar.date] = values
     return out
+
+
+def rounded_optional(value: float | None) -> float | None:
+    return round(value, 4) if value is not None else None
 
 
 def symbol_trade_windows(symbol: str, trades: list[TradeRecord], config: BacktestConfig) -> list[dict[str, object]]:
@@ -2118,14 +2724,32 @@ def symbol_trade_windows(symbol: str, trades: list[TradeRecord], config: Backtes
             event_dates.append(buy.signal_day)
         sell_dates = sorted({trade.timestamp.date().isoformat() for trade in related if trade.side == "SELL"})
         title = f"{symbol} | 信号日 {buy.signal_day or '-'} | 买入日 {buy.timestamp.date()} | 卖出日 {', '.join(sell_dates) if sell_dates else '-'}"
-        windows.append({"title": title, "event_dates": event_dates, "trades": related})
+        windows.append(
+            {
+                "title": title,
+                "signal_day": buy.signal_day.isoformat() if buy.signal_day else "",
+                "buy_day": buy.timestamp.date().isoformat(),
+                "sell_days": sell_dates,
+                "event_dates": event_dates,
+                "trades": related,
+            }
+        )
     if not windows and trades:
         for trade in trades:
             event_dates = [trade.timestamp.date()]
             if trade.signal_day is not None:
                 event_dates.append(trade.signal_day)
             title = f"{symbol} | {trade.side} {trade.timestamp.date()}"
-            windows.append({"title": title, "event_dates": event_dates, "trades": [trade]})
+            windows.append(
+                {
+                    "title": title,
+                    "signal_day": trade.signal_day.isoformat() if trade.signal_day else "",
+                    "buy_day": trade.timestamp.date().isoformat() if trade.side == "BUY" else "",
+                    "sell_days": [trade.timestamp.date().isoformat()] if trade.side == "SELL" else [],
+                    "event_dates": event_dates,
+                    "trades": [trade],
+                }
+            )
     return windows
 
 
@@ -2152,7 +2776,106 @@ def sample_window_bars(bars: list[DailyBar], event_dates: list[date], context_da
     return sampled
 
 
-def trade_payload(trade: TradeRecord) -> dict[str, object]:
+def trade_kline_location(
+    price: float,
+    bar: DailyBar | MinuteBar | None,
+    bar_label: str = "日 K",
+) -> dict[str, object]:
+    """Describe where an exact fill price sits on a matching candle."""
+    if bar is None:
+        return {
+            "matched": False,
+            "status": "missing",
+            "position": f"缺少对应{bar_label}",
+            "range_position_pct": None,
+            "open": None,
+            "high": None,
+            "low": None,
+            "close": None,
+        }
+
+    low = float(bar.low)
+    high = float(bar.high)
+    open_price = float(bar.open)
+    close = float(bar.close)
+    epsilon = max(abs(low), abs(high), 1.0) * 1e-9
+    if high > low:
+        range_position_pct = round((price - low) / (high - low) * 100.0, 1)
+    else:
+        range_position_pct = None
+
+    if price < low - epsilon:
+        status = "outside"
+        position = f"低于{bar_label} 最低价"
+    elif price > high + epsilon:
+        status = "outside"
+        position = f"高于{bar_label} 最高价"
+    elif math.isclose(price, high, rel_tol=0.0, abs_tol=epsilon):
+        status = "inside"
+        position = f"{bar_label} 最高点"
+    elif math.isclose(price, low, rel_tol=0.0, abs_tol=epsilon):
+        status = "inside"
+        position = f"{bar_label} 最低点"
+    elif math.isclose(high, low, rel_tol=0.0, abs_tol=epsilon):
+        status = "inside"
+        position = f"单价{bar_label}"
+    else:
+        body_low = min(open_price, close)
+        body_high = max(open_price, close)
+        if body_low - epsilon <= price <= body_high + epsilon:
+            status = "inside"
+            position = f"{bar_label} 实体"
+        elif price > body_high:
+            status = "inside"
+            position = "上影线"
+        else:
+            status = "inside"
+            position = "下影线"
+
+    return {
+        "matched": True,
+        "status": status,
+        "position": position,
+        "range_position_pct": range_position_pct,
+        "open": round(open_price, 4),
+        "high": round(high, 4),
+        "low": round(low, 4),
+        "close": round(close, 4),
+    }
+
+
+def trade_minute_kline_location(
+    trade: TradeRecord,
+    minute_bar: MinuteBar | None,
+    has_minute_bars_for_day: bool,
+) -> dict[str, object]:
+    if minute_bar is not None:
+        location = trade_kline_location(trade.price, minute_bar, "分钟 K")
+        return {
+            **location,
+            "exact": True,
+            "bar_time": minute_bar.timestamp.isoformat(timespec="minutes"),
+        }
+    position = (
+        "成交时刻缺少对应分钟 K（未吸附到相邻 K 线）"
+        if has_minute_bars_for_day
+        else "成交当天缺少分钟 K"
+    )
+    return {
+        **trade_kline_location(trade.price, None, "分钟 K"),
+        "status": "missing_time" if has_minute_bars_for_day else "missing_day",
+        "position": position,
+        "exact": False,
+        "bar_time": None,
+    }
+
+
+def trade_payload(
+    trade: TradeRecord,
+    daily_bar: DailyBar | None = None,
+    minute_bar: MinuteBar | None = None,
+    has_minute_bars_for_day: bool = False,
+) -> dict[str, object]:
     return {
         "timestamp": trade.timestamp.date().isoformat(),
         "time": trade.timestamp.isoformat(timespec="minutes"),
@@ -2164,20 +2887,29 @@ def trade_payload(trade: TradeRecord) -> dict[str, object]:
         "price_change_pct": round(trade.price_change_pct, 6),
         "rule": trade.rule,
         "signal_day": trade.signal_day.isoformat() if trade.signal_day else "",
+        "kline_location": trade_kline_location(trade.price, daily_bar),
+        "minute_kline_location": trade_minute_kline_location(
+            trade,
+            minute_bar,
+            has_minute_bars_for_day,
+        ),
     }
 
 
 def stats_cards(stats: BacktestStats, minute_bar_count: int) -> str:
     cards = [
-        ("最终权益", money(stats.final_equity)),
-        ("总收益", money(stats.total_return)),
-        ("收益率", pct(stats.return_pct)),
-        ("最大回撤", pct(stats.max_drawdown_pct)),
-        ("卖出/平仓次数", str(stats.sell_order_count)),
-        ("胜率", pct(stats.win_rate)),
-        ("1Min K线数量", f"{minute_bar_count:,}"),
+        ("最终权益", money(stats.final_equity), ""),
+        ("总收益", money(stats.total_return), "positive" if stats.total_return >= 0 else "negative"),
+        ("收益率", pct(stats.return_pct), "positive" if stats.return_pct >= 0 else "negative"),
+        ("最大回撤", pct(stats.max_drawdown_pct), "negative" if stats.max_drawdown_pct < 0 else ""),
+        ("卖出/平仓次数", str(stats.sell_order_count), ""),
+        ("胜率", pct(stats.win_rate), ""),
+        ("1Min K线数量", f"{minute_bar_count:,}", ""),
     ]
-    return '<div class="grid">' + "".join(f"<div class='metric'>{html.escape(label)}<strong>{html.escape(value)}</strong></div>" for label, value in cards) + "</div>"
+    return '<div class="grid">' + "".join(
+        f"<div class='metric' data-tone='{tone}'>{html.escape(label)}<strong>{html.escape(value)}</strong></div>"
+        for label, value, tone in cards
+    ) + "</div>"
 
 
 def stats_table(stats: BacktestStats) -> str:

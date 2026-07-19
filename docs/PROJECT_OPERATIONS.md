@@ -23,7 +23,8 @@
 ## 3. Python 环境与密钥
 
 - 默认解释器：`C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe`。
-- `.venv_corrupt_backup_20260715` 是旧损坏环境备份，不得作为运行或定时任务解释器。
+- 根目录 `monitor_*.py`、`watchcode_*.py`、`run_backtest*.py` 和 `open_daily_review.py` 只保留公开运行入口；实际编排分别位于 `alpaca_ma5_service/workflows/` 与 `backtest/runners/`。
+- 盘中可编辑运行参数位于 `alpaca_ma5_service/workflows/monitoring/intraday.py`；根目录 `monitor_ma5_forever.py` 继续作为点击运行入口。
 - `.env` 已被 `.gitignore` 排除。不得输出、复制、提交或在文档中记录真实 key。
 - 检查连接时只打印模式、账户状态和阻塞标志等非敏感信息；不要打印凭据或完整账户对象。
 - Moomoo 实时行情依赖本机 OpenD 时，应先确认 OpenD 已启动且端口与 `.env` 一致；行情源故障不能通过放宽下单保护来绕过。
@@ -31,13 +32,18 @@
 
 ## 4. WatchCode 的语义和生成顺序
 
+完整日流程图和入口导航见 [`architecture/PROJECT_FLOW.md`](architecture/PROJECT_FLOW.md)。最短链路是：
+
+`monitor_auto.py` → 交易日/时段 → 对应 WatchCode → 盘前提醒、盘中交易或盘后提醒 → 账本/通知/复盘。
+
 ### 文件职责
 
-- `watch_codes.txt`：盘中自动交易观察池，会参与盘中买入判断。
-- `watch_codes_premarket.txt`：盘前推荐观察池，只用于推荐提醒，不参与盘中自动买入。
-- `watch_code_afterhours.txt`：盘后策略观察池，必须按具体入口确认是提醒模式还是可下单模式。
+- `data/watchcodes/watch_codes.txt`：盘中自动交易观察池，会参与盘中买入判断。
+- `data/watchcodes/watch_codes_premarket.txt`：盘前推荐观察池，只用于推荐提醒，不参与盘中自动买入。
+- `data/watchcodes/watch_code_afterhours.txt`：盘后策略观察池，必须按具体入口确认是提醒模式还是可下单模式。
 - 这些文件是运行时产物，可能在工作区显示为已修改；没有用户要求时不要回滚、清空或用旧文件覆盖。
-- 当前 `watchcode_ma5.py` 使用的 `ma5_dip` 筛选不要求 `MA5 > MA10 > MA20`；三条均线仍会计算并写入候选报告和图表。
+- 默认 `ma5_dip` WatchCode 筛选要求信号日收盘价比包含该日收盘价计算的当日 `MA5` 至少高 15 个点（`close/MA5 >= 1.15`），但不要求 `MA5 > MA10 > MA20`；三条均线仍会计算并写入候选报告和图表。
+- `watchcode_ma5.py`、`monitor_auto.py` 和盘中监控必须共用 `alpaca_ma5_service.workflows.monitoring.intraday.build_monitor_settings()`；不得在生成器中另写固定策略名，避免观察池和实际买入策略静默漂移。
 
 ### 日期规则
 
@@ -55,6 +61,11 @@
 
 ## 5. 监控阶段与真实下单边界
 
+- 盘中外部入口固定为：`monitor_ma5_forever.py` → `workflows/monitoring/intraday.py` → `service.run_forever()` → `service.run_once()`。`run_once()` 内逐股直接执行 `check_buy → execute_buy → notify_buy → check_sell → execute_sell → notify_sell → check_cancel → execute_cancel → notify_cancel`，不再经过 `process_*` 中间编排。WatchCode 进入买入三阶段，券商全部持仓进入卖出三阶段；默认 Broker 提交后内部完成撤单/终态确认，服务层撤单三阶段只兜底自定义 Broker 返回的开放订单。四类实现目录见 `alpaca_ma5_service/strategy_framework/README.md`。
+- `alpaca_ma5_service/workflows/monitoring/intraday.py` 顶部先选择基础 `STRATEGY_NAME`，再分别选择 `WATCHLIST_STRATEGY_NAME`、`BUY_STRATEGY_NAME`、`SELL_STRATEGY_NAME` 和 `CANCEL_STRATEGY_NAME`。四类可以独立组合，空环境变量则继承 profile。
+- `.env` 可用 `STRATEGY_PROFILE`、`WATCHLIST_STRATEGY`、`BUY_STRATEGY`、`SELL_STRATEGY`、`CANCEL_STRATEGY`；入口显式值优先，旧 `strategy_name` 仍兼容为 profile 名。
+- 启动时必须先解析完整 profile 和四类策略；未知名称、重复注册、缺少接口或 profile 缺少组件时应在行情、账户和订单 I/O 前失败关闭。
+- 自定义实现只允许在 `alpaca_ma5_service/strategy_framework/extensions.py` 中显式、可信注册；禁止让 `.env` 或网页值成为任意 Python 导入路径。配置切换需重启对应运行进程。
 - `monitor_auto.py` 是统一自动入口，负责根据时间进入盘前、盘中或盘后阶段。
 - 盘前 `monitor_premarket_ma5.py` 是推荐提醒链路，不提交买单。
 - 盘中 `monitor_ma5_forever.py` 才会依据策略提交真实订单。
@@ -63,7 +74,13 @@
 - 休市日即使是周一到周五，也必须阻止盘前、盘中和盘后的下单窗口。
 - 自动买入使用最终买点作为 BUY LIMIT，不使用当前价追单。
 - 卖出风控会检查券商当前持仓，可能包含不在 WatchCode 中的手动持仓。
+- 每轮卖出前还会查询券商开放卖单；同一股票已有开放卖单，或查询失败无法确认时，本轮不得再次提交卖单。
 - 同一股票的拒单/错误保护、每日买入上限、未完成订单和重复订单保护不得在修复 UI 时绕开。
+- 默认自动撤单策略 `timeout_cancel_confirmed` 会按设置等待、请求撤单并复查最终订单状态；切换取消策略不得跳过最终状态确认或降低真实账户保护。
+- 部分成交后只要剩余数量尚未确认终态，仍按未确认订单处理；同一 `order_id` 的完整生命周期只计一次当日买入名额。
+- 订单提交后即使终态等待、撤单或本地 CSV 记录失败，也必须保留真实 `order_id` 并暂停后续自动买入。服务层只接受与原订单 `order_id`、方向和股票一致的撤单结果，不能用无归属的撤单错误解除暂停。
+- 真实订单使用唯一 `client_order_id`。提交超时或网络异常时先按该标识恢复券商订单；既无法恢复、又不能确认是明确拒单时，按 `SUBMIT_UNCONFIRMED` 暂停后续自动买入，不得盲目重试。
+- `DONE_FOR_DAY` 仍可能在下一交易日更新，`REPLACED` 表示暴露已经转移到替换订单；监控必须沿 `replaced_by` 跟踪当前订单，不能把两者当成安全终态。
 
 ## 6. 网页看板准则
 
@@ -159,3 +176,127 @@ git diff --check
 - Windows 定时任务名称、时间或目标日期。
 - 资金流水、盈亏和手动交易对账口径。
 - 测试、部署、重启或运行态验证命令。
+
+## 12. 两年全普通股日线 SQLite
+
+### 数据口径
+
+- 正式路径：`backtest/data/market_data.sqlite`；重建 staging：`backtest/data/market_data.sqlite.rebuild`。
+- 所有依赖日线的回测必须优先只读正式库。覆盖不足时必须明确报告缺口，不得静默切换到其他日线库；确需补数据时使用正式重建入口，或在用户明确授权后写入独立缓存。
+- 来源为 Alpaca Market Data SIP，周期 `1Day`，`split` 复权，字段包含 OHLC、volume、VWAP、transactions、timestamp 和 MA5/10/20。
+- 日期由 Alpaca calendar 和统一离线交易日历交叉校验，正式库只写 `daily_bars`，`minute_bars` 必须保持 0 行。
+- 统一离线日历包含 2025-01-09 全国哀悼日休市，且重建会与 Alpaca 日历交叉校验。
+- 股票池合并当前 Alpaca active/inactive US equity 快照，并用当前 Nasdaq Trader 的 ETF/Test Issue 和证券名称标记先排除 ETF、ETN、权证、权利、单位、优先股、债券、基金、SPAC、非经营性 Trust、结构化证券、OTC 和测试证券，再纳入 NYSE/NASDAQ/AMEX 上其余上市股。普通股名称不需要显式包含 `Common Stock`；REIT 和 Property Trust 作为经营性上市股保留。
+- 当前目录不是权威历史时点证券主表。inactive/退市候选会纳入，但不能宣称已彻底消除幸存者偏差；以 manifest 的 `survivorship_bias_fully_eliminated=false` 为准。
+
+### 重建和替换
+
+```powershell
+.\.venv\Scripts\python.exe run_backtest_daily_history_rebuild.py --start-date 2024-07-17 --end-date 2026-07-16
+```
+
+- 单个重建进程默认使用 4 路只读 HTTP 下载流，SQLite 写入保持串行；不得同时启动第二个回填、回测、构建或数据修复任务。
+- 每个股票批次完整下载后才写入 staging，并为全部候选（包括区间内没有返回日线的证券）记录 `daily` 覆盖范围。
+- 所有批次完成后核对 metadata、`daily_bars` 实际行数、交易日范围、OHLC、全股票池覆盖标记、空 `minute_bars` 和 `PRAGMA quick_check`。
+- 正式库已存在时先用 SQLite backup API 写入 `backtest/output/market_data_before_daily_replace_*.sqlite` 并校验，再用同卷原子替换 staging。
+- 完成后更新 `backtest/output/daily_history_rebuild_manifest.json` 和日志；manifest 固定记录 `timeframe=1Day`、`minute_rows=0` 和证券池局限。
+
+该入口只读取资产目录、交易日历和历史行情，不读取持仓、不查询或提交订单，也不启动 WatchCode、监控、网页或计划任务。全量回填属于重型任务，必须全局串行。
+
+## 13. 信号日强势 + 动态 MA5 回测
+
+入口：`run_backtest_signal_dynamic_ma5.py`。
+
+- 信号日使用正式日线库筛选全普通股：`MA5 > MA10 > MA20`，相对前收涨幅严格大于 `10%`，`close / open - 1` 严格大于 `10%` 且收阳。
+- 买入候选必须是全局下一交易日，并且该日正式日线开盘价相对信号日收盘价严格上涨；开盘涨幅等于或小于 0 时排除，缺失下一交易日日线时不得顺延到后续日期。
+- 动态 MA5 固定为“信号日及其之前共 4 个已完成交易日收盘价 + 当前已完成 1 分钟 K 线收盘价”除以 5。
+- 买入触发固定为当前已完成 1 分钟 K 线收盘价小于或等于动态 MA5，且该收盘价相对买入日开盘价跌幅严格大于 `15%`；等于 `15%`、高于动态 MA5 或全天未达到条件时不得买入。触发后在下一根真实 1 分钟 K 线开盘成交，且该实际入场价相对买入日开盘价跌幅仍须严格大于 `15%`；反弹后不满足时继续等待窗口内后续有效触发。实际成交时间必须满足 `09:30 <= t < 12:00 ET`；12:00 ET 及以后禁止买入，窗口内触发但缺少窗口内下一根真实分钟线时不得伪造成交。
+- 盈利 `5% / 10% / 15%` 各卖出原始仓位 `1/3`；亏损 `10%` 卖出全部剩余仓位；最后一根常规盘分钟线收盘卖出剩余仓位。同一分钟高低价同时触及止损和止盈时止损优先。
+- 正式 `backtest/data/market_data.sqlite` 全程只读且 `minute_bars` 必须保持 0 行。候选分钟线仅写入 `backtest/data/signal_dynamic_ma5_minute_cache.sqlite`，feed 固定 SIP、复权固定 `split`；SIP 失败必须中止，不得静默混入 IEX。
+- 输出固定为 `backtest/output/signal_dynamic_ma5/` 下的 JSON、CSV 和 HTML。默认每笔候选独立使用 `$10,000` 名义本金，佣金和滑点为 0；总盈亏不能描述为资金容量受限的组合收益。
+- 股票池虽包含重建时能识别的 active/inactive 普通股，仍不能宣称完全消除幸存者偏差。
+
+运行命令：
+
+```powershell
+.\.venv\Scripts\python.exe run_backtest_signal_dynamic_ma5.py
+```
+
+该入口只读取本地日线和历史 SIP 分钟行情；不得读取账户、持仓或订单，不得调用任何提交订单入口，也不启动 WatchCode、监控、网页或计划任务。分钟下载和回测属于重型任务，必须全局串行。
+
+最低验证：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_signal_dynamic_ma5_backtest -v
+```
+
+## 14. 日内动态涨幅榜回测网页
+
+### 边界
+
+- 源码、配置、测试和网页都在 `intraday_top20/`。
+- 该模块只读取本地历史行情，不需要项目 `.env`，不连接 Paper/Live 账户，也没有订单入口。
+- 它不复用或重启 review web、WatchCode 生成器、监控器和计划任务。对该模块的修改无需重启现有 MA5 服务。
+- 合成样例只用于功能验收。真实策略结论必须通过网页显示的数据可靠性门禁。
+
+### 安装、生成、回测和网页
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe -m intraday_top20.data.sample_data
+.\.venv\Scripts\python.exe -m intraday_top20.run_backtest --force
+.\.venv\Scripts\python.exe -m streamlit run intraday_top20\app.py
+```
+
+稳健性测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m intraday_top20.run_backtest --robustness
+```
+
+测试：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest intraday_top20\tests -q
+```
+
+回测、完整稳健性测试和完整测试均属于本机重型任务，必须服从全局串行和 heavy-task guard；不得与 Gradle、Android、Electron 构建或其他回测并发。
+
+### 数据和缓存
+
+- 默认配置：`intraday_top20/config/default_config.yaml`。
+- 真实行情目录由 `data.data_dir` 指定；文件名必须含交易日，字段、证券主表和拆股表格式见 `intraday_top20/README.md`。
+- `intraday_top20/example_data/` 和 `intraday_top20/outputs/` 是运行生成目录，已忽略。前者只放行情和证券参考数据；后者包含行情 Parquet 缓存、结果压缩 CSV、manifest、配置、日志和稳健性结果。
+- 参数不变且数据指纹不变时加载结果缓存；参数变化只重跑事件回测，清洗后的日行情缓存可以复用。
+
+### 最低运行验收
+
+1. 全部 `intraday_top20/tests` 通过，特别是动态排名、连续跌破、重新站上、下一根开盘、止盈半仓、15:55、成交量参与率、成本和停牌缺 K 线测试。
+2. CLI 基准回测成功保存结果，`future_data_used=false`，示例数据 `data_reliability_gate_passed=false`。
+3. 临时启动 Streamlit 后首页返回 HTTP 200；浏览器可见合成数据警示、Plotly 图和交易表。
+4. 验证完成只停止本次明确启动的 Streamlit 进程，不影响端口 8766/8788 或其他项目服务。
+5. 明确记录：没有读取账户，没有提交订单，没有修改 WatchCode、定时任务或现有服务。
+
+## 15. 通用交互式回测报告
+
+`backtest/reporting/` 是与具体策略解耦的报告能力。`InteractiveReportDocument` 只描述标题、徽标、数据门禁、章节和数据集；`renderer.py` 负责把模板、CSS、JavaScript 和转义后的 JSON 合并成可直接打开的主 HTML。`backtest/engine.py` 只负责把 `BacktestResult`、交易轮次和行情证据适配成该文档，新的历史研究模块也可以直接复用报告包而不依赖账户、订单或 MA5 实盘链路。大体量分钟行情按股票写入 `symbol_details/*.minute.js`，仅在日期下钻时加载，主 HTML 不嵌入全量分钟数据。
+
+当前交互报告提供：
+
+- 权益曲线、汇总统计、按股票证据、逐笔交易、审计和配置章节；
+- 股票搜索、盈利/亏损/多轮筛选、按已实现盈亏排序；
+- 逐股证据按每只股票最近一次交易时间默认从新到旧排列，可切换最早优先，筛选后保持当前时间顺序；
+- 买入日附近日 K、MA5/MA10/MA20、成交量、信号/买入/卖出事件轨；
+- 买卖箭头精确锚定成交日期和成交价，并给出成交价位于日 K 实体、影线、区间外或缺失的核验说明；
+- 轮次已实现收益与股票累计已实现收益并列展示，避免把单轮结果误认为股票总结果；
+- 点击日 K 或事件日期下钻当天 1 分钟 K，按完整成交时间和成交价标注买卖点；缺数据时不回退日期、不吸附相邻 K 线；
+- 多轮交易前后切换、URL 深链、键盘左右键、焦点管理、打印和窄屏布局；
+- Plotly 不可用时仍保留可读的表格和图表降级提示。
+
+报告层修改的最低验证：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_backtest_reporting tests.test_backtest.BacktestTests.test_symbol_detail_table_defaults_to_latest_activity_first tests.test_backtest.BacktestTests.test_backtest_reuses_strategy_and_writes_html_report -v
+```
+
+然后用真实浏览器至少检查一个桌面视口和一个手机视口，验证章节导航、筛选、股票详情、多轮切换、日 K 点击、分钟 K 按需加载、精确买卖标记、缺数状态、深链和键盘关闭。报告生成只处理历史结果，不读取账户、不提交订单，也不需要重启现有 review web、监控或 WatchCode 进程。

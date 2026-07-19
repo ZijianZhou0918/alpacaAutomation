@@ -14,10 +14,15 @@ ADJUSTMENT_SPLIT = "split"
 
 
 class MarketDataCache:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, read_only: bool = False):
         self.path = path
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._ensure_schema()
+        self.read_only = read_only
+        if self.read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"Read-only market data cache does not exist: {self.path}")
+        else:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._ensure_schema()
 
     def load_daily_bars(
         self,
@@ -61,6 +66,7 @@ class MarketDataCache:
         covered_symbols: list[str] | None = None,
         adjustment: str = ADJUSTMENT_SPLIT,
     ) -> None:
+        self._require_writable()
         feed_key = feed.lower()
         symbols = normalize_symbols(covered_symbols or list(bars_by_symbol))
         bar_symbols = normalize_symbols(list(bars_by_symbol))
@@ -150,6 +156,7 @@ class MarketDataCache:
         covered_symbols: list[str] | None = None,
         adjustment: str = ADJUSTMENT_SPLIT,
     ) -> None:
+        self._require_writable()
         feed_key = feed.lower()
         symbols = normalize_symbols(covered_symbols or list(bars_by_symbol))
         now = datetime.now(UTC).isoformat(timespec="seconds")
@@ -286,12 +293,21 @@ class MarketDataCache:
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.path)
+        if self.read_only:
+            uri = f"{self.path.resolve().as_uri()}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True)
+        else:
+            conn = sqlite3.connect(self.path)
         try:
             yield conn
-            conn.commit()
+            if not self.read_only:
+                conn.commit()
         finally:
             conn.close()
+
+    def _require_writable(self) -> None:
+        if self.read_only:
+            raise PermissionError(f"Market data cache is read-only: {self.path}")
 
     def _mark_ranges(
         self,

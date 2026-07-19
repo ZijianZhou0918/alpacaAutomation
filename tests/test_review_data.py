@@ -4,6 +4,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest import TestCase
 
+from alpaca_ma5_service.paths import intraday_monitor_config_path
 from alpaca_ma5_service.review_data import (
     ParsedMonitorLog,
     _build_attention,
@@ -36,7 +37,9 @@ class ReviewDataTests(TestCase):
     def make_root(self, root: Path) -> Path:
         (root / "outputs" / "logs").mkdir(parents=True)
         (root / "outputs" / "watchlist_charts").mkdir(parents=True)
-        (root / "monitor_ma5_forever.py").write_text(
+        config_path = intraday_monitor_config_path(root)
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(
             "BUY_STOCK_COUNT = 2\n"
             "BUY_NOTIONAL_USD = 2000.0\n"
             "MA5_MAX_BUY_TODAY_CURRENT_GAIN_PCT = -0.12\n"
@@ -246,7 +249,7 @@ class ReviewDataTests(TestCase):
     def test_timeline_uses_runtime_drop_threshold(self):
         with TemporaryDirectory() as temp:
             root = self.make_root(Path(temp))
-            (root / "monitor_ma5_forever.py").write_text(
+            intraday_monitor_config_path(root).write_text(
                 "BUY_STOCK_COUNT = 2\n"
                 "BUY_NOTIONAL_USD = 2000.0\n"
                 "MA5_MAX_BUY_TODAY_CURRENT_GAIN_PCT = -0.15\n"

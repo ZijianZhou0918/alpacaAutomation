@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="__LANGUAGE__" data-report-version="__REPORT_VERSION__">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' fill='%23ffb547'/><text x='5' y='22' font-size='17' font-family='monospace' fill='%23071013'>R²</text></svg>">
+  <title>__TITLE__ · 回测研究终端</title>
+  <style>__REPORT_STYLES__</style>
+  <script src="__PLOTLY_URL__"></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">跳到报告正文</a>
+  <div class="report-topbar">
+    <a class="report-brand" href="#report-top" aria-label="返回报告顶部">
+      <span class="brand-mark" aria-hidden="true">R²</span>
+      <span>Backtest research</span>
+    </a>
+    <nav class="report-nav" aria-label="报告章节">__REPORT_NAV__</nav>
+    <button id="print-report" class="topbar-action" type="button">打印 / PDF</button>
+  </div>
+
+  <div id="report-top" class="shell">
+    <header class="hero">
+      <div class="hero-index" aria-hidden="true">01—06</div>
+      <div class="eyebrow">__EYEBROW__</div>
+      <h1>__TITLE__</h1>
+      <p class="lede">__LEDE__</p>
+      <div class="chips">__BADGES__</div>
+      <div class="callout">
+        <b>__DATA_GATE_TITLE__</b>
+        <span class="note">__DATA_GATE_BODY__</span>
+      </div>
+    </header>
+    <main id="main">__SECTIONS__</main>
+  </div>
+
+  <div id="detail-modal" class="modal" aria-hidden="true">
+    <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="detail-modal-title">
+      <div class="modal-header">
+        <div>
+          <span class="modal-kicker">Symbol evidence</span>
+          <strong id="detail-modal-title">股票 K 线详情</strong>
+        </div>
+        <div class="modal-actions">
+          <button id="detail-copy-link" class="ghost-button" type="button">复制链接</button>
+          <button id="detail-modal-back" class="ghost-button" type="button">返回报告</button>
+          <button id="detail-modal-close" class="ghost-button" type="button" aria-label="关闭股票详情">关闭 ×</button>
+        </div>
+      </div>
+      <div class="modal-body">
+        <aside class="detail-aside">
+          <div class="label">EVENT RAIL</div>
+          <div id="detail-event-rail" class="event-rail"></div>
+          <p id="detail-note" class="note"></p>
+          <a id="detail-direct-link" class="direct-link" href="#" target="_blank" rel="noopener">单独打开此股票详情 ↗</a>
+        </aside>
+        <div class="detail-main">
+          <div class="round-toolbar">
+            <button id="round-prev" class="round-step" type="button" aria-label="上一轮交易">←</button>
+            <div id="detail-window-tabs" class="window-tabs" role="tablist" aria-label="交易轮次"></div>
+            <button id="round-next" class="round-step" type="button" aria-label="下一轮交易">→</button>
+          </div>
+          <div id="detail-summary" class="detail-summary"></div>
+          <div class="detail-drilldown">
+            <div class="detail-view-heading">
+              <span class="label">TIMEFRAME / DAY DRILLDOWN</span>
+              <strong id="detail-view-title">日 K 交易窗口</strong>
+            </div>
+            <button id="detail-daily-view" class="view-button active" type="button" aria-pressed="true">日 K 概览</button>
+            <div id="detail-day-tabs" class="day-tabs" role="group" aria-label="选择分钟 K 日期"></div>
+            <p id="detail-minute-status" class="note" aria-live="polite">点击日 K 或日期按钮查看当天分钟 K。</p>
+          </div>
+          <div id="detail-trade-locations" class="trade-locations" aria-label="成交点精确位置"></div>
+          <div id="detail-chart" class="chart detail-chart" aria-label="股票 K 线与交易标记图"></div>
+          <p class="chart-help">买卖箭头的尖端锚定真实成交日期/时间与成交价；点击日 K 可下钻至当天 1 分钟 K。分钟数据缺失时明确提示，不吸附到相邻 K 线。</p>
+        </div>
+      </div>
+      <div id="modal-status" class="sr-only" aria-live="polite"></div>
+    </div>
+  </div>
+
+  <script>window.__BACKTEST_REPORT__ = __REPORT_DATA__;</script>
+  <script>__REPORT_SCRIPT__</script>
+</body>
+</html>

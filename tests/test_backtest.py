@@ -5,6 +5,7 @@ from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import unittest
@@ -20,11 +21,17 @@ from backtest.data_repair import DataRepairConfig, run_data_repair
 from backtest.data_spotcheck import DataSpotcheckConfig, run_data_spotcheck
 from backtest.engine import (
     BacktestConfig,
+    TradeRecord,
+    build_symbol_detail_payload,
+    build_symbol_minute_payload,
     build_daily_bars,
     build_historical_watchlists,
     daily_request_end_date_exclusive,
+    fetch_backtest_daily_bars,
     fetch_candidate_day_minute_bars,
     run_backtest,
+    symbol_detail_table,
+    trade_kline_location,
 )
 from tests.test_strategy import make_settings
 
@@ -153,6 +160,124 @@ def clone_bars(symbol: str, bars: list[MinuteBar]) -> list[MinuteBar]:
 
 
 class BacktestTests(unittest.TestCase):
+    def test_symbol_detail_table_defaults_to_latest_activity_first(self):
+        timezone = ZoneInfo("America/New_York")
+
+        def trade(symbol: str, day: int, hour: int, side: str = "BUY") -> TradeRecord:
+            return TradeRecord(
+                timestamp=datetime(2026, 7, day, hour, 30, tzinfo=timezone),
+                symbol=symbol,
+                side=side,
+                quantity=1.0,
+                price=10.0,
+                gross_value=10.0,
+                fee=0.0,
+                cash_after=1_000.0,
+                realized_pnl=2.0 if side == "SELL" else 0.0,
+                reason="test",
+                rule="test",
+            )
+
+        content = symbol_detail_table(
+            [
+                trade("US.OLD", 1, 10),
+                trade("US.NEW", 15, 9),
+                trade("US.MID", 8, 11),
+                trade("US.NEW", 16, 14, "SELL"),
+            ]
+        )
+
+        self.assertLess(content.index("data-symbol='NEW'"), content.index("data-symbol='MID'"))
+        self.assertLess(content.index("data-symbol='MID'"), content.index("data-symbol='OLD'"))
+        self.assertIn("data-latest-time='2026-07-16T14:30-04:00'", content)
+        self.assertIn("最近交易时间", content)
+        self.assertIn("data-row-rank", content)
+
+    def test_symbol_detail_separates_round_and_cumulative_realized_pnl(self):
+        timezone = ZoneInfo("America/New_York")
+        first_day = date(2026, 4, 23)
+        second_day = date(2026, 7, 16)
+
+        def trade(day: date, at: time, side: str, price: float, realized_pnl: float = 0.0) -> TradeRecord:
+            return TradeRecord(
+                timestamp=datetime.combine(day, at, tzinfo=timezone),
+                symbol="US.NVNI",
+                side=side,
+                quantity=1.0,
+                price=price,
+                gross_value=price,
+                fee=0.0,
+                cash_after=1_000.0,
+                realized_pnl=realized_pnl,
+                reason="test",
+                rule="test",
+                signal_day=day - timedelta(days=1),
+            )
+
+        trades = [
+            trade(first_day, time(9, 53), "BUY", 1.41),
+            trade(first_day, time(15, 55), "SELL", 1.38, -74.46),
+            trade(second_day, time(9, 47), "BUY", 1.55),
+            trade(second_day, time(15, 55), "SELL", 1.575, 56.45),
+        ]
+        daily_bars = {
+            "NVNI": [
+                DailyBar("NVNI", first_day, 1.35, 1.50, 1.30, 1.38),
+                DailyBar("NVNI", second_day, 1.48, 1.62, 1.45, 1.58),
+            ]
+        }
+        minute_bars = [
+            minute_bar(first_day, time(9, 53), 1.40, 1.43, 1.39, 1.41, "NVNI"),
+            minute_bar(first_day, time(15, 55), 1.39, 1.40, 1.37, 1.38, "NVNI"),
+            minute_bar(second_day, time(9, 47), 1.54, 1.57, 1.53, 1.55, "NVNI"),
+            minute_bar(second_day, time(15, 55), 1.57, 1.59, 1.56, 1.575, "NVNI"),
+        ]
+        with TemporaryDirectory() as tmp:
+            result = SimpleNamespace(
+                trades=trades,
+                config=make_backtest_config(Path(tmp), second_day),
+            )
+
+            payload = build_symbol_detail_payload("US.NVNI", result, daily_bars, minute_bars)
+
+        self.assertEqual(payload["symbol_realized_pnl"], -18.01)
+        self.assertEqual([window["realized_pnl"] for window in payload["windows"]], [-74.46, 56.45])
+        self.assertEqual(payload["minute_days"], ["2026-04-23", "2026-07-16"])
+        first_buy = payload["windows"][0]["trades"][0]
+        self.assertTrue(first_buy["minute_kline_location"]["exact"])
+        self.assertEqual(first_buy["minute_kline_location"]["bar_time"], "2026-04-23T09:53-04:00")
+
+    def test_trade_kline_location_reports_exact_region_and_outside_prices(self):
+        bar = DailyBar("TEST", date(2026, 7, 16), 10.0, 12.0, 9.0, 11.0)
+
+        inside = trade_kline_location(10.5, bar)
+        outside = trade_kline_location(12.5, bar)
+        missing = trade_kline_location(10.5, None)
+
+        self.assertEqual(inside["position"], "日 K 实体")
+        self.assertEqual(inside["range_position_pct"], 50.0)
+        self.assertEqual(outside["status"], "outside")
+        self.assertEqual(outside["position"], "高于日 K 最高价")
+        self.assertFalse(missing["matched"])
+
+    def test_minute_payload_preserves_full_timestamp_and_exact_ohlc(self):
+        day = date(2026, 7, 16)
+        bars = [
+            minute_bar(day, time(9, 30), 1.234567, 1.345678, 1.2, 1.3, "TEST"),
+            minute_bar(day, time(9, 31), 1.3, 1.4, 1.25, 1.35, "TEST"),
+        ]
+
+        payload = build_symbol_minute_payload("US.TEST", [], bars)
+
+        self.assertEqual(payload["symbol"], "TEST")
+        self.assertEqual(payload["days"]["2026-07-16"][0], [
+            "2026-07-16T09:30-04:00",
+            1.234567,
+            1.345678,
+            1.2,
+            1.3,
+        ])
+
     def test_massive_key_and_grouped_daily_payload_parsing(self):
         self.assertEqual(split_api_keys("key1,key2; key1\nkey3"), ("key1", "key2", "key3"))
         payload = {
@@ -255,6 +380,34 @@ class BacktestTests(unittest.TestCase):
 
             self.assertEqual(cache.uncovered_symbols("daily", ["TEST"], "2026-01-01", "2026-01-03", feed="iex"), [])
             self.assertEqual(cache.uncovered_symbols("daily", ["TEST"], "2026-01-01", "2026-01-04", feed="iex"), ["TEST"])
+
+    def test_market_data_cache_read_only_mode_never_writes(self):
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "market_data.sqlite"
+            writable = MarketDataCache(path)
+            writable.save_daily_bars(
+                {"TEST": [DailyBar("TEST", date(2026, 1, 2), 10.0, 11.0, 9.0, 10.5)]},
+                feed="iex",
+                range_start=date(2026, 1, 2),
+                range_end_exclusive=date(2026, 1, 3),
+            )
+            read_only = MarketDataCache(path, read_only=True)
+
+            loaded = read_only.load_daily_bars(
+                ["TEST"],
+                date(2026, 1, 2),
+                date(2026, 1, 3),
+                feed="iex",
+            )
+
+            self.assertEqual(loaded["TEST"][0].close, 10.5)
+            with self.assertRaises(PermissionError):
+                read_only.save_daily_bars(
+                    {"TEST": [DailyBar("TEST", date(2026, 1, 2), 10.0, 11.0, 9.0, 10.5)]},
+                    feed="iex",
+                    range_start=date(2026, 1, 2),
+                    range_end_exclusive=date(2026, 1, 3),
+                )
 
     def test_data_repair_backfills_warmup_and_recomputes_target_mas(self):
         with TemporaryDirectory() as tmp:
@@ -442,8 +595,35 @@ class BacktestTests(unittest.TestCase):
             self.assertIn("资金曲线", content)
             self.assertIn("股票 K 线详情", content)
             self.assertIn("data-detail-url='symbol_details/TEST.html'", content)
+            self.assertIn("data-minute-url='symbol_details/TEST.minute.js'", content)
+            self.assertIn("data-symbol='TEST'", content)
             self.assertIn("detail-modal", content)
             self.assertIn("detail-modal-back", content)
+            self.assertIn("detail-copy-link", content)
+            self.assertIn("round-prev", content)
+            self.assertIn("round-next", content)
+            self.assertIn("symbol-search", content)
+            self.assertIn("data-sort-symbol-time", content)
+            self.assertIn("最新优先", content)
+            self.assertIn('sortSymbolRows("desc")', content)
+            self.assertIn("data-latest-time=", content)
+            self.assertIn("data-symbol-filter='profit'", content)
+            self.assertIn("data-symbol-filter='loss'", content)
+            self.assertIn("data-symbol-filter='multi'", content)
+            self.assertIn("EVENT RAIL", content)
+            self.assertIn("TIMEFRAME / DAY DRILLDOWN", content)
+            self.assertIn("本轮已实现收益", content)
+            self.assertIn("股票累计收益", content)
+            self.assertIn("plotly_click", content)
+            self.assertIn("不吸附到相邻 K 线", content)
+            self.assertIn('"details":{"TEST"', content)
+            self.assertIn("MA5 / MA10 / MA20", content)
+            self.assertIn('data-report-version="2"', content)
+            self.assertIn("report-nav", content)
+            self.assertIn("Interactive v2", content)
+            self.assertIn("updateDeepLink", content)
+            self.assertIn("data-realized-pnl=", content)
+            self.assertIn("data-rounds=", content)
             self.assertIn("收益统计表", content)
             self.assertIn("时间顺序与收益核验", content)
             self.assertIn("现金流水核对", content)
@@ -458,23 +638,38 @@ class BacktestTests(unittest.TestCase):
             detail_content = detail.read_text(encoding="utf-8")
             self.assertIn("candlestick", detail_content)
             self.assertIn('name: "MA5"', detail_content)
+            self.assertIn('name: "MA10"', detail_content)
+            self.assertIn('name: "MA20"', detail_content)
             self.assertIn('increasing: {line: {color: "#c0392b"}', detail_content)
             self.assertIn('decreasing: {line: {color: "#137b4b"}', detail_content)
             self.assertIn("日K", detail_content)
             self.assertIn("Buy", detail_content)
             self.assertIn("Sell", detail_content)
+            minute_detail = result.report_path.parent / "symbol_details" / "TEST.minute.js"
+            self.assertTrue(minute_detail.exists())
+            minute_content = minute_detail.read_text(encoding="utf-8")
+            self.assertIn('window.__BACKTEST_MINUTE_DETAILS__["TEST"]=', minute_content)
+            self.assertIn(f'"{trade_day:%Y-%m-%d}"', minute_content)
             payload_start = detail_content.index("const windows = ") + len("const windows = ")
             payload_end = detail_content.index(";\n\n    function pctText", payload_start)
             windows = json.loads(detail_content[payload_start:payload_end])
             self.assertGreaterEqual(len(windows[0]["bars"]), 6)
             self.assertIn(f"{trade_day:%Y-%m-%d}", [bar["timestamp"] for bar in windows[0]["bars"]])
             self.assertTrue(any(bar["ma5"] is not None for bar in windows[0]["bars"]))
+            self.assertTrue(any(bar["ma10"] is not None for bar in windows[0]["bars"]))
+            self.assertTrue(any(bar["ma20"] is not None for bar in windows[0]["bars"]))
+            self.assertIn("volume", windows[0]["bars"][0])
+            self.assertEqual(windows[0]["buy_day"], f"{trade_day:%Y-%m-%d}")
+            self.assertTrue(windows[0]["signal_day"])
             buy_trade = next(trade for trade in windows[0]["trades"] if trade["side"] == "BUY")
             sell_trade = next(trade for trade in windows[0]["trades"] if trade["side"] == "SELL")
             self.assertEqual(buy_trade["timestamp"], f"{trade_day:%Y-%m-%d}")
             self.assertEqual(sell_trade["timestamp"], f"{trade_day:%Y-%m-%d}")
             self.assertGreater(buy_trade["price"], 0)
             self.assertGreater(sell_trade["price"], 0)
+            self.assertIn("kline_location", buy_trade)
+            self.assertIn("minute_kline_location", buy_trade)
+            self.assertTrue(buy_trade["minute_kline_location"]["exact"])
 
     def test_backtest_forces_day_end_sell_without_close_liquidation_bar(self):
         trade_day, bars = make_signal_and_trade_bars()
@@ -752,6 +947,7 @@ class BacktestTests(unittest.TestCase):
             TARGET_RETURN_PCT,
             TARGET_YEARS,
         )
+        from backtest.paths import OFFICIAL_DAILY_DB_PATH
         from run_backtest import backtest_date_range_for_year, build_final_strategy_config, strategy_rule_summary
 
         with TemporaryDirectory() as tmp:
@@ -772,12 +968,40 @@ class BacktestTests(unittest.TestCase):
         self.assertEqual(config.max_daily_buys, MAX_DAILY_BUYS)
         self.assertEqual(config.max_positions, MAX_POSITIONS)
         self.assertEqual(config.slippage_pct, SLIPPAGE_PCT)
-        self.assertEqual(config.daily_data_source, "yahoo")
+        self.assertEqual(
+            config.data_cache_dir / config.data_cache_name,
+            OFFICIAL_DAILY_DB_PATH,
+        )
+        self.assertEqual(config.daily_data_source, "alpaca")
+        self.assertTrue(config.use_data_cache)
+        self.assertTrue(config.cache_daily_bars)
+        self.assertFalse(config.cache_minute_bars)
+        self.assertFalse(config.refresh_data_cache)
+        self.assertTrue(config.require_daily_cache_coverage)
         self.assertEqual(config.optimization_rules, OPTIMIZATION_RULES)
         self.assertEqual(config.stop_params["take_profit_sell_fraction"], STOP_PARAMS["take_profit_sell_fraction"])
         self.assertNotIn("blocked_signal_months", config.optimization_rules)
         self.assertNotIn("blocked_buy_hour_candidate_count_ranges", config.optimization_rules)
         self.assertEqual(strategy_rule_summary()["config"]["buy_notional_usd"], BUY_NOTIONAL_USD)
+
+    def test_required_daily_database_coverage_does_not_fall_back_to_network(self):
+        trade_day = date(2025, 1, 6)
+        with TemporaryDirectory() as tmp:
+            config = replace(
+                make_backtest_config(Path(tmp), trade_day),
+                use_data_cache=True,
+                require_daily_cache_coverage=True,
+            )
+            with patch(
+                "backtest.engine.fetch_backtest_daily_bars_from_source"
+            ) as remote_fetch:
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "Official daily database coverage gap",
+                ):
+                    fetch_backtest_daily_bars(config, ["TEST"])
+
+            remote_fetch.assert_not_called()
 
     def test_daily_backtest_uses_daily_bars_without_minute_fetch(self):
         trade_day, bars = make_signal_and_trade_bars()

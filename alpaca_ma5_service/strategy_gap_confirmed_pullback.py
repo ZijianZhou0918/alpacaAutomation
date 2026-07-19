@@ -1,3 +1,9 @@
+"""缺口确认回撤买入策略。
+
+本模块只判断行情并返回 BUY/HOLD ``Signal``。BUY 信号把当前价写入
+``diagnostics['final_buy_point']``，真正的 BUY LIMIT 仍由服务层和 Broker 提交。
+"""
+
 from __future__ import annotations
 
 from .final_strategy import BUY_SIGNAL_PARAMS, STRATEGY_DESCRIPTION, STRATEGY_NAME
@@ -19,6 +25,11 @@ MIN_CURRENT_VS_TODAY_MA5_PCT = BUY_SIGNAL_PARAMS["MIN_CURRENT_VS_TODAY_MA5_PCT"]
 
 
 def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
+    """检查信号日、开盘涨幅、动态 MA5 和回撤区间，产生 BUY/HOLD。
+
+    该函数不读取账户、不检查每日名额，也不调用 Alpaca；这些统一风控由
+    ``service.run_once`` 在收到 BUY 信号后继续执行。
+    """
     if snapshot.current_price <= 0:
         return Signal(snapshot.symbol, "HOLD", "当前价格无效", snapshot.current_price)
     if len(snapshot.previous_closes) < 4:
@@ -137,6 +148,7 @@ def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
         f"当前价相对动态MA5 {_format_pct(current_vs_today_ma5_pct)}；"
         f"用当前价 {final_buy_point:.4f} 挂 BUY LIMIT"
     )
+    # 【买入决策，不下单】服务层会读取 final_buy_point 并提交 BUY LIMIT。
     return Signal(snapshot.symbol, "BUY", reason, snapshot.current_price, diagnostics=diagnostics)
 
 

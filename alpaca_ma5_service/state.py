@@ -66,16 +66,27 @@ def append_order(output_dir: Path, result: OrderResult, reason: str, day: date |
 
 
 def count_today_buy_orders(output_dir: Path, day: date | None = None) -> int:
-    """统计当天实际买成的买单；拒单、撤单、未确认撤单都不占名额。"""
+    """统计当天实际买成的买单，并按券商订单号去重。
+
+    同一订单可能先记录“部分成交、撤单待确认”，随后再记录最终取消或成交状态。
+    这些行属于一个订单生命周期，只能占用一个每日买入名额；没有订单号的历史
+    记录无法安全合并，仍逐行计数。
+    """
     path = orders_file(output_dir, day)
     if not path.exists():
         return 0
+    unique_order_ids: set[str] = set()
+    anonymous_executed_orders = 0
     with path.open("r", newline="", encoding="utf-8-sig") as f:
-        return sum(
-            1
-            for row in csv.DictReader(f)
-            if row.get("side") == "BUY" and consumes_daily_buy_slot(row.get("status", ""))
-        )
+        for row in csv.DictReader(f):
+            if row.get("side") != "BUY" or not consumes_daily_buy_slot(row.get("status", "")):
+                continue
+            order_id = (row.get("order_id") or "").strip()
+            if order_id:
+                unique_order_ids.add(order_id)
+            else:
+                anonymous_executed_orders += 1
+    return len(unique_order_ids) + anonymous_executed_orders
 
 
 def count_today_symbol_order_errors(output_dir: Path, symbol: str, day: date | None = None) -> int:

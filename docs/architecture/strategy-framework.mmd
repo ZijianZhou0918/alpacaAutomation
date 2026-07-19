@@ -1,0 +1,22 @@
+flowchart TD
+    A["workflows/monitoring/intraday.py 配置 / .env"] --> B["build_settings"]
+    B --> C["基础 StrategyProfile"]
+    C --> D["WatchCode / 买入 / 卖出 / 撤单独立覆盖"]
+    D --> E{"启动前全量校验"}
+    E -- 失败 --> F["失败关闭<br/>不创建行情或 Broker"]
+    E -- 通过 --> G["不可变 StrategyRuntime"]
+
+    G --> W["WatchlistStrategy"]
+    W --> WC["生成当日 WatchCode"]
+    WC --> RT["service.run_once"]
+
+    G --> U["BuyStrategy"]
+    G --> S["SellStrategy"]
+    G --> X["CancelStrategy"]
+    RT --> CAND{"当前对象"}
+    CAND -->|"WatchCode 内、无持仓"| U
+    CAND -->|"券商当前持仓"| S
+    U --> BR["Broker + 统一安全层"]
+    S --> BR
+    BR --> X
+    X --> O["订单终态、账本、通知、复盘"]

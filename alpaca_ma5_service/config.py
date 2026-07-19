@@ -9,9 +9,9 @@ from typing import Any
 
 from .envfile import load_env_file
 from . import final_strategy
+from .paths import BASE_DIR, INTRADAY_WATCH_CODES_PATH
 
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 BUY_NOTIONAL_USD = 1_500.0
 MA5_DIP_STRATEGY_NAME = "ma5_dip"
 GAP_CONFIRMED_PULLBACK_STRATEGY_NAME = final_strategy.STRATEGY_NAME
@@ -62,13 +62,23 @@ class Settings:
     watchlist_chart_lan_host: str
     watchlist_chart_lan_port: int
     strategy_name: str = DEFAULT_STRATEGY_NAME
+    strategy_profile_name: str = ""
+    watchlist_strategy_name: str = ""
+    buy_strategy_name: str = ""
+    sell_strategy_name: str = ""
+    cancel_strategy_name: str = ""
 
 
 def build_settings(
     *,
     buy_stock_count: int | None = None,
     buy_notional_usd: float | None = None,
-    strategy_name: str = DEFAULT_STRATEGY_NAME,
+    strategy_name: str | None = None,
+    strategy_profile_name: str | None = None,
+    watchlist_strategy_name: str | None = None,
+    buy_strategy_name: str | None = None,
+    sell_strategy_name: str | None = None,
+    cancel_strategy_name: str | None = None,
     max_symbol_order_errors: int | None = None,
     stop_loss_pct: float | None = None,
     stop_loss_limit_pct: float | None = None,
@@ -93,8 +103,16 @@ def build_settings(
     """
     env = load_env_file(BASE_DIR / ".env")
     output_dir = BASE_DIR / "outputs"
-    strategy_name = validate_strategy_name(strategy_name)
-    defaults = strategy_runtime_defaults(strategy_name)
+    selection = build_strategy_selection(
+        env,
+        strategy_name=strategy_name,
+        strategy_profile_name=strategy_profile_name,
+        watchlist_strategy_name=watchlist_strategy_name,
+        buy_strategy_name=buy_strategy_name,
+        sell_strategy_name=sell_strategy_name,
+        cancel_strategy_name=cancel_strategy_name,
+    )
+    defaults = strategy_runtime_defaults(selection.profile_name)
     max_daily_buys = defaults["max_daily_buys"] if buy_stock_count is None else validate_buy_stock_count(buy_stock_count)
     buy_notional = BUY_NOTIONAL_USD if buy_notional_usd is None else validate_buy_notional_usd(buy_notional_usd)
     realtime_source = (
@@ -108,7 +126,7 @@ def build_settings(
         else env_value(env, "TRADE_NOTIFY_MODE") or "local"
     )
     return Settings(
-        watch_codes_file=BASE_DIR / "watch_codes.txt",
+        watch_codes_file=INTRADAY_WATCH_CODES_PATH,
         output_dir=output_dir,
         state_file=output_dir / "state.json",
         buy_notional_usd=buy_notional,
@@ -138,7 +156,12 @@ def build_settings(
             defaults["take_profit_remainder_stop_pct"],
             take_profit_remainder_stop_pct,
         ),
-        strategy_name=strategy_name,
+        strategy_name=selection.profile_name,
+        strategy_profile_name=selection.profile_name,
+        watchlist_strategy_name=selection.watchlist_strategy_name,
+        buy_strategy_name=selection.buy_strategy_name,
+        sell_strategy_name=selection.sell_strategy_name,
+        cancel_strategy_name=selection.cancel_strategy_name,
         close_liquidation_start=close_liquidation_start or time(15, 55),
         close_liquidation_end=close_liquidation_end or time(16, 0),
         regular_poll_seconds=validate_positive_int(
@@ -247,33 +270,67 @@ def validate_bool(name: str, value: bool) -> bool:
     return value
 
 
-def validate_strategy_name(strategy_name: str) -> str:
-    name = (strategy_name or DEFAULT_STRATEGY_NAME).strip()
-    if name not in {MA5_DIP_STRATEGY_NAME, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME}:
+def build_strategy_selection(
+    env: dict[str, str],
+    *,
+    strategy_name: str | None,
+    strategy_profile_name: str | None,
+    watchlist_strategy_name: str | None,
+    buy_strategy_name: str | None,
+    sell_strategy_name: str | None,
+    cancel_strategy_name: str | None,
+):
+    """Resolve legacy/profile/component settings and reject invalid mixes before I/O."""
+    from .strategy_framework import resolve_strategy_selection
+
+    legacy_name = (strategy_name or "").strip()
+    explicit_profile_name = (strategy_profile_name or "").strip()
+    if legacy_name and explicit_profile_name and legacy_name != explicit_profile_name:
         raise ValueError(
-            f"strategy_name must be {MA5_DIP_STRATEGY_NAME!r} or {GAP_CONFIRMED_PULLBACK_STRATEGY_NAME!r}"
+            "strategy_name and strategy_profile_name must match when both are provided"
         )
-    return name
+    profile_name = (
+        explicit_profile_name
+        or legacy_name
+        or env_value(env, "STRATEGY_PROFILE")
+        or DEFAULT_STRATEGY_NAME
+    )
+    return resolve_strategy_selection(
+        profile_name,
+        watchlist_strategy_name=_strategy_override(
+            watchlist_strategy_name, env_value(env, "WATCHLIST_STRATEGY")
+        ),
+        buy_strategy_name=_strategy_override(
+            buy_strategy_name, env_value(env, "BUY_STRATEGY")
+        ),
+        sell_strategy_name=_strategy_override(
+            sell_strategy_name, env_value(env, "SELL_STRATEGY")
+        ),
+        cancel_strategy_name=_strategy_override(
+            cancel_strategy_name, env_value(env, "CANCEL_STRATEGY")
+        ),
+    )
+
+
+def _strategy_override(explicit_value: str | None, env_value_text: str) -> str | None:
+    if explicit_value is not None:
+        return explicit_value.strip()
+    return env_value_text or None
+
+
+def validate_strategy_name(strategy_name: str) -> str:
+    """Backward-compatible profile validation for older callers."""
+    from .strategy_framework import get_strategy_registry
+
+    name = (strategy_name or DEFAULT_STRATEGY_NAME).strip()
+    return get_strategy_registry().profile(name).name
 
 
 def strategy_runtime_defaults(strategy_name: str) -> dict[str, float | int | None]:
-    if strategy_name == GAP_CONFIRMED_PULLBACK_STRATEGY_NAME:
-        return {
-            "max_daily_buys": DEFAULT_GAP_CONFIRMED_BUY_STOCK_COUNT,
-            "stop_loss_pct": final_strategy.STOP_PARAMS["stop_loss_pct"],
-            "stop_loss_limit_pct": final_strategy.STOP_PARAMS["stop_loss_limit_pct"],
-            "take_profit_half_pct": final_strategy.STOP_PARAMS["take_profit_half_pct"],
-            "take_profit_sell_fraction": final_strategy.STOP_PARAMS["take_profit_sell_fraction"],
-            "take_profit_remainder_stop_pct": final_strategy.STOP_PARAMS["take_profit_remainder_stop_pct"],
-        }
-    return {
-        "max_daily_buys": DEFAULT_BUY_STOCK_COUNT,
-        "stop_loss_pct": -0.10,
-        "stop_loss_limit_pct": -0.08,
-        "take_profit_half_pct": 0.10,
-        "take_profit_sell_fraction": 0.50,
-        "take_profit_remainder_stop_pct": None,
-    }
+    from .strategy_framework import get_strategy_registry
+
+    profile = get_strategy_registry().profile(validate_strategy_name(strategy_name))
+    return dict(profile.runtime_defaults)
 
 
 def env_value(env: dict[str, str], key: str) -> str:

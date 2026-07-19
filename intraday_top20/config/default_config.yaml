@@ -1,0 +1,54 @@
+data:
+  data_dir: intraday_top20/example_data
+  file_glob: "*.csv*"
+  security_master_path: intraday_top20/example_data/security_master.csv
+  splits_path: ""
+  source_label: synthetic_example
+  start_date: "2025-01-03"
+  end_date: "2025-02-07"
+  source_adjusted: false
+  contains_delisted: false
+  example_mode: true
+  csv_chunksize: 500000
+
+strategy:
+  rank_top_n: 20
+  continuous_below_minutes: 20
+  take_profit_pct: 0.20
+  latest_entry_time: "15:00"
+  indicator: vwap
+  moving_average_window: 5
+  require_volume_expansion: false
+  volume_lookback_bars: 5
+  volume_expansion_multiplier: 1.50
+  allow_repeat_symbol: false
+  max_trades_per_symbol_per_day: 1
+
+portfolio:
+  initial_capital: 100000.0
+  max_position_pct: 0.10
+  max_concurrent_positions: 10
+  max_daily_entries: 10
+  fractional_shares: true
+
+execution:
+  min_price: 1.0
+  min_five_minute_dollar_volume: 100000.0
+  max_volume_participation: 0.01
+  commission_per_share: 0.005
+  minimum_commission: 1.0
+  base_slippage_bps: 8.0
+  assumed_spread_bps: 10.0
+  low_price_threshold: 5.0
+  low_price_extra_slippage_bps: 20.0
+  high_volatility_range_pct: 0.08
+  high_volatility_extra_slippage_bps: 15.0
+  take_profit_fraction: 0.50
+  force_exit_time: "15:55"
+
+output:
+  output_root: intraday_top20/outputs
+  cache_results: true
+  save_audit_bars: true
+
+random_seed: 20260716

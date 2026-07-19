@@ -12,6 +12,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .monitor_runtime import read_monitor_tasks
+from .paths import watchcode_dir
 from .watchlist import read_watch_codes
 
 
@@ -36,8 +37,9 @@ _ACTION_PROCESSES: dict[str, subprocess.Popen] = {}
 
 def action_status(base_dir: Path | str) -> dict[str, Any]:
     root = Path(base_dir).resolve()
-    watch_path = root / "watch_codes.txt"
-    premarket_watch_path = root / "watch_codes_premarket.txt"
+    watch_dir = watchcode_dir(root)
+    watch_path = watch_dir / "watch_codes.txt"
+    premarket_watch_path = watch_dir / "watch_codes_premarket.txt"
     expected = _expected_signal_date()
     signal_date = _read_watchcode_signal_date(watch_path)
     premarket_signal_date = None
@@ -282,18 +284,22 @@ def run_action(action: str, *, base_dir: Path | str) -> None:
     root = Path(base_dir).resolve()
     os.chdir(root)
     if action == ACTION_GENERATE_WATCHCODE:
-        from watchcode_ma5 import generate_ma5_watchcode
+        from .workflows.watchcode.intraday import generate_ma5_watchcode
 
         generate_ma5_watchcode()
         return
     if action == ACTION_GENERATE_PREMARKET_WATCHCODE:
-        from watchcode_premarket import generate_premarket_watchcode
+        from .workflows.watchcode.premarket import generate_premarket_watchcode
 
         generate_premarket_watchcode()
         return
     if action == ACTION_START_MONITOR:
-        from alpaca_ma5_service.config import build_settings
-        from monitor_auto import configure_console_logging, ensure_current_session_watchcode, monitor_auto
+        from .config import build_settings
+        from .workflows.monitoring.auto import (
+            configure_console_logging,
+            ensure_current_session_watchcode,
+            monitor_auto,
+        )
 
         configure_console_logging()
         settings = build_settings()
@@ -303,9 +309,12 @@ def run_action(action: str, *, base_dir: Path | str) -> None:
         monitor_auto()
         return
     if action == ACTION_START_PREMARKET_MONITOR:
-        from alpaca_ma5_service.config import build_settings
-        from monitor_auto import configure_console_logging, ensure_premarket_watchcode
-        from monitor_premarket_ma5 import monitor_premarket_ma5
+        from .config import build_settings
+        from .workflows.monitoring.auto import (
+            configure_console_logging,
+            ensure_premarket_watchcode,
+        )
+        from .workflows.monitoring.premarket import monitor_premarket_ma5
 
         configure_console_logging()
         settings = build_settings()
@@ -323,15 +332,15 @@ def _python_executable(root: Path) -> Path:
 
 
 def _expected_signal_date():
-    from monitor_auto import expected_signal_date
-    from alpaca_ma5_service.config import build_settings
+    from .config import build_settings
+    from .workflows.monitoring.auto import expected_signal_date
 
     settings = build_settings()
     return expected_signal_date(datetime.now(ZoneInfo(settings.market_timezone)))
 
 
 def _read_watchcode_signal_date(path: Path):
-    from monitor_auto import read_watchcode_signal_date
+    from .workflows.monitoring.auto import read_watchcode_signal_date
 
     return read_watchcode_signal_date(path)
 

@@ -9,7 +9,8 @@ from .errors import short_error
 from .market_data import build_market_data
 from .market_time import now_market_time
 from .models import MarketSnapshot, OrderResult
-from .order_guard import normalize_order_status, wait_for_fill_or_cancel
+from .order_guard import normalize_order_status
+from .strategy_framework import resolve_strategy_runtime
 from .trade_notifications import notify_order_submitted, record_order_and_notify
 from .watchlist import normalize_symbol, to_alpaca_symbol
 
@@ -38,7 +39,10 @@ def place_test_order(
 ) -> OrderResult:
     """
     PyCharm 点箭头入口：提交一笔真实 Alpaca BUY LIMIT 测试单。
-    股票、金额、折扣价都在 tools/run_test_order.py 里改。
+
+    先读取行情并生成预览，再调用 ``_submit_limit_buy`` 直接写入 Alpaca；
+    提交后复用当前撤单策略等待终态。股票、金额、折扣价都在
+    ``tools/run_test_order.py`` 里改。此入口不经过自动监控的买入策略筛选。
     """
     settings = settings or build_settings()
     cancel_after_seconds = settings.order_cancel_after_seconds if cancel_after_seconds is None else cancel_after_seconds
@@ -87,7 +91,7 @@ def place_test_order(
         if quantity <= 0:
             result = OrderResult("", symbol, "BUY", 0, limit_price, "REJECTED", "买入金额不足 1 股")
         else:
-            # 这里会真实提交订单；未在配置时间内完全成交就自动撤单。
+            # 【执行买入订单：独立测试路径】这里不经过 service.py，会真实提交订单。
             try:
                 raw = _submit_limit_buy(client, symbol, quantity, limit_price)
                 submitted = OrderResult(
@@ -100,7 +104,8 @@ def place_test_order(
                     f"Alpaca {mode.lower()} 测试单已提交",
                 )
                 notify_order_submitted(settings, submitted, reason, broker_name=broker_name)
-                result = wait_for_fill_or_cancel(
+                # 【订单终态/自动撤单】测试单同样使用当前配置的撤单策略。
+                result = resolve_strategy_runtime(settings).cancel.wait_for_terminal(
                     client,
                     raw,
                     symbol,
@@ -183,7 +188,7 @@ def quantity_for_notional(notional_usd: float, limit_price: float) -> float:
 
 
 def _submit_limit_buy(client, symbol: str, quantity: float, limit_price: float):
-    """向 Alpaca 提交真实 BUY LIMIT 测试单。"""
+    """构造并向 Alpaca 提交真实 BUY LIMIT 测试单。"""
     from alpaca.trading.enums import OrderSide, TimeInForce
     from alpaca.trading.requests import LimitOrderRequest
 
@@ -194,4 +199,5 @@ def _submit_limit_buy(client, symbol: str, quantity: float, limit_price: float):
         time_in_force=TimeInForce.DAY,
         limit_price=limit_price,
     )
+    # 【真实券商写入：买入】本行直接向当前 Alpaca paper/live 账户提交测试单。
     return client.submit_order(order_data=request)

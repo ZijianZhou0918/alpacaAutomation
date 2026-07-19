@@ -5,14 +5,12 @@ import shutil
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from alpaca_ma5_service.trading_calendar import offline_trading_day_decision
-from alpaca_ma5_service.watchlist_generator import DailyBar
 from backtest.data_cache import MarketDataCache, average_tail, normalize_symbols
 from backtest.daily_sources import (
-    DailyFetchResult,
     MassiveDailyConfig,
     coalesced_date_ranges,
     fetch_massive_grouped_daily_bars_with_failures,

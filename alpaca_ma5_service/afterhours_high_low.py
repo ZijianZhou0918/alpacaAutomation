@@ -13,7 +13,8 @@ from .alpaca_connection import build_trading_connection, load_alpaca_credentials
 from .config import Settings, build_settings
 from .errors import short_error
 from .models import OrderResult
-from .order_guard import normalize_order_status, wait_for_fill_or_cancel
+from .order_guard import normalize_order_status
+from .strategy_framework import resolve_strategy_runtime
 from .state import append_order, orders_file
 from .trading_calendar import latest_trading_day_on_or_before, offline_trading_day_decision
 from .watchlist import normalize_symbol, to_alpaca_symbol
@@ -754,6 +755,8 @@ def submit_afterhours_limit_buys(
                 continue
 
             try:
+                # 【真实券商写入：盘后买入】这是盘后 high/low 独立策略的 BUY LIMIT；
+                # 它不经过 service.py，但提交后仍使用当前 CancelStrategy 等待/撤单。
                 raw = client.submit_order(
                     order_data=LimitOrderRequest(
                         symbol=to_alpaca_symbol(symbol),
@@ -774,7 +777,8 @@ def submit_afterhours_limit_buys(
                     "盘后 BUY LIMIT 已提交",
                 )
                 record_afterhours_order(settings, submitted, reason, order_time=now_et)
-                result = wait_for_fill_or_cancel(
+                # 【订单终态/自动撤单】盘后买单超时后同样取消未成交部分。
+                result = resolve_strategy_runtime(settings).cancel.wait_for_terminal(
                     client,
                     raw,
                     symbol,
@@ -1051,7 +1055,7 @@ def load_open_sell_order_symbols(broker) -> set[str] | None:
 
 
 def preview_or_sell(broker, symbol: str, quantity: float, current_price: float, reason: str, dry_run: bool) -> OrderResult:
-    """dry-run 时只打印预览；真实模式才提交卖单。"""
+    """盘后卖出统一出口：dry-run 只预览，真实模式才调用 Broker 提交。"""
     if dry_run:
         result = OrderResult("", normalize_symbol(symbol), "SELL", quantity, current_price, "DRY_RUN", "卖出预览，未提交真实订单")
         print_order_signal(
@@ -1064,6 +1068,7 @@ def preview_or_sell(broker, symbol: str, quantity: float, current_price: float, 
             ],
         )
         return result
+    # 【执行卖出订单：盘后策略】Broker 会按当前时段转换成可用的保护限价单。
     return broker.place_market_sell(symbol, quantity, current_price, reason)
 
 

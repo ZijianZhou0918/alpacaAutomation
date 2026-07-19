@@ -1,7 +1,7 @@
 # Alpaca MA5 代码修改准则
 
 > 状态：长期有效，适用于本仓库及全部子目录  
-> 最后一次架构核对：2026-07-15  
+> 最后一次架构核对：2026-07-18
 > 执行入口：项目根目录 `AGENTS.md`  
 > 运行手册：`docs/PROJECT_OPERATIONS.md`
 
@@ -46,38 +46,46 @@
 | 路径 | 主要职责 | 修改注意点 |
 | --- | --- | --- |
 | `alpaca_ma5_service/` | 核心交易、行情、策略、运行时、复盘和 Web API | 任何交易/日期/账本改动均为高风险 |
+| `alpaca_ma5_service/strategy_framework/components/` | 按 WatchCode、买入、卖出、自动撤单分开的策略实现 | 一个组件只负责一个阶段，不得绕过统一安全层 |
+| `alpaca_ma5_service/strategy_framework/` | profile、契约、注册表、运行时解析和扩展入口 | 新实现必须显式注册，完整组合必须在任何外部 I/O 前解析成功 |
+| `alpaca_ma5_service/workflows/` | 监控、WatchCode 和复盘的运行编排 | 内部模块不得反向依赖根目录入口 |
+| `backtest/runners/` | 根目录回测命令背后的参数解析与编排 | 不承载策略算法或数据库实现 |
+| `backtest/reporting/` | 可复用的交互式回测报告文档模型、模板和静态资源 | 不依赖具体策略或账户；引擎只负责把结果适配成报告文档 |
+| `data/watchcodes/` | 盘前、盘中、盘后三个观察池运行文件 | 可能是用户当日结果，不得擅自覆盖 |
 | `web/review_dashboard/` | 无构建步骤的静态 HTML/CSS/JS 看板 | 必须保持后端 API 契约和安全请求头 |
 | `backtest/` | 历史数据缓存、修复、校验和回测引擎 | 默认数据源与线上实时链路不同，禁止静默混用 |
 | `tests/` | Python `unittest` 回归测试 | 新增规则或修复必须覆盖对应风险面 |
 | `tools/` | 自检、任务安装、健康检查、真实测试单、图表服务等运维入口 | 文件名不能代表安全级别，执行前读完整调用链 |
 | `outputs/` | 订单、排除记录、日志、运行时心跳、图表等运行时产物 | 通常被忽略；不得把旧数据当源码回滚 |
 | `docs/` | 长期运行手册和补充文档 | 架构或运行方式变化时同步维护 |
-| 根目录 `monitor_*.py` | 盘前、盘中、盘后和统一监控入口 | 可启动长期任务或真实交易，修改后需运行态验证 |
-| 根目录 `watchcode_*.py` | 不同阶段的观察池生成入口 | 生成日期、文件目标和并发互斥必须一致 |
-| 根目录 `watch_codes*.txt` | 运行时观察池 | 可能是用户当日结果，不得擅自覆盖 |
+| 根目录 `monitor_*.py` | 盘前、盘中、盘后和统一监控的薄启动入口 | 可启动长期任务或真实交易，必须只委托对应 workflow |
+| 根目录 `watchcode_*.py` | 不同阶段观察池的薄启动入口 | 必须只委托对应 workflow |
+| 根目录 `run_backtest*.py` | 回测和历史数据任务的薄启动入口 | 必须只委托 `backtest/runners/` |
 | `.env` / `.env.example` | 本机密钥与非敏感配置样例 | `.env` 永不提交；新增变量同步样例和文档 |
 
-默认解释器是 `.venv\Scripts\python.exe`。`.venv_corrupt_backup_20260715` 是损坏环境备份，不得作为运行、测试或计划任务解释器。
+默认解释器是 `.venv\Scripts\python.exe`。
 
 ## 4. 核心业务流程
+
+总流程和用户入口见 [`docs/architecture/PROJECT_FLOW.md`](docs/architecture/PROJECT_FLOW.md)。策略代码导航见 [`alpaca_ma5_service/strategy_framework/README.md`](alpaca_ma5_service/strategy_framework/README.md)。
 
 ### 4.1 统一监控阶段
 
 `monitor_auto.py` 按美东时间和交易日切换阶段：
 
-1. 盘前：确认/生成 `watch_codes_premarket.txt`，运行盘前推荐监控；该链路只提醒，不买入。
-2. 盘中：确认/生成 `watch_codes.txt`，启动 `monitor_ma5_forever.py`；这是主要自动下单链路。
-3. 盘后：确认/生成 `watch_code_afterhours.txt`，运行盘后监控并生成日报。
+1. 盘前：确认/生成 `data/watchcodes/watch_codes_premarket.txt`，运行盘前推荐监控；该链路只提醒，不买入。
+2. 盘中：确认/生成 `data/watchcodes/watch_codes.txt`，启动 `monitor_ma5_forever.py`；这是主要自动下单链路。
+3. 盘后：确认/生成 `data/watchcodes/watch_code_afterhours.txt`，运行盘后监控并生成日报。
 4. 非交易日或阶段结束：按当前入口规则退出或仅生成报告，不得因为是工作日就绕过交易所日历。
 
 修改阶段切换时必须同时验证：节假日、半日市、跨日、夏令时、当日日线是否完成，以及生成任务已经存在时的等待行为。
 
 ### 4.2 WatchCode 生成与消费
 
-- `watch_codes.txt`：盘中自动交易观察池。
-- `watch_codes_premarket.txt`：盘前推荐观察池，不得直接变成买入池。
-- `watch_code_afterhours.txt`：盘后观察池，是否可下单取决于实际入口调用链。
-- `watchcode_ma5.py` 当前使用的 `ma5_dip` 筛选不要求 `MA5 > MA10 > MA20`；MA5/MA10/MA20 仍作为诊断字段保留。
+- `data/watchcodes/watch_codes.txt`：盘中自动交易观察池。
+- `data/watchcodes/watch_codes_premarket.txt`：盘前推荐观察池，不得直接变成买入池。
+- `data/watchcodes/watch_code_afterhours.txt`：盘后观察池，是否可下单取决于实际入口调用链。
+- `watchcode_ma5.py` 默认使用的 `ma5_dip` 筛选要求信号日收盘价比包含该日收盘价计算的当日 `MA5` 至少高 15 个点（`close/MA5 >= 1.15`），但不要求 `MA5 > MA10 > MA20`；MA5/MA10/MA20 仍作为诊断字段保留。实际 WatchCode 策略必须来自与盘中监控相同的 `build_monitor_settings()`。
 - `signal_date` 必须来自最近一个已完成日线的交易日；交易日统一使用 `alpaca_ma5_service/trading_calendar.py`。
 - 当天日线尚未完成时使用前一完成交易日；日线完成后才允许使用当天。
 - 启动监控前如文件缺失或过期，先生成；如盘前或盘中任一生成器已在运行，等待现有任务完成，不得重复生成。
@@ -87,15 +95,23 @@
 
 核心链路为：
 
-`monitor_ma5_forever.py` → `service.run_forever()` → `service.run_once()` → 行情/持仓/订单/风控读取 → 策略评估 → `AlpacaStockBroker` 下单 → 本地订单记录与通知。
+`monitor_ma5_forever.py`（薄入口）→ `workflows/monitoring/intraday.py` → `build_monitor_settings()` → `strategy_framework.resolve_strategy_runtime()` → `service.run_forever()` → `service.run_once()`。`run_once()` 的逐股核心循环必须直接按 `check_buy → execute_buy → notify_buy → check_sell → execute_sell → notify_sell → check_cancel → execute_cancel → notify_cancel` 展开，不得再增加掩盖主流程的 `process_*` 编排包装。真实买卖仍由 `AlpacaStockBroker` 提交；默认 Broker 内部等待订单终态并调用已选择的自动撤单策略，服务层撤单阶段只兜底处理自定义 Broker 直接返回的开放订单；最终进入本地订单记录与通知。
 
 必须保持的边界：
 
 - 买入候选只来自当日有效的盘中 WatchCode；卖出风控会检查券商全部持仓，包括用户手动买入的股票。
+- WatchCode、买入、卖出和自动撤单是四个独立命名空间；基础 profile 给出完整默认组合，各分类允许显式覆盖。配置必须在任何行情、账户或订单 I/O 前完成全量解析，未知名称和缺失接口一律失败关闭。
+- 旧 `strategy_name` 继续作为 profile 名兼容；实时主链路不得再通过进程全局可变策略名切换，旧上下文切换只保留给兼容回测调用。
 - 真实买入仅允许在交易日 `09:30 <= t < 12:00 ET`。
 - 实时订单总窗口与买入窗口不是同一概念；不得因盘前/盘后可报价就放宽买入窗口。
 - 买入使用最终策略买点的限价单，不得为了提高成交率静默改成追价或市价单。
 - 未完成订单、每日买入上限、重复订单、连续拒单/错误、止损和排除记录都是安全保护，不得为修复 UI 或提高速度而绕过。
+- 买入或卖出订单一旦已提交，即使终态等待、自动撤单、本地记录或通知随后异常，也必须保留原始 `order_id` 和未确认暴露并失败关闭；不得把“后处理失败”误当成“没有订单”继续交易。
+- 每次真实订单提交必须携带唯一 `client_order_id`；提交请求发生超时或网络异常时，必须先按该标识向券商恢复订单。无法确认“已接受”或“明确拒绝”时按 `SUBMIT_UNCONFIRMED` 失败关闭并暂停后续自动买入，禁止直接重试造成重复订单。
+- 部分成交订单在剩余数量确认终态前仍属于未确认暴露；同一 `order_id` 的部分成交、撤单请求和最终撤单记录只能占用一次当日买入名额。
+- `DONE_FOR_DAY` 和 `REPLACED` 不是可直接解除暴露的最终状态；替换订单必须沿 `replaced_by` 追踪到当前订单，再等待或撤销当前订单。
+- 卖出前必须查询券商开放卖单；同一股票已有开放卖单，或查询失败无法确认时，必须跳过新的自动卖出。
+- 服务层撤单结果只有在 `order_id`、方向和股票与原订单一致时才能替换原暴露；无法确认归属的撤单错误不得解除交易暂停。
 - 手动持仓属于正常业务输入；不得自动篡改本地记录强行与券商对齐，也不得把“本地与券商不一致”一律视为错误。
 
 ### 4.4 盘后入口差异
@@ -121,7 +137,7 @@
 
 ### 4.6 回测流程
 
-回测链路读取本地 SQLite 日线/分钟线缓存，通过 Massive/Polygon、Yahoo、Alpaca 历史接口或其他明确数据源同步、修复和抽查，再由 `backtest/engine.py` 运行策略。线上实时行情默认可能来自 Moomoo，不能假定线上和回测数据源天然等价。
+回测链路读取本地 SQLite 日线/分钟线缓存，通过 Massive/Polygon、Yahoo、Alpaca 历史接口或其他明确数据源同步、修复和抽查，再由 `backtest/engine.py` 运行策略。通用交互式报告由 `backtest/reporting/` 渲染；引擎把策略结果、交易、权益曲线和股票证据适配成 `InteractiveReportDocument`，模板层不得反向导入具体策略或账户实现。分钟 K 证据应按股票拆分并按需加载；成交标记必须使用实际成交时间与成交价，缺失时明确标记且禁止吸附到相邻 K 线或回退到其他日期。线上实时行情默认可能来自 Moomoo，不能假定线上和回测数据源天然等价。
 
 更改回测数据源、复权、时区、日期边界或缓存主键时，必须记录数据来源，验证重复写入的幂等性，并先备份数据库。回测结果不得直接证明明日一定会成交或盈利。
 
@@ -134,7 +150,9 @@
 | `service.py` | 单轮/循环交易编排 | 保护顺序、买卖边界和账本写入不可绕过 |
 | `broker.py`, `alpaca_connection.py` | Alpaca 账户、订单、持仓适配 | 提交/撤单是外部写操作，测试必须隔离 |
 | `market_data.py`, `moomoo_market_data.py` | 历史/实时行情 | 行情故障不能通过放宽交易保护兜底 |
-| `strategy*.py`, `final_strategy.py` | 买卖信号和策略选择 | 修改需固定样例、边界值和回归测试 |
+| `strategy_framework/components/*` | WatchCode、买入、卖出、自动撤单的内置实现 | 各阶段职责独立；安全窗口和订单防重不得下沉为可绕过组件 |
+| `strategy_framework/*` | 四类策略契约、独立注册表、profile 组合、运行时解析和扩展注册 | 禁止按配置任意导入模块；注册失败不得留下半初始化全局状态 |
+| `strategy*.py`, `final_strategy.py` | 内置买卖信号和旧调用兼容层 | 修改需固定样例、边界值和回归测试 |
 | `watchlist*.py`, `premarket_watchlist.py` | 观察池生成、读取和图表 | 日期、目标文件和阶段语义必须一致 |
 | `order_guard.py`, `state.py` | 订单防重、错误保护和本地状态 | 不得用空值/异常默认放行 |
 | `monitor_runtime.py`, `run_lock.py` | 心跳、日志镜像、任务发现和互斥 | 遥测失败不能终止交易；互斥不能误杀进程 |
@@ -144,6 +162,7 @@
 | `openclaw_trade_control.py`, `manual_order.py` | 手动自然语言/命令交易 | 可跳过自动时间和策略过滤，属于最高风险入口 |
 | `daily_report.py` | 日报生成 | 指标名称必须对应真实财务口径 |
 | `backtest/*` | 历史缓存、修复、校验和回测 | 与实时链路分离，数据修复默认备份 |
+| `backtest/reporting/*` | 通用交互报告模型、HTML 模板、CSS 和 JavaScript | 主报告保持可直接打开；大体量分钟数据允许按股票拆分并按需加载；保持数据安全嵌入、键盘访问和窄屏可用 |
 
 ## 6. 前后端接口关系
 
@@ -191,7 +210,7 @@
 | 统一监控日志 | `outputs/logs/monitor_auto_YYYYMMDD.*.log` | 监控写入，看板读取 |
 | 任务心跳和日志 | `outputs/monitor_runtime/<task-id>.json/.log` | 运行时登记，看板轮询 |
 | 图表 | `outputs/watchlist_charts/*.html` | 生成器写入，Web/图表服务读取 |
-| 观察池 | 根目录 `watch_codes*.txt` | 生成器写入，监控读取 |
+| 观察池 | `data/watchcodes/watch_codes*.txt`、`data/watchcodes/watch_code_afterhours.txt` | 生成器写入，监控读取 |
 
 运行时 JSON 状态采用临时文件加原子替换。修改时必须保持崩溃恢复和部分写入保护；心跳/日志镜像错误应降级记录，不能终止交易主循环。
 
@@ -202,8 +221,15 @@
 - `daily_bars`：以 `(symbol, bar_date, feed, adjustment)` 为主键，保存 OHLC、成交量、VWAP、交易数、时间戳和 MA5/10/20。
 - `minute_bars`：以 `(symbol, timestamp_utc, feed, adjustment)` 为复合主键，保存分钟 OHLC。
 - `fetch_ranges`：记录不同 kind/symbol/feed/adjustment 的已抓取区间，避免无边界重复抓取。
+- `daily_dataset_metadata`、`security_master`：记录两年全普通股日线数据集的口径、构建进度和候选证券。
 
 Schema、主键、复权或时区变更必须提供迁移/兼容方案，先备份再运行，验证 WAL、索引、upsert 幂等性和旧数据库读取。不得把数据修复脚本作为普通单元测试执行。
+
+两年全普通股日线库通过 `run_backtest_daily_history_rebuild.py` 重建。口径固定为 Alpaca SIP、`1Day`、`split` 复权，并用 Alpaca 日历和统一离线日历交叉校验交易日。重建先写 `market_data.sqlite.rebuild`；完整校验 `daily_bars`、覆盖标记、OHLC、日期范围、空分钟表和 `PRAGMA quick_check` 后，先备份已有正式库，再原子替换。
+
+任何新增或修改的日线回测入口，都必须优先只读 `backtest/data/market_data.sqlite`，并复用 `backtest.paths.OFFICIAL_DAILY_DB_PATH`，不得另行硬编码正式库路径。正式库覆盖不足时必须明确失败或报告缺口；不得静默改用其他日线库，也不得把分钟线写入正式库。分钟行情必须使用独立缓存。
+
+证券池由当前 Alpaca active/inactive US equity 快照和当前 Nasdaq Trader ETF/Test Issue 标记共同分类。分类先排除 ETF、基金、优先股、权证、SPAC、非经营性 Trust 和结构化证券，再纳入 NYSE/NASDAQ/AMEX 上其余上市股；不得要求证券名称必须显式包含 `Common Stock`，REIT 和 Property Trust 必须保留。它尽量包含区间内已退市候选，但不是权威的历史时点证券主表；manifest 必须保留 `survivorship_bias_fully_eliminated=false`，不得把该口径描述成已彻底消除幸存者偏差。
 
 ## 8. 配置文件与环境变量
 
@@ -220,8 +246,11 @@ Schema、主键、复权或时区变更必须提供迁移/兼容方案，先备�
 | 通知兼容别名 | `WEBHOOK_URL`, `WEBHOOK_SECRET`, `WATCHLIST_TELEGRAM_TARGET` |
 | 图表服务 | `WATCHLIST_CHART_LAN_HOST`, `WATCHLIST_CHART_LAN_PORT` |
 | 历史数据 | `MASSIVE_API_KEYS` 或 `POLYGON_API_KEYS` |
+| 策略组合 | `STRATEGY_PROFILE`, `WATCHLIST_STRATEGY`, `BUY_STRATEGY`, `SELL_STRATEGY`, `CANCEL_STRATEGY` |
 
 当前 `.env.example` 只列出常用变量，不是全部运行配置的唯一来源。新增/重命名变量时必须：更新 `.env.example`（仅占位符）、更新本文件或运行手册、保留必要兼容别名或给出迁移错误、增加缺失值/非法值测试。禁止把真实值写进样例、日志或测试。
+
+策略配置的优先级为：workflow 传入的分类覆盖 → workflow 传入的 profile/兼容 `strategy_name` → 对应环境变量 → `ma5_dip` 默认组合。`alpaca_ma5_service/workflows/monitoring/intraday.py` 顶部配置区是直接点击运行、PyCharm 和统一监控链路的权威配置；根目录 `monitor_ma5_forever.py` 只负责启动。新增策略、组合和依赖方向见 [`docs/architecture/STRATEGY_FRAMEWORK.md`](docs/architecture/STRATEGY_FRAMEWORK.md)。
 
 ## 9. 第三方服务和外部依赖
 
@@ -301,15 +330,16 @@ Schema、主键、复权或时区变更必须提供迁移/兼容方案，先备�
 ## 12. 实施代码修改的通用规则
 
 1. 先定位真实入口和调用链，再修改最小必要表面；避免顺手重构无关模块。
-2. 保留用户已有改动和运行时产物；不使用 `git reset --hard`、`git checkout --` 或等价破坏性操作。
-3. 业务规则只保留一个权威实现。日期、时间窗、WatchCode 就绪、订单保护和指标口径禁止在 UI/脚本中复制简化版。
-4. 不以吞掉异常、无限等待、扩大超时或强制重试掩盖根因；重试必须有上限、幂等和可观察状态。
-5. 跨线程/跨进程共享文件采用原子写、锁或现有运行时协议，避免半文件和并发覆盖。
-6. 前后端字段变化采用兼容迁移；不在同一版本让旧前端得到无解释的 404/503。
-7. 注释解释“为什么有此安全边界”，避免重复代码表面行为；删除保护前必须证明替代机制。
-8. 任何可影响交易结果的默认值变化，都要在变更报告中单独列出。
-9. 不把回测盈利、单次模拟或当前 key 存在视为真实交易一定会成交/盈利的证明。
-10. 文档与代码不一致时，以经过调用链和测试确认的实际行为为依据，并在同次修改修正文档。
+2. 根目录 Python 文件只允许作为公开运行入口，不放业务函数、类或数据；实现进入 `alpaca_ma5_service/workflows/` 或 `backtest/runners/`。
+3. 保留用户已有改动和运行时产物；不使用 `git reset --hard`、`git checkout --` 或等价破坏性操作。
+4. 业务规则只保留一个权威实现。日期、时间窗、WatchCode 就绪、订单保护和指标口径禁止在 UI/脚本中复制简化版。
+5. 不以吞掉异常、无限等待、扩大超时或强制重试掩盖根因；重试必须有上限、幂等和可观察状态。
+6. 跨线程/跨进程共享文件采用原子写、锁或现有运行时协议，避免半文件和并发覆盖。
+7. 前后端字段变化采用兼容迁移；不在同一版本让旧前端得到无解释的 404/503。
+8. 注释解释“为什么有此安全边界”，避免重复代码表面行为；删除保护前必须证明替代机制。
+9. 任何可影响交易结果的默认值变化，都要在变更报告中单独列出。
+10. 不把回测盈利、单次模拟或当前 key 存在视为真实交易一定会成交/盈利的证明。
+11. 文档与代码不一致时，以经过调用链和测试确认的实际行为为依据，并在同次修改修正文档。
 
 ## 13. 测试、构建和验证矩阵
 
@@ -331,7 +361,7 @@ Schema、主键、复权或时区变更必须提供迁移/兼容方案，先备�
 | Web API | `test_review_web.py` / `test_dashboard_actions.py`；GET/POST/405/404、同源/确认头、路径穿越、进程归属 |
 | 前端 | 目标日期、空态、运行态切换、按钮确认/结束、日志快速出现、隐藏页退避；实际浏览器或 HTTP 联调 |
 | 运行时/并发 | 外部 Python/IDE 启动、父子进程、陈旧 PID、心跳中断、任务退出和重复启动测试 |
-| SQLite/回测 | 临时数据库 schema/upsert/覆盖范围测试；真实修复前备份，未经授权不运行批量修复 |
+| SQLite/回测 | 临时数据库 schema/upsert/覆盖范围测试；报告改动运行 `tests.test_backtest_reporting` 和对应引擎报告测试，并用真实浏览器检查桌面/窄屏；真实修复前备份，未经授权不运行批量修复 |
 | 通知 | patch 外发；验证异常不影响交易主流程，未经授权不发送真实测试消息 |
 
 若相关测试因环境或外部服务无法运行，变更报告必须写明未验证项和具体原因，不得以“应该可以”代替证据。
@@ -384,3 +414,40 @@ Schema、主键、复权或时区变更必须提供迁移/兼容方案，先备�
 7. **剩余风险**：只列真实存在且尚未验证的风险，不写泛泛建议。
 
 报告不得包含密钥、完整账户数据或敏感通知目标；不得把代码检查描述成已完成真实下单验证。
+
+## 18. 日内动态涨幅榜历史研究模块
+
+`intraday_top20/` 是独立历史研究和 Streamlit 报告模块，不属于 MA5 实盘推荐、WatchCode、监控或下单链路。该目录内不得新增账户读取、订单提交或复用实盘买入入口；历史回测验证不构成真实下单授权。
+
+### 固定口径
+
+- 股票池必须在每根已完成五分钟 K 线后，用当前收盘价和前一交易日收盘价动态重排；禁止使用日终 Top N 回填盘中股票池。
+- 信号只能使用当前完成 K 线及之前数据；默认买入时间为信号 K 线结束时间，即下一根五分钟 K 线开始时间。
+- 默认 20 分钟阈值必须解释为严格超过 20 分钟，因此至少 5 根完整五分钟 K 线收于均线下方。
+- 停牌、缺下一根 K 线或缺 15:55 K 线不得产生理想化成交；必须拒单、保留未解决状态或等待下一根真实可用 K 线，并降低可信度。
+- 合成数据结果必须在网页、导出报告和交付结论中明确标记，禁止描述为历史策略收益。
+
+### 变更验证矩阵
+
+- 修改排名、指标或状态机：运行 `test_ranking.py`、`test_strategy.py` 和 `test_no_lookahead.py`。
+- 修改成交、仓位、成本或退出：运行 `test_execution.py` 和 `test_no_lookahead.py`。
+- 修改数据清洗或加载：补充时区、正常时段、前收、拆股、缺失 K 线或证券过滤测试，并运行全部 `intraday_top20/tests`。
+- 修改网页、图表或导出：先运行全部模块测试，再临时启动 Streamlit，验证首页、至少一个 Plotly 图和至少一个交易表；只终止本次明确启动的进程。
+- 修改依赖、入口、数据字段、可信度门禁或部署方法：同次更新 `intraday_top20/README.md`、根 README 和 `docs/PROJECT_OPERATIONS.md`。
+
+完整测试命令：
+
+```powershell
+.\.venv\Scripts\python.exe -m pytest intraday_top20\tests -q
+```
+
+## 19. 信号日强势 + 动态 MA5 历史回测
+
+`backtest/signal_dynamic_ma5.py` 和 `run_backtest_signal_dynamic_ma5.py` 是独立历史研究入口，不属于实盘 MA5 监控、WatchCode、账户或订单链路。
+
+- 日线筛选只能读取已完成日线。信号日固定要求 `MA5 > MA10 > MA20`、涨幅严格大于 `10%`、阳线实体严格大于 `10%`；买入日固定为全局下一交易日且开盘涨幅严格大于 0，等于 0 时不得进入分钟回放。
+- 动态 MA5 固定使用前 4 个已完成交易日收盘价和当前已完成分钟收盘价；只有当前已完成分钟收盘价小于或等于动态 MA5，且相对买入日开盘价跌幅严格大于 `15%` 时才能触发，等于 `15%` 或全天未达到条件时不得买入。成交必须落在下一根真实分钟线开盘，该实际入场价相对买入日开盘价跌幅仍须严格大于 `15%`；反弹后不满足时继续等待窗口内后续有效触发。实际成交时间必须满足 `09:30 <= t < 12:00 ET`，12:00 ET 及以后禁止买入，禁止使用触发分钟收盘价回填成交。
+- 分档止盈按原始仓位各卖 `1/3`；同一分钟止损优先；缺下一分钟或缺尾盘分钟线时不得伪造成交或价格。
+- 正式日线库保持只读且不得写入分钟线。候选分钟线使用独立缓存、SIP、`split`；不得静默回退到其他 feed。
+- 修改信号、动态均线、成交时序、退出或成本时，必须运行 `tests.test_signal_dynamic_ma5_backtest`，再运行全项目测试，并执行真实历史回测核对 JSON、CSV 和 HTML 三类产物。
+- 历史回测不得读取账户或调用订单入口。零成本、固定名义本金、非组合容量约束和不能完全消除的幸存者偏差必须在报告和交付结论中明确披露。

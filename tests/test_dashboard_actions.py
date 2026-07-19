@@ -18,7 +18,8 @@ class DashboardActionsTests(TestCase):
     def test_action_status_marks_matching_watchcode_ready(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            watch_path = root / "watch_codes.txt"
+            watch_path = root / "data" / "watchcodes" / "watch_codes.txt"
+            watch_path.parent.mkdir(parents=True)
             watch_path.write_text("# signal_date=2026-07-10\nUS.HAO\nUS.RNAZ\n", encoding="utf-8")
             with patch.object(dashboard_actions, "_expected_signal_date", return_value=date(2026, 7, 10)):
                 with patch.object(dashboard_actions, "_read_watchcode_signal_date", return_value=date(2026, 7, 10)):
@@ -31,7 +32,8 @@ class DashboardActionsTests(TestCase):
     def test_action_status_reports_premarket_watchcode_separately(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
-            path = root / "watch_codes_premarket.txt"
+            path = root / "data" / "watchcodes" / "watch_codes_premarket.txt"
+            path.parent.mkdir(parents=True)
             path.write_text("# signal_date=2026-07-10\nUS.HAO\nUS.RNAZ\n", encoding="utf-8")
             with patch.object(dashboard_actions, "_expected_signal_date", return_value=date(2026, 7, 10)):
                 status = dashboard_actions.action_status(root)

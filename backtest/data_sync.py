@@ -26,11 +26,11 @@ from backtest.daily_sources import (
     YahooDailyConfig,
     fetch_massive_grouped_daily_bars_with_failures,
     fetch_moomoo_daily_bars,
-    fetch_yahoo_daily_bars,
     fetch_yahoo_daily_bars_with_failures,
     coalesced_date_ranges,
     failure_dates,
     filter_daily_bars_to_dates,
+    format_elapsed,
     is_massive_rate_limit_failure,
     merge_daily_bars,
 )
@@ -626,17 +626,6 @@ def planned_chunk_count(config: DataSyncConfig, chunk_days: int) -> int:
     if config.max_date_chunks is not None:
         chunks = min(chunks, config.max_date_chunks)
     return max(0, chunks)
-
-
-def format_elapsed(seconds: float) -> str:
-    total = int(seconds)
-    hours, rem = divmod(total, 3600)
-    minutes, secs = divmod(rem, 60)
-    if hours:
-        return f"{hours}h{minutes:02d}m{secs:02d}s"
-    if minutes:
-        return f"{minutes}m{secs:02d}s"
-    return f"{secs}s"
 
 
 def date_chunks(start_date: date, end_date: date, chunk_days: int):

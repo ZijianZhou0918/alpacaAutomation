@@ -2,8 +2,16 @@
 .idea/
 __pycache__/
 *.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
 .env
 outputs/
+/output/
 .codex-remote-attachments/
 backtest/output/
 backtest/data/
+intraday_top20/example_data/
+intraday_top20/outputs/

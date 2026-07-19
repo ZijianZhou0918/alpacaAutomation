@@ -9,11 +9,12 @@ from time import perf_counter
 from zoneinfo import ZoneInfo
 
 from .alpaca_connection import build_trading_connection, load_alpaca_credentials
-from .config import GAP_CONFIRMED_PULLBACK_STRATEGY_NAME, MA5_DIP_STRATEGY_NAME, Settings, build_settings
+from .config import GAP_CONFIRMED_PULLBACK_STRATEGY_NAME, Settings, build_settings
 from .console_notify import send_console_notification
 from .errors import short_error
 from .final_strategy import OPTIMIZATION_RULES, WATCHLIST_SIGNAL_PARAMS
 from .market_time import daily_request_end, stale_sip_daily_end
+from .strategy_framework import get_strategy_registry, resolve_strategy_runtime
 from . import strategy_ma5_dip
 from .watchlist import read_watch_codes, to_alpaca_symbol
 from .watchlist_charts import ensure_watchlist_chart_server_running, watchlist_chart_http_url, write_watchlist_chart_page
@@ -29,6 +30,7 @@ MIN_CLOSE_TO_MA5_RATIO = WATCHLIST_SIGNAL_PARAMS["MIN_CLOSE_TO_MA5_RATIO"]
 MAX_CLOSE_TO_MA5_RATIO = OPTIMIZATION_RULES["max_close_to_ma5_ratio"]
 MIN_SIGNAL_CLOSE_POSITION_PCT = OPTIMIZATION_RULES["min_signal_close_position_pct"]
 REQUIRE_MA5_GT_MA10_GT_MA20 = bool(OPTIMIZATION_RULES["require_ma5_gt_ma10_gt_ma20"])
+MA5_DIP_MIN_CLOSE_TO_MA5_RATIO = 1.15
 
 
 @dataclass(frozen=True)
@@ -40,6 +42,7 @@ class WatchlistScreenRules:
     max_close_to_ma5_ratio: float
     min_signal_close_position_pct: float
     require_ma5_gt_ma10_gt_ma20: bool
+    include_min_close_to_ma5_ratio: bool = False
 
 
 GAP_CONFIRMED_WATCHLIST_RULES = WatchlistScreenRules(
@@ -56,11 +59,24 @@ MA5_DIP_WATCHLIST_RULES = WatchlistScreenRules(
     strategy_ma5_dip.MIN_SIGNAL_DAY_GAIN_PCT,
     0.0,
     0.0,
-    1.0,
+    MA5_DIP_MIN_CLOSE_TO_MA5_RATIO,
     999.0,
     0.0,
     False,
+    True,
 )
+
+
+def gap_confirmed_watchlist_rules() -> WatchlistScreenRules:
+    return WatchlistScreenRules(
+        MIN_SIGNAL_GAIN_PCT,
+        MIN_SIGNAL_GAIN_OVER_MA5_GAIN_PCT,
+        MIN_OPEN_TO_MA5_RATIO,
+        MIN_CLOSE_TO_MA5_RATIO,
+        MAX_CLOSE_TO_MA5_RATIO,
+        MIN_SIGNAL_CLOSE_POSITION_PCT,
+        REQUIRE_MA5_GT_MA10_GT_MA20,
+    )
 
 
 def ma5_dip_watchlist_rules() -> WatchlistScreenRules:
@@ -68,10 +84,11 @@ def ma5_dip_watchlist_rules() -> WatchlistScreenRules:
         strategy_ma5_dip.MIN_SIGNAL_DAY_GAIN_PCT,
         0.0,
         0.0,
-        1.0,
+        MA5_DIP_MIN_CLOSE_TO_MA5_RATIO,
         999.0,
         0.0,
         False,
+        True,
     )
 
 
@@ -124,7 +141,8 @@ def generate_watch_codes(
     symbol_pool = symbols or load_tradable_symbols(max_symbols=max_symbols)
     if max_symbols is not None:
         symbol_pool = symbol_pool[:max_symbols]
-    rules = watchlist_screen_rules(settings.strategy_name)
+    strategy_runtime = resolve_strategy_runtime(settings)
+    rules = strategy_runtime.watchlist.screen_rules()
 
     print(f"开始生成 watch_codes：symbols={len(symbol_pool)} feed={feed}", flush=True)
     bars_by_symbol = fetch_daily_bars(symbol_pool, now_et, lookback_days, batch_size, feed)
@@ -146,7 +164,8 @@ def generate_watch_codes(
                 "动作：后续盘中监控会基于该文件检测买入/卖出信号。",
                 "",
                 "生成结果",
-                f"- 策略：{settings.strategy_name}",
+                f"- 策略组合：{strategy_runtime.selection.profile_name}",
+                f"- WatchCode 策略：{strategy_runtime.selection.watchlist_strategy_name}",
                 f"- 候选数量：{len(candidates)}",
                 f"- 观察文件：{settings.watch_codes_file}",
                 f"- 图表链接：{chart_url}",
@@ -159,9 +178,8 @@ def generate_watch_codes(
 
 
 def watchlist_screen_rules(strategy_name: str | None = None) -> WatchlistScreenRules:
-    if (strategy_name or GAP_CONFIRMED_PULLBACK_STRATEGY_NAME) == MA5_DIP_STRATEGY_NAME:
-        return ma5_dip_watchlist_rules()
-    return GAP_CONFIRMED_WATCHLIST_RULES
+    name = strategy_name or GAP_CONFIRMED_PULLBACK_STRATEGY_NAME
+    return get_strategy_registry().watchlist(name).screen_rules()
 
 
 def load_tradable_symbols(max_symbols: int | None = None) -> list[str]:
@@ -348,6 +366,15 @@ def latest_completed_signal_date(bars_by_symbol: dict[str, list[DailyBar]], now_
     return max(dates) if dates else None
 
 
+def meets_min_close_to_ma5_ratio(close: float, ma5: float, rules: WatchlistScreenRules) -> bool:
+    if ma5 <= 0:
+        return False
+    ratio = close / ma5
+    if rules.include_min_close_to_ma5_ratio:
+        return ratio >= rules.min_close_to_ma5_ratio
+    return ratio > rules.min_close_to_ma5_ratio
+
+
 def evaluate_watch_candidate(
     symbol: str,
     bars: list[DailyBar],
@@ -383,7 +410,7 @@ def evaluate_watch_candidate(
         return None
     if gain_pct - ma5_gain_pct <= rules.min_signal_gain_over_ma5_gain_pct:
         return None
-    if ma5 <= 0 or signal.close / ma5 <= rules.min_close_to_ma5_ratio:
+    if not meets_min_close_to_ma5_ratio(signal.close, ma5, rules):
         return None
     if ma5 <= 0 or signal.close / ma5 > rules.max_close_to_ma5_ratio:
         return None
@@ -414,9 +441,12 @@ def evaluate_watch_candidate(
 def validate_candidates(candidates: list[WatchCandidate], *, rules: WatchlistScreenRules | None = None) -> None:
     """写入前再次校验，防止异常数据进入真实监控列表。"""
     rules = rules or GAP_CONFIRMED_WATCHLIST_RULES
+    min_close_operator = ">=" if rules.include_min_close_to_ma5_ratio else ">"
     for candidate in candidates:
-        if candidate.ma5 <= 0 or candidate.close / candidate.ma5 <= rules.min_close_to_ma5_ratio:
-            raise RuntimeError(f"{candidate.symbol} 收盘价不满足 close/MA5>{rules.min_close_to_ma5_ratio:g}")
+        if not meets_min_close_to_ma5_ratio(candidate.close, candidate.ma5, rules):
+            raise RuntimeError(
+                f"{candidate.symbol} 收盘价不满足 close/MA5{min_close_operator}{rules.min_close_to_ma5_ratio:g}"
+            )
         if candidate.ma5 <= 0 or candidate.close / candidate.ma5 > rules.max_close_to_ma5_ratio:
             raise RuntimeError(f"{candidate.symbol} 收盘价不满足 close/MA5<={rules.max_close_to_ma5_ratio:g}")
         if candidate.ma5 <= 0 or candidate.open / candidate.ma5 <= rules.min_open_to_ma5_ratio:
@@ -472,10 +502,11 @@ def write_watch_codes(path: Path, candidates: list[WatchCandidate], *, rules: Wa
     """写出监控直接读取的 watch_codes.txt。"""
     rules = rules or GAP_CONFIRMED_WATCHLIST_RULES
     ma_order_text = "MA5>MA10>MA20" if rules.require_ma5_gt_ma10_gt_ma20 else "MA order not required"
+    min_close_operator = ">=" if rules.include_min_close_to_ma5_ratio else ">"
     lines = [
         "# Auto-generated by watchcode_ma5.py",
         "# Pool: Alpaca active/tradable regular common stocks only",
-        f"# Rules: gain>{rules.min_signal_gain_pct:.0%}, signal_gain>ma5_gain+{rules.min_signal_gain_over_ma5_gain_pct:.0%}, close/MA5>{rules.min_close_to_ma5_ratio:g}, close/MA5<={rules.max_close_to_ma5_ratio:g}, open/MA5>{rules.min_open_to_ma5_ratio:g}, close_position>={rules.min_signal_close_position_pct:.0%}, {ma_order_text}",
+        f"# Rules: gain>{rules.min_signal_gain_pct:.0%}, signal_gain>ma5_gain+{rules.min_signal_gain_over_ma5_gain_pct:.0%}, close/MA5{min_close_operator}{rules.min_close_to_ma5_ratio:g}, close/MA5<={rules.max_close_to_ma5_ratio:g}, open/MA5>{rules.min_open_to_ma5_ratio:g}, close_position>={rules.min_signal_close_position_pct:.0%}, {ma_order_text}",
     ]
     if candidates:
         lines.append(f"# signal_date={candidates[0].signal_date}")

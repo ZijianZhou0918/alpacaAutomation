@@ -128,16 +128,37 @@ def consumes_daily_buy_slot(status: str) -> bool:
     return is_executed_order_status(status)
 
 
+_UNCONFIRMED_ORDER_STATUSES = {
+    "ACCEPTED",
+    "ACCEPTED_FOR_BIDDING",
+    "CALCULATED",
+    "CANCEL_FAILED",
+    "CANCEL_REQUESTED",
+    "DONE_FOR_DAY",
+    "HELD",
+    "NEW",
+    "PARTIALLY_FILLED",
+    "PENDING_CANCEL",
+    "PENDING_NEW",
+    "PENDING_REVIEW",
+    "PENDING_REPLACE",
+    "REPLACED",
+    "STOPPED",
+    "SUBMIT_UNCONFIRMED",
+    "SUBMITTED",
+    "SUSPENDED",
+}
+
+
 def has_unconfirmed_order_status(status: str) -> bool:
-    """判断订单是否仍可能有未确认暴露，用于本轮暂停继续买入。"""
+    """判断订单是否仍可能有未确认暴露，用于本轮暂停继续下单。
+
+    ``PARTIALLY_FILLED_*`` 同时表达“已经有成交”和“剩余订单处于什么状态”。
+    因此不能仅凭 PARTIALLY_FILLED 前缀就当作终态：例如
+    PARTIALLY_FILLED_CANCEL_REQUESTED 仍有未确认余量，而
+    PARTIALLY_FILLED_CANCELED 才表示剩余挂单已结束。
+    """
     status = status.upper()
-    return status in {
-        "ACCEPTED",
-        "CANCEL_FAILED",
-        "CANCEL_REQUESTED",
-        "HELD",
-        "NEW",
-        "PENDING_CANCEL",
-        "PENDING_NEW",
-        "SUBMITTED",
-    }
+    if status.startswith("PARTIALLY_FILLED_"):
+        status = status.removeprefix("PARTIALLY_FILLED_")
+    return status in _UNCONFIRMED_ORDER_STATUSES
