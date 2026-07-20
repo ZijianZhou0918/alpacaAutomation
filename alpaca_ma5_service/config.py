@@ -114,7 +114,11 @@ def build_settings(
     )
     defaults = strategy_runtime_defaults(selection.profile_name)
     max_daily_buys = defaults["max_daily_buys"] if buy_stock_count is None else validate_buy_stock_count(buy_stock_count)
-    buy_notional = BUY_NOTIONAL_USD if buy_notional_usd is None else validate_buy_notional_usd(buy_notional_usd)
+    buy_notional = (
+        float(defaults.get("buy_notional_usd", BUY_NOTIONAL_USD))
+        if buy_notional_usd is None
+        else validate_buy_notional_usd(buy_notional_usd)
+    )
     realtime_source = (
         realtime_price_source
         if realtime_price_source is not None

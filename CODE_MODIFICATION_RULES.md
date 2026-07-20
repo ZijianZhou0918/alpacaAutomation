@@ -451,3 +451,18 @@ Schema、主键、复权或时区变更必须提供迁移/兼容方案，先备�
 - 正式日线库保持只读且不得写入分钟线。候选分钟线使用独立缓存、SIP、`split`；不得静默回退到其他 feed。
 - 修改信号、动态均线、成交时序、退出或成本时，必须运行 `tests.test_signal_dynamic_ma5_backtest`，再运行全项目测试，并执行真实历史回测核对 JSON、CSV 和 HTML 三类产物。
 - 历史回测不得读取账户或调用订单入口。零成本、固定名义本金、非组合容量约束和不能完全消除的幸存者偏差必须在报告和交付结论中明确披露。
+
+## 20. Gap pullback 参数研究
+
+`backtest/gap_strategy_optimization.py` 及两个
+`run_backtest_gap_strategy_*` 根入口是隔离的历史研究链路：
+
+- 原始基线必须在研究模块内显式冻结为 `-8%..-2%` 回撤、`+8%` 全部止盈，不能因 `final_strategy.py` 后续更新而漂移。
+- stage1/stage2 只能使用 2025-01-01..09-30；Q4 只能在候选清单落盘后打开一次；所有阶段必须拒绝 2026。不得根据 Q4 或用户保留的 2026 继续改参数。
+- 正式日线库只读；SIP/split 分钟线只写独立 gap 缓存。基线候选集合是缓存上界，任何变体扩大候选集合都必须失败关闭。
+- 冻结候选必须有相邻参数平台、季度切片、最少交易数、利润因子、最大回撤、日块 bootstrap、Wilson 区间、PBO/Deflated Sharpe 和滑点压力结果；只提高胜率但利润因子跌破 1 的候选不得部署。
+- 总收益研究的选择指标必须是固定初始现金下、计入预先声明滑点后的组合收益，不得用逐笔收益简单相加或靠超过现金余额的名义敞口制造“最大收益”。信号与资金配置必须分层，matched-sizing 结果必须单独披露。
+- `return_signal/return_sizing` 只读 2025-01-01..09-30；`return_frozen_selection_manifest.json` 必须在计算候选 Q4 前落盘。Q4 绝对收益为负、利润因子低于 1、或留出回撤突破开发护栏时，候选只能保留为研究产物，不得写入 profile 或启动 Paper/Live。
+- 总收益 PBO 必须与总收益选择目标一致；不同资金倍数不能混进等风险的信号 PBO。10bp 主成本、25bp 压力、原始金额基线和 matched-sizing 基线都必须保留。
+- 修改冻结买点、退出、金额或 profile 运行默认值，必须同步修改 `final_strategy.py`、profile、盘中配置装配和固定样例测试；默认 `ma5_dip` 不得被研究入口自动切换。
+- 最低测试为 `tests.test_gap_strategy_optimization`、`tests.test_strategy_validation`、`tests.test_gap_strategy_validation_report`、`tests.test_intraday_workflow_config`、`tests.test_strategy_framework`、`tests.test_strategy` 和 `tests.test_backtest`，重新生成胜率/总收益验证报告，然后运行全项目测试。

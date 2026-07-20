@@ -932,16 +932,52 @@ def sorted_watch_candidates(
     candidates: list[watchlist_module.WatchCandidate],
     optimization_rules: dict[str, object] | None,
 ) -> list[watchlist_module.WatchCandidate]:
-    sort_name = str((optimization_rules or {}).get("candidate_sort") or "gain_desc_upper_desc")
+    rules = optimization_rules or {}
+    sort_name = str(rules.get("candidate_sort") or "gain_desc_upper_desc")
     if sort_name == "gain_asc_upper_asc":
-        return sorted(candidates, key=lambda item: (item.gain_pct, item.upper_shadow_pct, item.symbol))
-    if sort_name == "upper_asc_gain_desc":
-        return sorted(candidates, key=lambda item: (item.upper_shadow_pct, -item.gain_pct, item.symbol))
-    if sort_name == "body_desc_upper_asc":
-        return sorted(candidates, key=lambda item: (-item.body_pct, item.upper_shadow_pct, -item.gain_pct, item.symbol))
-    if sort_name == "close_to_ma5_asc_gain_desc":
-        return sorted(candidates, key=lambda item: (item.close / item.ma5 if item.ma5 > 0 else 999.0, -item.gain_pct, item.symbol))
-    return sorted(candidates, key=lambda item: (item.gain_pct, item.upper_shadow_pct, item.symbol), reverse=True)
+        ordered = sorted(candidates, key=lambda item: (item.gain_pct, item.upper_shadow_pct, item.symbol))
+    elif sort_name == "upper_asc_gain_desc":
+        ordered = sorted(candidates, key=lambda item: (item.upper_shadow_pct, -item.gain_pct, item.symbol))
+    elif sort_name == "body_desc_upper_asc":
+        ordered = sorted(candidates, key=lambda item: (-item.body_pct, item.upper_shadow_pct, -item.gain_pct, item.symbol))
+    elif sort_name == "close_to_ma5_asc_gain_desc":
+        ordered = sorted(candidates, key=lambda item: (_candidate_close_to_ma5(item, 999.0), -item.gain_pct, item.symbol))
+    elif sort_name == "close_to_ma5_desc_gain_desc":
+        ordered = sorted(candidates, key=lambda item: (-_candidate_close_to_ma5(item, 0.0), -item.gain_pct, item.symbol))
+    elif sort_name == "close_position_desc_gain_desc":
+        ordered = sorted(candidates, key=lambda item: (-_candidate_close_position(item), -item.gain_pct, item.symbol))
+    elif sort_name == "range_desc_gain_desc":
+        ordered = sorted(candidates, key=lambda item: (-_candidate_range_to_close(item), -item.gain_pct, item.symbol))
+    elif sort_name == "range_asc_gain_desc":
+        ordered = sorted(candidates, key=lambda item: (_candidate_range_to_close(item), -item.gain_pct, item.symbol))
+    else:
+        # Preserve the exact legacy tie-breaking behavior for the baseline.
+        ordered = sorted(
+            candidates,
+            key=lambda item: (item.gain_pct, item.upper_shadow_pct, item.symbol),
+            reverse=True,
+        )
+
+    max_candidates = rule_int(rules, "max_watchlist_candidates")
+    if max_candidates is not None:
+        return ordered[:max(0, max_candidates)]
+    return ordered
+
+
+def _candidate_close_to_ma5(
+    candidate: watchlist_module.WatchCandidate,
+    fallback: float,
+) -> float:
+    return candidate.close / candidate.ma5 if candidate.ma5 > 0 else fallback
+
+
+def _candidate_close_position(candidate: watchlist_module.WatchCandidate) -> float:
+    width = candidate.high - candidate.low
+    return (candidate.close - candidate.low) / width if width > 0 else 0.0
+
+
+def _candidate_range_to_close(candidate: watchlist_module.WatchCandidate) -> float:
+    return (candidate.high - candidate.low) / candidate.close if candidate.close > 0 else 0.0
 
 
 def evaluate_historical_watch_candidate(
@@ -1112,8 +1148,13 @@ def passes_optimization_daily_filters(
         return False
 
     signal_volume = safe_float(signal.volume)
+    signal_dollar_volume = signal.close * signal_volume
     min_signal_dollar_volume = rule_float(rules, "min_signal_dollar_volume")
-    if min_signal_dollar_volume is not None and signal.close * signal_volume < min_signal_dollar_volume:
+    if min_signal_dollar_volume is not None and signal_dollar_volume < min_signal_dollar_volume:
+        return False
+
+    max_signal_dollar_volume = rule_float(rules, "max_signal_dollar_volume")
+    if max_signal_dollar_volume is not None and signal_dollar_volume > max_signal_dollar_volume:
         return False
 
     min_signal_volume_to_avg20 = rule_float(rules, "min_signal_volume_to_avg20")
@@ -2460,28 +2501,72 @@ def symbol_minute_filename(symbol: str) -> str:
 
 
 def symbol_detail_table(trades: list[TradeRecord]) -> str:
-    symbols = traded_symbols_by_latest_activity(trades)
+    symbols = traded_symbols(trades)
     if not symbols:
         return "<p class='note'>本次回测没有成交股票。</p>"
+
+    round_rows: list[dict[str, object]] = []
+    for symbol in symbols:
+        alpaca_symbol = to_alpaca_symbol(symbol)
+        symbol_trades = sorted(
+            [
+                trade
+                for trade in trades
+                if to_alpaca_symbol(trade.symbol) == alpaca_symbol
+            ],
+            key=lambda trade: trade.timestamp,
+        )
+        windows = symbol_trade_windows(normalize_symbol(symbol), symbol_trades)
+        for window_index, window in enumerate(windows):
+            window_trades = list(window["trades"])
+            if not window_trades:
+                continue
+            round_rows.append(
+                {
+                    "symbol": symbol,
+                    "window_index": window_index,
+                    "round_count": len(windows),
+                    "trades": window_trades,
+                    "buy_day": str(window["buy_day"] or "—"),
+                    "sell_days": ", ".join(window["sell_days"]) or "—",
+                    "latest": max(trade.timestamp for trade in window_trades),
+                }
+            )
+    round_rows.sort(
+        key=lambda row: (
+            -row["latest"].timestamp(),
+            to_alpaca_symbol(str(row["symbol"])),
+            -int(row["window_index"]),
+        )
+    )
+
     rows = []
-    for rank, symbol in enumerate(symbols, start=1):
-        symbol_trades = [trade for trade in trades if to_alpaca_symbol(trade.symbol) == to_alpaca_symbol(symbol)]
-        buy_count = sum(1 for trade in symbol_trades if trade.side == "BUY")
-        sell_count = sum(1 for trade in symbol_trades if trade.side == "SELL")
-        realized = sum(trade.realized_pnl for trade in symbol_trades if trade.side == "SELL")
-        latest_time = max(trade.timestamp for trade in symbol_trades).isoformat(timespec="minutes")
+    for rank, round_row in enumerate(round_rows, start=1):
+        symbol = str(round_row["symbol"])
+        window_index = int(round_row["window_index"])
+        window_trades = list(round_row["trades"])
+        buy_count = sum(1 for trade in window_trades if trade.side == "BUY")
+        sell_count = sum(1 for trade in window_trades if trade.side == "SELL")
+        realized = sum(
+            trade.realized_pnl for trade in window_trades if trade.side == "SELL"
+        )
+        latest_time = round_row["latest"].isoformat(timespec="minutes")
         latest_label = latest_time.replace("T", " ")
         link = f"symbol_details/{html.escape(symbol_detail_filename(symbol))}"
         minute_link = f"symbol_details/{html.escape(symbol_minute_filename(symbol))}"
         label = html.escape(normalize_symbol(symbol))
         symbol_key = html.escape(to_alpaca_symbol(symbol))
         rows.append(
-            f"<tr data-symbol='{symbol_key}' data-realized-pnl='{realized:.8f}' data-rounds='{buy_count}' "
+            f"<tr data-symbol='{symbol_key}' data-realized-pnl='{realized:.8f}' "
+            f"data-rounds='{int(round_row['round_count'])}' data-window-index='{window_index}' "
             f"data-latest-time='{html.escape(latest_time)}'>"
             f"<td class='rank-cell' data-row-rank>{rank:02d}</td>"
             f"<td class='symbol-cell'><button class='detail-button' type='button' data-symbol='{symbol_key}' "
+            f"data-window-index='{window_index}' "
             f"data-detail-url='{link}' data-minute-url='{minute_link}' "
-            f"aria-label='打开 {label} 的 K 线和交易证据'>{label}</button></td>"
+            f"aria-label='打开 {label} 第 {window_index + 1} 轮的 K 线和交易证据'>{label}</button></td>"
+            f"<td>{html.escape(str(round_row['buy_day']))}</td>"
+            f"<td>{html.escape(str(round_row['sell_days']))}</td>"
             f"<td>{buy_count}</td>"
             f"<td>{sell_count}</td>"
             f"<td class='pnl-cell' data-tone='{'positive' if realized > 0 else 'negative' if realized < 0 else 'neutral'}'>"
@@ -2490,8 +2575,9 @@ def symbol_detail_table(trades: list[TradeRecord]) -> str:
             "</tr>"
         )
     return (
-        "<table id='symbol-detail-table'><thead><tr><th class='rank-cell'>#</th><th>股票</th><th>买入次数</th>"
-        "<th>卖出次数</th><th>已实现收益</th><th>最近交易时间</th></tr></thead>"
+        "<table id='symbol-detail-table'><thead><tr><th class='rank-cell'>#</th><th>股票</th>"
+        "<th>买入日</th><th>卖出日</th><th>买入次数</th><th>卖出次数</th>"
+        "<th>已实现收益</th><th>本轮最新时间</th></tr></thead>"
         f"<tbody>{''.join(rows)}</tbody></table>"
     )
 
@@ -2709,7 +2795,11 @@ def rounded_optional(value: float | None) -> float | None:
     return round(value, 4) if value is not None else None
 
 
-def symbol_trade_windows(symbol: str, trades: list[TradeRecord], config: BacktestConfig) -> list[dict[str, object]]:
+def symbol_trade_windows(
+    symbol: str,
+    trades: list[TradeRecord],
+    config: BacktestConfig | None = None,
+) -> list[dict[str, object]]:
     buys = [trade for trade in trades if trade.side == "BUY"]
     windows: list[dict[str, object]] = []
     for index, buy in enumerate(buys):

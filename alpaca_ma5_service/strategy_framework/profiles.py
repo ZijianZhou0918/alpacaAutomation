@@ -37,7 +37,8 @@ def register_builtin_profiles(registry: StrategyRegistry) -> None:
             sell_strategy_name=DEFAULT_SELL_STRATEGY_NAME,
             cancel_strategy_name=DEFAULT_CANCEL_STRATEGY_NAME,
             runtime_defaults={
-                "max_daily_buys": 3,
+                "buy_notional_usd": final_strategy.BUY_NOTIONAL_USD,
+                "max_daily_buys": final_strategy.MAX_DAILY_BUYS,
                 "stop_loss_pct": final_strategy.STOP_PARAMS["stop_loss_pct"],
                 "stop_loss_limit_pct": final_strategy.STOP_PARAMS["stop_loss_limit_pct"],
                 "take_profit_half_pct": final_strategy.STOP_PARAMS["take_profit_half_pct"],

@@ -11,7 +11,7 @@ from alpaca_ma5_service.entrypoint import ensure_local_venv
 
 ensure_local_venv()
 
-from alpaca_ma5_service import strategy_ma5_dip
+from alpaca_ma5_service import final_strategy, strategy_ma5_dip
 from alpaca_ma5_service.config import MA5_DIP_STRATEGY_NAME, build_settings
 from alpaca_ma5_service.final_strategy import STRATEGY_NAME as GAP_CONFIRMED_PULLBACK_STRATEGY
 from alpaca_ma5_service.monitor_runtime import monitor_runtime
@@ -39,7 +39,9 @@ from alpaca_ma5_service.strategy_framework import (
 # 选择基础策略组合。它提供四类策略的默认值。
 # 用法：保留 MA5_DIP_STRATEGY_NAME 就是老的 5 日均线低吸；
 # 如果要切到新策略，把右边改成 GAP_CONFIRMED_PULLBACK_STRATEGY。
-STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
+# gap 组合当前使用 $2,500、每日最多 3 只、
+# -8% 止损和 +4% 全部止盈；下面的 MA5 金额和风控值不会覆盖它。
+STRATEGY_NAME = GAP_CONFIRMED_PULLBACK_STRATEGY
 
 # 分别选择 WatchCode、买入、卖出和自动撤单策略。
 # 默认保持同一组合；也可以只替换其中一项，启动时会先验证名称和组合是否有效。
@@ -51,12 +53,12 @@ CANCEL_STRATEGY_NAME = DEFAULT_CANCEL_STRATEGY_NAME
 # 每天最多买入几只股票。
 # 用法：想试水就设小，比如 1 到 3；想放大覆盖面再调高。
 # 注意：这里控制“成交买入名额”，不是 watch_codes.txt 的观察数量。
-BUY_STOCK_COUNT = 2
+BUY_STOCK_COUNT = 3
 
 # 每只股票本轮最多使用多少美元买入。
 # 用法：1500.0 表示每只最多 1500 美元；账户现金不足时会按剩余名额动态压低单只金额。
 # 注意：不要写成字符串，也不要带 $ 符号。
-BUY_NOTIONAL_USD = 2_000.0
+BUY_NOTIONAL_USD = 2_500.0
 
 # 老 MA5 低吸策略：信号日最低涨幅。
 # 用法：0.15 表示信号日涨幅至少 15% 才有买点；想放宽就调低，想严格就调高。
@@ -186,20 +188,31 @@ def build_monitor_settings():
     if MA5_DIP_STRATEGY_NAME in {WATCHLIST_STRATEGY_NAME, BUY_STRATEGY_NAME}:
         apply_ma5_dip_config()
 
+    gap_profile_selected = STRATEGY_NAME == GAP_CONFIRMED_PULLBACK_STRATEGY
+    risk_overrides = (
+        {}
+        if gap_profile_selected
+        else {
+            "stop_loss_pct": STOP_LOSS_PCT,
+            "stop_loss_limit_pct": STOP_LOSS_LIMIT_PCT,
+            "take_profit_half_pct": TAKE_PROFIT_HALF_PCT,
+            "take_profit_sell_fraction": TAKE_PROFIT_SELL_FRACTION,
+            "take_profit_remainder_stop_pct": TAKE_PROFIT_REMAINDER_STOP_PCT,
+        }
+    )
     return build_settings(
         strategy_profile_name=STRATEGY_NAME,
         watchlist_strategy_name=WATCHLIST_STRATEGY_NAME,
         buy_strategy_name=BUY_STRATEGY_NAME,
         sell_strategy_name=SELL_STRATEGY_NAME,
         cancel_strategy_name=CANCEL_STRATEGY_NAME,
-        buy_stock_count=BUY_STOCK_COUNT,
-        buy_notional_usd=BUY_NOTIONAL_USD,
+        buy_stock_count=None if gap_profile_selected else BUY_STOCK_COUNT,
+        buy_notional_usd=(
+            final_strategy.BUY_NOTIONAL_USD
+            if gap_profile_selected
+            else BUY_NOTIONAL_USD
+        ),
         max_symbol_order_errors=MAX_SYMBOL_ORDER_ERRORS,
-        stop_loss_pct=STOP_LOSS_PCT,
-        stop_loss_limit_pct=STOP_LOSS_LIMIT_PCT,
-        take_profit_half_pct=TAKE_PROFIT_HALF_PCT,
-        take_profit_sell_fraction=TAKE_PROFIT_SELL_FRACTION,
-        take_profit_remainder_stop_pct=TAKE_PROFIT_REMAINDER_STOP_PCT,
         close_liquidation_start=CLOSE_LIQUIDATION_START,
         close_liquidation_end=CLOSE_LIQUIDATION_END,
         regular_poll_seconds=REGULAR_POLL_SECONDS,
@@ -211,6 +224,7 @@ def build_monitor_settings():
         order_status_poll_seconds=ORDER_STATUS_POLL_SECONDS,
         realtime_price_source=REALTIME_PRICE_SOURCE,
         trade_notify_mode=TRADE_NOTIFY_MODE,
+        **risk_overrides,
     )
 
 

@@ -230,6 +230,44 @@ git diff --check
 .\.venv\Scripts\python.exe -m unittest tests.test_signal_dynamic_ma5_backtest -v
 ```
 
+## 13.1 Gap pullback 受限优化与验证
+
+入口：
+
+```powershell
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase baseline
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase stage1
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase stage2
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase holdout --start-date 2025-10-01 --end-date 2025-12-31
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase robustness --start-date 2025-01-01 --end-date 2025-12-31
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_validation.py
+
+# 总收益目标（10bp/成交，固定 $100,000，无杠杆）
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase return_signal
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase return_sizing
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase return_holdout --start-date 2025-10-01 --end-date 2025-12-31
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_optimization.py --phase return_robustness --start-date 2025-01-01 --end-date 2025-12-31
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_return_validation.py
+```
+
+- 开发窗口固定为 2025-01-01..09-30；stage1 固定 25 个单因素试验，stage2 固定 6 个相邻组合。冻结参数为相对信号日收盘回撤 `-8%..-5%` 买入、盈利 `4%` 全部卖出。
+- 2025-Q4 是一次性留出集；`frozen_selection_manifest.json` 必须在任何 Q4 分钟下载前写出，留出结果不得用于继续调参。2026 固定为用户外部交叉验证集，研究入口对任何 2026 日期硬失败。
+- 日线只读 `backtest/data/market_data.sqlite`；分钟线仅写 `backtest/data/gap_strategy_2025_minute_cache.sqlite`，feed 固定 SIP、复权固定 `split`，不得回退 IEX。
+- 结果在 `backtest/output/gap_strategy_optimization/`，包括逐阶段 JSON/CSV、逐笔交易、冻结清单、验证 JSON/Markdown 和可执行 notebook。零成本、10bp/笔和 25bp/笔滑点结果必须同时保留。
+- 该入口只读历史行情，不读取账户、持仓或订单，不启动监控、WatchCode、网页或计划任务。回测和下载属于重型任务，必须全局串行。
+- 当前盘中默认已按用户明确要求切换为 gap profile，运行时使用 `$2,500`、每日最多 3 笔/3 个持仓、`-8%` 止损和 `+4%` 全部止盈；WatchCode 同样执行信号日振幅不超过 `30%`。`ma5_dip` 仍保留为可选 profile，但不是 `workflows/monitoring/intraday.py` 的当前默认值。
+- 当前代码的 daily-3 优化入口为 `run_backtest_gap_strategy_current_daily3_optimization.py`：`development` 只读 2025-01-01..09-30 并先冻结，`diagnostic` 只读 2025-Q4，`validate-2026` 只允许一次读取 2026-01-01..07-17 且拒绝覆盖已有结果。研究使用正式只读日线库、独立 SIP 分钟缓存和每次成交 `10bp` 成本，不读取账户或订单。
+- 总收益阶段先在相同 `$3,500` 仓位测试 12 个受限信号，再对冻结信号测试 7 个现金配置；候选必须至少 500 笔、利润因子不低于 1.10、开发期最大回撤不差于 `-15%`，且 Q1/Q2/Q3 都盈利。
+- 总收益候选为 `$20,000 × 5`、回撤至少 4%、信号日收盘位置至少 60%、4% 全部止盈；它的 Q4 绝对收益和利润因子未通过，因此不得写入 profile、不得启动 Paper/Live，必须等待冻结标准后的 2026 盲测。
+- 总收益产物在 `backtest/output/gap_strategy_return_optimization/`；`return_frozen_selection_manifest.json` 必须先于该候选 Q4 结果，事后 matched-sizing 对照只能做归因，不能改变候选。
+
+最低验证：
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest tests.test_gap_strategy_optimization tests.test_strategy_validation tests.test_gap_strategy_validation_report tests.test_intraday_workflow_config -v
+.\.venv\Scripts\python.exe run_backtest_gap_strategy_return_validation.py
+```
+
 ## 14. 日内动态涨幅榜回测网页
 
 ### 边界

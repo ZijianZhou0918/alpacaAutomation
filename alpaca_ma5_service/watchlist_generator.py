@@ -29,6 +29,7 @@ MIN_OPEN_TO_MA5_RATIO = WATCHLIST_SIGNAL_PARAMS["MIN_OPEN_TO_MA5_RATIO"]
 MIN_CLOSE_TO_MA5_RATIO = WATCHLIST_SIGNAL_PARAMS["MIN_CLOSE_TO_MA5_RATIO"]
 MAX_CLOSE_TO_MA5_RATIO = OPTIMIZATION_RULES["max_close_to_ma5_ratio"]
 MIN_SIGNAL_CLOSE_POSITION_PCT = OPTIMIZATION_RULES["min_signal_close_position_pct"]
+MAX_SIGNAL_RANGE_PCT = OPTIMIZATION_RULES["max_signal_range_pct"]
 REQUIRE_MA5_GT_MA10_GT_MA20 = bool(OPTIMIZATION_RULES["require_ma5_gt_ma10_gt_ma20"])
 MA5_DIP_MIN_CLOSE_TO_MA5_RATIO = 1.15
 
@@ -43,6 +44,7 @@ class WatchlistScreenRules:
     min_signal_close_position_pct: float
     require_ma5_gt_ma10_gt_ma20: bool
     include_min_close_to_ma5_ratio: bool = False
+    max_signal_range_pct: float = 999.0
 
 
 GAP_CONFIRMED_WATCHLIST_RULES = WatchlistScreenRules(
@@ -53,6 +55,7 @@ GAP_CONFIRMED_WATCHLIST_RULES = WatchlistScreenRules(
     MAX_CLOSE_TO_MA5_RATIO,
     MIN_SIGNAL_CLOSE_POSITION_PCT,
     REQUIRE_MA5_GT_MA10_GT_MA20,
+    max_signal_range_pct=MAX_SIGNAL_RANGE_PCT,
 )
 
 MA5_DIP_WATCHLIST_RULES = WatchlistScreenRules(
@@ -76,6 +79,7 @@ def gap_confirmed_watchlist_rules() -> WatchlistScreenRules:
         MAX_CLOSE_TO_MA5_RATIO,
         MIN_SIGNAL_CLOSE_POSITION_PCT,
         REQUIRE_MA5_GT_MA10_GT_MA20,
+        max_signal_range_pct=MAX_SIGNAL_RANGE_PCT,
     )
 
 
@@ -420,6 +424,13 @@ def evaluate_watch_candidate(
         return None
     if signal_close_position_pct(signal) < rules.min_signal_close_position_pct:
         return None
+    signal_range_pct = (
+        (signal.high - signal.low) / previous.close
+        if previous.close > 0
+        else 0.0
+    )
+    if signal_range_pct > rules.max_signal_range_pct:
+        return None
 
     return WatchCandidate(
         symbol,
@@ -459,6 +470,15 @@ def validate_candidates(candidates: list[WatchCandidate], *, rules: WatchlistScr
             raise RuntimeError(f"{candidate.symbol} 不满足 MA5>MA10>MA20")
         if signal_close_position_pct(candidate) < rules.min_signal_close_position_pct:
             raise RuntimeError(f"{candidate.symbol} 收盘位置不满足 >= {rules.min_signal_close_position_pct:.0%}")
+        signal_range_to_close = (
+            (candidate.high - candidate.low) / candidate.close
+            if candidate.close > 0 and candidate.low > 0
+            else 0.0
+        )
+        if candidate.low > 0 and signal_range_to_close > rules.max_signal_range_pct:
+            raise RuntimeError(
+                f"{candidate.symbol} 信号日振幅不满足 <= {rules.max_signal_range_pct:.0%}"
+            )
 
 
 def is_completed_bar(bar: DailyBar, now_et: datetime) -> bool:

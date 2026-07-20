@@ -67,7 +67,7 @@ WatchCode 内无持仓股票 -> 买入策略 -> Broker -> 撤单/终态确认
 默认组合和四类策略都在 `alpaca_ma5_service/workflows/monitoring/intraday.py` 顶部配置区选择；根目录 `monitor_ma5_forever.py` 的点击运行/PyCharm 运行方式不变：
 
 ```python
-STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
+STRATEGY_NAME = GAP_CONFIRMED_PULLBACK_STRATEGY
 WATCHLIST_STRATEGY_NAME = STRATEGY_NAME
 BUY_STRATEGY_NAME = STRATEGY_NAME
 SELL_STRATEGY_NAME = DEFAULT_SELL_STRATEGY_NAME
@@ -75,6 +75,7 @@ CANCEL_STRATEGY_NAME = DEFAULT_CANCEL_STRATEGY_NAME
 ```
 
 - `STRATEGY_NAME` 是基础组合，提供四类组件和止损/止盈等运行默认值。
+- 当前盘中默认组合已切换为 gap profile：固定单笔 `$2,500`、每日最多 3 笔/3 个持仓、`-8%` 止损和 `+4%` 全部止盈；信号日振幅上限 `30%` 在线上 WatchCode 与回测中一致执行。`ma5_dip` 仍保留为可选 profile。2025 开发集冻结的新候选在 Q4 和 2026 交叉验证中均未同时超过当前信号，因此没有替换 gap 的信号规则。
 - 四个分类变量可以独立覆盖基础组合；例如 WatchCode 用缺口策略、买入仍用 MA5。
 - `watchcode_ma5.py`、`monitor_auto.py` 和盘中监控共用 `build_monitor_settings()`，不会再分别硬编码两套策略。
 - 所有名称会在行情、账户和订单 I/O 之前统一解析；名称不存在、接口不完整或组合缺组件时直接终止。
@@ -396,6 +397,31 @@ C:\Users\zzj\Desktop\alpaca_ma5_service\.venv\Scripts\python.exe
 买入日的动态 MA5 定义为“前 4 个已完成交易日收盘价 + 当前已完成 1 分钟 K 线收盘价”除以 5。只有当前已完成 1 分钟 K 线收盘价小于或等于动态 MA5，且相对买入日开盘价跌幅严格大于 `15%` 时才触发；为避免前视，统一在下一根 1 分钟 K 线开盘成交，且该实际入场价相对买入日开盘价的跌幅仍须严格大于 `15%`。实际成交时间必须满足 `09:30 <= t < 12:00 ET`，12:00 ET 及以后禁止买入；全天未达到条件就不买。盈利 `5% / 10% / 15%` 时各卖出原始仓位的 `1/3`，亏损 `10%` 清仓，剩余仓位在常规盘最后一分钟收盘清仓；同一分钟同时触发止损和止盈时按止损优先。
 
 候选日分钟线只从 Alpaca SIP 读取并保存到独立缓存 `backtest/data/signal_dynamic_ma5_minute_cache.sqlite`，不会写入正式日线库。结果写入 `backtest/output/signal_dynamic_ma5/`。默认每个候选独立使用 `$10,000` 名义本金、零佣金和零滑点，因此汇总盈亏不是受资金容量与并发持仓约束的组合收益。该入口只读历史行情，不读取账户、持仓或订单，也不启动监控与 WatchCode。
+
+## Gap pullback 2025 受限优化
+
+`run_backtest_gap_strategy_optimization.py` 使用正式 SIP/split 日线库和独立
+gap 分钟缓存。开发集固定为 2025-01-01..09-30，Q4 只在候选冻结后打开一次，
+2026 由代码硬锁并留给外部交叉验证。原胜率研究候选把买入回撤区间从
+`-8%..-2%` 收窄为 `-8%..-5%`，把全仓止盈从 `8%` 改为 `4%`；策略旧名称
+为兼容已有配置继续保留。
+
+阶段结果、逐笔证据、冻结清单、滑点压力、验证 Markdown 和 notebook 位于
+`backtest/output/gap_strategy_optimization/`。用
+`run_backtest_gap_strategy_validation.py` 可从已保存逐笔成交重算置信区间、
+PBO 和 Deflated Sharpe。研究入口不读取账户或订单，也不会自动把当前
+`ma5_dip` 监控切换为 gap。
+
+总收益研究使用同一入口的 `return_signal`、`return_sizing`、
+`return_holdout` 和 `return_robustness` 阶段，以 `$100,000` 初始现金、
+无杠杆、每次成交 `10bp` 滑点后的组合收益为主目标。开发期冻结候选为：
+至少回撤 `4%`、信号日收盘位于当日区间上方 `40%`、盈利 `4%` 全部卖出、
+每笔 `$20,000`、每日/并发最多 5 笔。它在开发期收益为 `145.38%`，但
+Q4 为 `-3.29%`、利润因子 `0.964`、单独最大回撤 `-18.42%`，所以只保留
+为研究候选，不更新 Live profile。用
+`run_backtest_gap_strategy_return_validation.py` 从已保存证据重算报告；产物
+位于 `backtest/output/gap_strategy_return_optimization/`。2026 仍是唯一
+干净的外部交叉验证集。
 
 ## 切换 Paper / Live
 

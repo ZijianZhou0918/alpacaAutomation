@@ -578,7 +578,9 @@
   function bindModal() {
     if (!modal) return;
     document.querySelectorAll("[data-detail-url]").forEach(button => {
-      button.addEventListener("click", () => openDetail(button));
+      button.addEventListener("click", () => {
+        openDetail(button, Number(button.dataset.windowIndex || 0));
+      });
     });
     document.getElementById("detail-modal-back").addEventListener("click", closeDetailModal);
     document.getElementById("detail-modal-close").addEventListener("click", closeDetailModal);
@@ -677,7 +679,7 @@
       });
       updateVisibleRanks();
       const direction = symbolTimeSort?.dataset.direction === "asc" ? "最早优先" : "最新优先";
-      symbolCount.textContent = `${visible} / ${symbolRows.length} 只股票 · ${direction}`;
+      symbolCount.textContent = `${visible} / ${symbolRows.length} 笔交易 · ${direction}`;
     }
 
     function sortSymbolRows(direction) {

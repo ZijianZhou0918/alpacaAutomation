@@ -30,6 +30,7 @@ from backtest.engine import (
     fetch_backtest_daily_bars,
     fetch_candidate_day_minute_bars,
     run_backtest,
+    sorted_watch_candidates,
     symbol_detail_table,
     trade_kline_location,
 )
@@ -190,7 +191,7 @@ class BacktestTests(unittest.TestCase):
         self.assertLess(content.index("data-symbol='NEW'"), content.index("data-symbol='MID'"))
         self.assertLess(content.index("data-symbol='MID'"), content.index("data-symbol='OLD'"))
         self.assertIn("data-latest-time='2026-07-16T14:30-04:00'", content)
-        self.assertIn("最近交易时间", content)
+        self.assertIn("本轮最新时间", content)
         self.assertIn("data-row-rank", content)
 
     def test_symbol_detail_separates_round_and_cumulative_realized_pnl(self):
@@ -246,6 +247,17 @@ class BacktestTests(unittest.TestCase):
         first_buy = payload["windows"][0]["trades"][0]
         self.assertTrue(first_buy["minute_kline_location"]["exact"])
         self.assertEqual(first_buy["minute_kline_location"]["bar_time"], "2026-04-23T09:53-04:00")
+
+        table = symbol_detail_table(trades)
+        self.assertEqual(table.count("<tr data-symbol='NVNI'"), 2)
+        self.assertIn("data-window-index='0'", table)
+        self.assertIn("data-window-index='1'", table)
+        self.assertIn("<th>买入日</th><th>卖出日</th>", table)
+        self.assertIn("2026-04-23", table)
+        self.assertIn("2026-07-16", table)
+        self.assertIn("$-74.46", table)
+        self.assertIn("$56.45", table)
+        self.assertNotIn("$-18.01", table)
 
     def test_trade_kline_location_reports_exact_region_and_outside_prices(self):
         bar = DailyBar("TEST", date(2026, 7, 16), 10.0, 12.0, 9.0, 11.0)
@@ -843,6 +855,78 @@ class BacktestTests(unittest.TestCase):
 
             self.assertEqual(baseline_watchlists[f"{trade_day:%Y-%m-%d}"], ["US.TEST"])
             self.assertEqual(filtered_watchlists[f"{trade_day:%Y-%m-%d}"], [])
+
+    def test_backtest_optimization_rules_filter_max_signal_dollar_volume(self):
+        trade_day, bars = make_signal_and_trade_bars()
+        daily_bars = build_daily_bars(bars)
+        daily_bars["TEST"] = [
+            DailyBar(
+                bar.symbol,
+                bar.date,
+                bar.open,
+                bar.high,
+                bar.low,
+                bar.close,
+                100.0,
+                bar.vwap,
+                bar.transactions,
+                bar.timestamp_ms,
+            )
+            for bar in daily_bars["TEST"]
+        ]
+        with TemporaryDirectory() as tmp:
+            config = make_backtest_config(Path(tmp), trade_day)
+            filtered = replace(
+                config,
+                optimization_rules={"max_signal_dollar_volume": 1.0},
+            )
+
+            baseline_watchlists = build_historical_watchlists(daily_bars, config)
+            filtered_watchlists = build_historical_watchlists(daily_bars, filtered)
+
+            self.assertEqual(baseline_watchlists[f"{trade_day:%Y-%m-%d}"], ["US.TEST"])
+            self.assertEqual(filtered_watchlists[f"{trade_day:%Y-%m-%d}"], [])
+
+    def test_sorted_watch_candidates_applies_ranking_and_pool_limit(self):
+        signal_day = date(2025, 1, 2)
+        candidates = [
+            watchlist_module.WatchCandidate(
+                "US.AAA",
+                signal_day,
+                0.20,
+                0.01,
+                10.0,
+                9.0,
+                8.0,
+                11.0,
+                14.0,
+                12.0,
+                10.0,
+            ),
+            watchlist_module.WatchCandidate(
+                "US.BBB",
+                signal_day,
+                0.15,
+                0.01,
+                10.0,
+                9.0,
+                8.0,
+                11.0,
+                13.0,
+                12.5,
+                10.0,
+            ),
+        ]
+
+        ranked = sorted_watch_candidates(
+            candidates,
+            {
+                "candidate_sort": "close_position_desc_gain_desc",
+                "max_watchlist_candidates": 1,
+            },
+        )
+
+        self.assertEqual([candidate.symbol for candidate in ranked], ["US.BBB"])
 
     def test_backtest_optimization_rules_filter_bollinger_z20(self):
         trade_day, bars = make_signal_and_trade_bars()
