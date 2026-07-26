@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from ... import strategy_gap_confirmed_pullback, strategy_ma5_dip
+from ... import strategy_ma5_dip
 
 if TYPE_CHECKING:
     from ..registry import StrategyRegistry
@@ -23,22 +23,14 @@ class BuiltinWatchlistStrategy:
 
         if self.name == strategy_ma5_dip.STRATEGY_NAME:
             return watchlist_generator.ma5_dip_watchlist_rules()
-        if self.name == strategy_gap_confirmed_pullback.STRATEGY_NAME:
-            return watchlist_generator.gap_confirmed_watchlist_rules()
         raise ValueError(f"No built-in WatchCode rule factory for {self.name!r}")
 
 
 def register_builtin_watchcode_strategies(registry: StrategyRegistry) -> None:
-    """注册两套内置 WatchCode 选股规则。"""
+    """注册内置 MA5 WatchCode 选股规则。"""
     registry.register_watchlist(
         BuiltinWatchlistStrategy(
             strategy_ma5_dip.STRATEGY_NAME,
             "信号日强势且收盘相对动态 MA5 足够高的普通股观察池",
-        )
-    )
-    registry.register_watchlist(
-        BuiltinWatchlistStrategy(
-            strategy_gap_confirmed_pullback.STRATEGY_NAME,
-            "缺口确认回撤策略的均线、实体和涨幅观察池",
         )
     )

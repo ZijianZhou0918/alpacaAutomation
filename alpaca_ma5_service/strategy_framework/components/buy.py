@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from types import ModuleType
 from typing import TYPE_CHECKING
 
-from ... import strategy_gap_confirmed_pullback, strategy_ma5_dip
+from ... import strategy_ma5_dip
 from ...models import MarketSnapshot, Signal
 
 if TYPE_CHECKING:
@@ -37,8 +37,5 @@ class ModuleBuyStrategy:
 
 
 def register_builtin_buy_strategies(registry: StrategyRegistry) -> None:
-    """注册项目自带的两套买入信号实现。"""
+    """注册项目自带的 MA5 买入信号实现。"""
     registry.register_buy(ModuleBuyStrategy(strategy_ma5_dip, "动态 MA5 回撤买入"))
-    registry.register_buy(
-        ModuleBuyStrategy(strategy_gap_confirmed_pullback, "缺口确认后的回撤买入")
-    )

@@ -8,17 +8,14 @@ from pathlib import Path
 from typing import Any
 
 from .envfile import load_env_file
-from . import final_strategy
 from .paths import BASE_DIR, INTRADAY_WATCH_CODES_PATH
 
 
 BUY_NOTIONAL_USD = 1_500.0
 MA5_DIP_STRATEGY_NAME = "ma5_dip"
-GAP_CONFIRMED_PULLBACK_STRATEGY_NAME = final_strategy.STRATEGY_NAME
 DEFAULT_STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
 DEFAULT_BUY_STOCK_COUNT = 2
-DEFAULT_GAP_CONFIRMED_BUY_STOCK_COUNT = 3
-MAX_BUY_STOCK_COUNT = final_strategy.MAX_DAILY_BUYS
+MAX_BUY_STOCK_COUNT = 3
 ALLOWED_BUY_STOCK_COUNTS = set(range(1, MAX_BUY_STOCK_COUNT + 1))
 _UNSET: Any = object()
 

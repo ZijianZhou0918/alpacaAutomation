@@ -4,6 +4,15 @@
   const report = window.__BACKTEST_REPORT__ || {};
   const equity = Array.isArray(report.equity) ? report.equity : [];
   const details = report.details && typeof report.details === "object" ? report.details : {};
+  const embeddedMinuteDetails = report.minute_details && typeof report.minute_details === "object"
+    ? report.minute_details
+    : {};
+  const reportKind = String(report.report_kind || "");
+  const returnBasedReport = reportKind === "kdj_signal" || reportKind === "intraday_breakout_ytd";
+  const configuredEquitySeries = Array.isArray(report.equity_series) ? report.equity_series : [];
+  const equityHoverFields = Array.isArray(report.equity_hover_fields)
+    ? report.equity_hover_fields
+    : [];
   const plotConfig = {
     responsive: true,
     displaylogo: false,
@@ -84,26 +93,53 @@
       showChartFallback("equity-chart");
       return;
     }
-    window.Plotly.newPlot("equity-chart", [{
-      x: equity.map(row => row.timestamp),
-      y: equity.map(row => row.equity),
-      mode: "lines",
-      type: "scatter",
-      name: "Equity",
-      line: {color: "#ffb547", width: 2.4},
-      fill: "tozeroy",
-      fillcolor: "rgba(255,181,71,.08)",
-    }, {
-      x: equity.map(row => row.timestamp),
-      y: equity.map(row => row.cash),
-      mode: "lines",
-      type: "scatter",
-      name: "Cash",
-      line: {color: "#4dd7e5", width: 1.4, dash: "dot"},
-    }], {
+    const configuredTraces = configuredEquitySeries.map((series, index) => {
+      const hoverTemplate = [
+        "%{x|%Y-%m-%d}",
+        `${String(series.name || series.key || "Series")}: %{y:${String(series.value_format || ".2f")}}${String(series.value_suffix || "")}`,
+        ...equityHoverFields.map((field, fieldIndex) =>
+          `${String(field.label || field.key || "")}: %{customdata[${fieldIndex}]}`
+        ),
+        "<extra></extra>",
+      ].join("<br>");
+      return {
+        x: equity.map(row => row.timestamp),
+        y: equity.map(row => row[series.key]),
+        customdata: equity.map(row =>
+          equityHoverFields.map(field => row[field.key] == null ? "—" : row[field.key])
+        ),
+        mode: "lines",
+        type: "scatter",
+        name: String(series.name || series.key || `Series ${index + 1}`),
+        line: {
+          color: String(series.color || ["#ffb547", "#4dd7e5", "#ff6577"][index % 3]),
+          width: Number(series.width || 2),
+          dash: String(series.dash || "solid"),
+        },
+        hovertemplate: hoverTemplate,
+      };
+    });
+    const defaultTraces = [{
+        x: equity.map(row => row.timestamp),
+        y: equity.map(row => row.equity),
+        mode: "lines",
+        type: "scatter",
+        name: "Equity",
+        line: {color: "#ffb547", width: 2.4},
+        fill: "tozeroy",
+        fillcolor: "rgba(255,181,71,.08)",
+      }, {
+        x: equity.map(row => row.timestamp),
+        y: equity.map(row => row.cash),
+        mode: "lines",
+        type: "scatter",
+        name: "Cash",
+        line: {color: "#4dd7e5", width: 1.4, dash: "dot"},
+      }];
+    window.Plotly.newPlot("equity-chart", configuredTraces.length ? configuredTraces : defaultTraces, {
       ...baseLayout,
-      yaxis: {...baseLayout.yaxis, title: "USD"},
-      xaxis: {...baseLayout.xaxis, title: "Time"},
+      yaxis: {...baseLayout.yaxis, title: String(report.equity_yaxis_title || "USD")},
+      xaxis: {...baseLayout.xaxis, title: String(report.equity_xaxis_title || "Time")},
     }, plotConfig);
   }
 
@@ -203,11 +239,15 @@
           row.rule,
           location.position || "—",
           ohlcText(location),
-          row.realized_pnl,
+          returnBasedReport ? row.return_pct : row.realized_pnl,
         ];
       }),
       hovertemplate: `${side} %{y:.4f}<br>%{customdata[0]}<br>%{customdata[2]}<br>%{customdata[3]}<br>%{customdata[1]}`
-        + (side === "SELL" ? "<br>PnL $%{customdata[4]:.2f}" : "")
+        + (side === "SELL"
+          ? returnBasedReport
+            ? "<br>收益 %{customdata[4]:.2f}%"
+            : "<br>PnL $%{customdata[4]:.2f}"
+          : "")
         + "<extra></extra>",
     };
   }
@@ -277,6 +317,10 @@
     window.__BACKTEST_MINUTE_DETAILS__ = window.__BACKTEST_MINUTE_DETAILS__ || {};
     if (window.__BACKTEST_MINUTE_DETAILS__[symbol]) {
       return Promise.resolve(window.__BACKTEST_MINUTE_DETAILS__[symbol]);
+    }
+    if (embeddedMinuteDetails[symbol]) {
+      window.__BACKTEST_MINUTE_DETAILS__[symbol] = embeddedMinuteDetails[symbol];
+      return Promise.resolve(embeddedMinuteDetails[symbol]);
     }
     if (!url) return Promise.reject(new Error("没有分钟数据文件地址"));
     if (minuteLoadPromises.has(symbol)) return minuteLoadPromises.get(symbol);
@@ -489,14 +533,34 @@
     const trades = Array.isArray(windowData.trades) ? windowData.trades : [];
     const buys = trades.filter(row => row.side === "BUY");
     const firstBuy = buys[0];
-    document.getElementById("detail-summary").innerHTML = [
-      ["信号日", windowData.signal_day || "—"],
-      ["买入日", windowData.buy_day || "—"],
-      ["买入价", firstBuy ? priceText(firstBuy.price) : "—"],
-      ["本轮已实现收益", moneyText(windowData.realized_pnl)],
-      ["股票累计收益", moneyText(detail.symbol_realized_pnl)],
-      ["窗口日 K", String(rows.length)],
-    ].map(([label, value]) =>
+    const summaryRows = reportKind === "intraday_breakout_ytd"
+      ? [
+        ["交易日", windowData.buy_day || "—"],
+        ["买点", String(windowData.entry_time || "—").replace("T", " ")],
+        ["卖点", String(windowData.exit_time || "—").replace("T", " ")],
+        ["买入价", firstBuy ? priceText(firstBuy.price) : "—"],
+        ["全天最高涨幅", `${Number(windowData.session_high_gain_pct) >= 0 ? "+" : ""}${Number(windowData.session_high_gain_pct || 0).toFixed(2)}%`],
+        ["全天最低涨幅", `${Number(windowData.session_low_gain_pct) >= 0 ? "+" : ""}${Number(windowData.session_low_gain_pct || 0).toFixed(2)}%`],
+        ["本轮毛收益率", `${Number(windowData.return_pct) >= 0 ? "+" : ""}${Number(windowData.return_pct || 0).toFixed(2)}%`],
+      ]
+      : reportKind === "kdj_signal"
+      ? [
+        ["信号日", windowData.signal_day || "—"],
+        ["买点", String(windowData.entry_time || "—").replace("T", " ")],
+        ["卖点", String(windowData.exit_time || "—").replace("T", " ")],
+        ["买入价", firstBuy ? priceText(firstBuy.price) : "—"],
+        ["本轮收益率", `${Number(windowData.return_pct) >= 0 ? "+" : ""}${Number(windowData.return_pct || 0).toFixed(2)}%`],
+        ["股票逐笔复合", `${Number(detail.symbol_compounded_return_pct) >= 0 ? "+" : ""}${Number(detail.symbol_compounded_return_pct || 0).toFixed(2)}%`],
+      ]
+      : [
+        ["信号日", windowData.signal_day || "—"],
+        ["买入日", windowData.buy_day || "—"],
+        ["买入价", firstBuy ? priceText(firstBuy.price) : "—"],
+        ["本轮已实现收益", moneyText(windowData.realized_pnl)],
+        ["股票累计收益", moneyText(detail.symbol_realized_pnl)],
+        ["窗口日 K", String(rows.length)],
+      ];
+    document.getElementById("detail-summary").innerHTML = summaryRows.map(([label, value]) =>
       `<div class="detail-stat">${escapeText(label)}<strong>${escapeText(value)}</strong></div>`
     ).join("");
     renderDailyChart(windowData);

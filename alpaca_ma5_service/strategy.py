@@ -11,17 +11,15 @@ from contextlib import contextmanager
 from datetime import datetime
 from types import ModuleType
 
-from . import strategy_gap_confirmed_pullback, strategy_ma5_dip
+from . import strategy_ma5_dip
 from .config import Settings
 from .models import MarketSnapshot, Position, Signal
 
 
 DEFAULT_STRATEGY_NAME = strategy_ma5_dip.STRATEGY_NAME
-GAP_CONFIRMED_PULLBACK_STRATEGY_NAME = strategy_gap_confirmed_pullback.STRATEGY_NAME
 
 STRATEGY_MODULES: dict[str, ModuleType] = {
     strategy_ma5_dip.STRATEGY_NAME: strategy_ma5_dip,
-    strategy_gap_confirmed_pullback.STRATEGY_NAME: strategy_gap_confirmed_pullback,
 }
 
 MIN_SIGNAL_DAY_GAIN_PCT = strategy_ma5_dip.MIN_SIGNAL_DAY_GAIN_PCT

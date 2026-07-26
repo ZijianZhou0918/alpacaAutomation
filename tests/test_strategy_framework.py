@@ -6,11 +6,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from alpaca_ma5_service import strategy
-from alpaca_ma5_service.config import (
-    GAP_CONFIRMED_PULLBACK_STRATEGY_NAME,
-    MA5_DIP_STRATEGY_NAME,
-    build_settings,
-)
+from alpaca_ma5_service.config import MA5_DIP_STRATEGY_NAME, build_settings
 from alpaca_ma5_service.models import OrderResult, Signal
 from alpaca_ma5_service.strategy_framework import (
     DEFAULT_CANCEL_STRATEGY_NAME,
@@ -168,42 +164,26 @@ class StrategyConfigurationTests(TestCase):
 
         self.assertEqual(
             registry.available_profile_names(),
-            (MA5_DIP_STRATEGY_NAME, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME),
+            (MA5_DIP_STRATEGY_NAME,),
         )
-        settings = build_settings(strategy_name=GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
+        settings = build_settings(strategy_name=MA5_DIP_STRATEGY_NAME)
         runtime = resolve_strategy_runtime(settings)
 
-        self.assertEqual(runtime.selection.profile_name, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
-        self.assertEqual(
-            runtime.selection.watchlist_strategy_name,
-            GAP_CONFIRMED_PULLBACK_STRATEGY_NAME,
-        )
-        self.assertEqual(runtime.selection.buy_strategy_name, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
+        self.assertEqual(runtime.selection.profile_name, MA5_DIP_STRATEGY_NAME)
+        self.assertEqual(runtime.selection.watchlist_strategy_name, MA5_DIP_STRATEGY_NAME)
+        self.assertEqual(runtime.selection.buy_strategy_name, MA5_DIP_STRATEGY_NAME)
         self.assertEqual(runtime.selection.sell_strategy_name, DEFAULT_SELL_STRATEGY_NAME)
         self.assertEqual(runtime.selection.cancel_strategy_name, DEFAULT_CANCEL_STRATEGY_NAME)
-
-    def test_component_overrides_are_independent(self):
-        settings = build_settings(
-            strategy_profile_name=MA5_DIP_STRATEGY_NAME,
-            watchlist_strategy_name=GAP_CONFIRMED_PULLBACK_STRATEGY_NAME,
-            buy_strategy_name=MA5_DIP_STRATEGY_NAME,
-            sell_strategy_name=DEFAULT_SELL_STRATEGY_NAME,
-            cancel_strategy_name=DEFAULT_CANCEL_STRATEGY_NAME,
-        )
-
-        self.assertEqual(settings.strategy_name, MA5_DIP_STRATEGY_NAME)
-        self.assertEqual(settings.watchlist_strategy_name, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
-        self.assertEqual(settings.buy_strategy_name, MA5_DIP_STRATEGY_NAME)
 
     def test_invalid_component_is_rejected_while_building_settings(self):
         with self.assertRaisesRegex(ValueError, "Unknown buy strategy"):
             build_settings(buy_strategy_name="does_not_exist")
 
     def test_env_profile_is_supported_and_explicit_legacy_name_wins(self):
-        with patch.dict(os.environ, {"STRATEGY_PROFILE": GAP_CONFIRMED_PULLBACK_STRATEGY_NAME}):
+        with patch.dict(os.environ, {"STRATEGY_PROFILE": MA5_DIP_STRATEGY_NAME}):
             self.assertEqual(
                 build_settings().strategy_profile_name,
-                GAP_CONFIRMED_PULLBACK_STRATEGY_NAME,
+                MA5_DIP_STRATEGY_NAME,
             )
             self.assertEqual(
                 build_settings(strategy_name=MA5_DIP_STRATEGY_NAME).strategy_profile_name,
@@ -212,9 +192,9 @@ class StrategyConfigurationTests(TestCase):
 
     def test_runtime_selection_does_not_mutate_legacy_backtest_context(self):
         strategy.set_active_strategy(MA5_DIP_STRATEGY_NAME)
-        settings = build_settings(strategy_name=GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
+        settings = build_settings(strategy_name=MA5_DIP_STRATEGY_NAME)
 
         runtime = resolve_strategy_runtime(settings)
 
-        self.assertEqual(runtime.buy.name, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
+        self.assertEqual(runtime.buy.name, MA5_DIP_STRATEGY_NAME)
         self.assertEqual(strategy.active_buy_module().STRATEGY_NAME, MA5_DIP_STRATEGY_NAME)

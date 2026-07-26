@@ -36,8 +36,7 @@ from alpaca_ma5_service.afterhours_high_low import (
     write_afterhours_watch_codes,
 )
 from alpaca_ma5_service.broker import AlpacaStockBroker, DryRunStockBroker
-from alpaca_ma5_service.config import BUY_NOTIONAL_USD, Settings, build_settings
-from alpaca_ma5_service.final_strategy import MAX_DAILY_BUYS, STOP_PARAMS, STRATEGY_NAME as GAP_CONFIRMED_PULLBACK_STRATEGY_NAME
+from alpaca_ma5_service.config import BUY_NOTIONAL_USD, MA5_DIP_STRATEGY_NAME, Settings, build_settings
 from alpaca_ma5_service.manual_order import build_test_order_preview, discounted_limit_price, place_test_order, quantity_for_notional
 from alpaca_ma5_service.market_data import AlpacaMarketData, build_realtime_price_source, _SnapshotBar, _daily_request_end, _requires_realtime_price, _snapshot_inputs, _snapshot_previous_opens, _snapshot_today_open, _usable_today_open
 from alpaca_ma5_service.market_time import is_buy_order_time, is_premarket_monitor_finished, is_intraday_monitor_finished, is_premarket_time, is_realtime_order_time, is_regular_market_time, next_poll_seconds, regular_open_has_started
@@ -399,13 +398,13 @@ def make_settings(root: Path) -> Settings:
         output_dir=output_dir,
         state_file=output_dir / "state.json",
         buy_notional_usd=BUY_NOTIONAL_USD,
-        max_daily_buys=MAX_DAILY_BUYS,
+        max_daily_buys=2,
         max_symbol_order_errors=3,
-        stop_loss_pct=STOP_PARAMS["stop_loss_pct"],
-        stop_loss_limit_pct=STOP_PARAMS["stop_loss_limit_pct"],
-        take_profit_half_pct=STOP_PARAMS["take_profit_half_pct"],
-        take_profit_sell_fraction=STOP_PARAMS["take_profit_sell_fraction"],
-        take_profit_remainder_stop_pct=STOP_PARAMS["take_profit_remainder_stop_pct"],
+        stop_loss_pct=-0.10,
+        stop_loss_limit_pct=-0.08,
+        take_profit_half_pct=0.10,
+        take_profit_sell_fraction=0.50,
+        take_profit_remainder_stop_pct=None,
         close_liquidation_start=time(15, 55),
         close_liquidation_end=time(16, 0),
         regular_poll_seconds=10,
@@ -431,7 +430,7 @@ def make_settings(root: Path) -> Settings:
         openclaw_gateway_port=18789,
         watchlist_chart_lan_host="",
         watchlist_chart_lan_port=8766,
-        strategy_name=GAP_CONFIRMED_PULLBACK_STRATEGY_NAME,
+        strategy_name=MA5_DIP_STRATEGY_NAME,
     )
 
 
@@ -444,35 +443,13 @@ def make_screen_bars(symbol="TEST", signal_day=date(2026, 1, 20), passes=True):
         DailyBar(symbol, date(2026, 1, 16), 18.0, 18.0, 18.0, 18.0),
         DailyBar(symbol, date(2026, 1, 17), 18.0, 18.0, 18.0, 18.0),
         DailyBar(symbol, date(2026, 1, 18), 18.0, 18.0, 18.0, 18.0),
-        DailyBar(symbol, date(2026, 1, 19), 22.0, 22.0, 22.0, 22.0),
+        DailyBar(symbol, date(2026, 1, 19), 21.0, 21.0, 21.0, 21.0),
     ]
 
     if passes:
         bars.append(DailyBar(symbol, signal_day, 20.0, 26.5, 20.0, 25.0))
     else:
         bars.append(DailyBar(symbol, signal_day, 20.0, 21.0, 19.0, 20.0))
-    return bars
-
-
-def make_weak_signal_vs_ma5_gain_bars(symbol="WEAK_SIGNAL_MA5", signal_day=date(2026, 1, 20)):
-    """信号日涨幅达标，但没有比 MA5 涨幅高出足够空间。"""
-    closes = [4.0] * 10 + [5.0] * 4 + [1.0, 10.0, 10.0, 10.0, 10.0]
-    bars = [
-        DailyBar(symbol, date(2026, 1, index + 1), close, close, close, close)
-        for index, close in enumerate(closes)
-    ]
-    bars.append(DailyBar(symbol, signal_day, 11.0, 13.5, 10.5, 13.0))
-    return bars
-
-
-def make_close_below_ma5_bars(symbol="CLOSE_BELOW_MA5", signal_day=date(2026, 1, 20)):
-    """高开且涨幅达标，但信号日收盘价没有比 MA5 高 10 个点。"""
-    closes = [1.0] * 10 + [1.2] * 5 + [2.0, 2.0, 2.0, 1.0]
-    bars = [
-        DailyBar(symbol, date(2026, 1, index + 1), close, close, close, close)
-        for index, close in enumerate(closes)
-    ]
-    bars.append(DailyBar(symbol, signal_day, 1.8, 2.2, 1.3, 1.4))
     return bars
 
 
@@ -484,12 +461,6 @@ def make_ma5_dip_close_under_15_pct_bars(symbol="CLOSE_NEAR_MA5", signal_day=dat
         for index, close in enumerate(closes)
     ]
     bars.append(DailyBar(symbol, signal_day, 9.0, 11.2, 8.8, 11.0))
-    return bars
-
-
-def make_red_body_bars(symbol="RED_BODY", signal_day=date(2026, 1, 20)):
-    bars = make_screen_bars(symbol, signal_day, passes=True)
-    bars[-1] = DailyBar(symbol, signal_day, 26.0, 26.5, 23.5, 25.0)
     return bars
 
 
@@ -515,7 +486,7 @@ def make_buy_snapshot(current=12.3, closes=None, today_open=None, opens=None):
     return make_snapshot(current=current, closes=closes, today_open=today_open, opens=opens or [10.0, 10.0, 10.0, 10.0])
 
 
-def make_buy_snapshot_for_symbol(symbol="US.TEST", current=12.3):
+def make_buy_snapshot_for_symbol(symbol="US.TEST", current=10.65):
     return make_snapshot(symbol, current=current, closes=[10.0, 10.0, 10.0, 13.0], today_open=13.0, opens=[10.0, 10.0, 10.0, 10.0])
 
 
@@ -647,15 +618,15 @@ class StrategyTests(unittest.TestCase):
         signal = evaluate_buy(make_snapshot(current=10.0, closes=[10.0, 10.0, 10.0, 10.0]))
         self.assertEqual(signal.action, "HOLD")
 
-    def test_sell_on_8_percent_loss_with_6_percent_limit_price(self):
+    def test_sell_on_10_percent_loss_with_8_percent_limit_price(self):
         position = Position("US.TEST", 10, 10.0, "2026-05-28T09:35:00")
         now = datetime(2026, 5, 28, 12, 0)
         settings = make_settings(Path("."))
-        signal = evaluate_sell(position, make_snapshot(current=9.2), now, settings)
+        signal = evaluate_sell(position, make_snapshot(current=9.0), now, settings)
         self.assertEqual(signal.action, "SELL_ALL")
+        self.assertIn("10.00%", signal.reason)
         self.assertIn("8.00%", signal.reason)
-        self.assertIn("6.00%", signal.reason)
-        self.assertEqual(signal.diagnostics["stop_loss_limit_price"], 9.4)
+        self.assertEqual(signal.diagnostics["stop_loss_limit_price"], 9.2)
 
     def test_hold_when_loss_is_less_than_stop_loss(self):
         position = Position("US.TEST", 10, 10.0, "2026-05-28T09:35:00")
@@ -664,35 +635,25 @@ class StrategyTests(unittest.TestCase):
         signal = evaluate_sell(position, make_snapshot(current=9.3), now, settings)
         self.assertEqual(signal.action, "HOLD")
 
-    def test_sell_all_on_4_percent_gain(self):
+    def test_sell_half_on_10_percent_gain(self):
         position = Position("US.TEST", 11, 10.0, "2026-05-28T09:35:00")
         now = datetime(2026, 5, 28, 12, 0)
         settings = make_settings(Path("."))
-        signal = evaluate_sell(position, make_snapshot(current=10.4), now, settings)
+        signal = evaluate_sell(position, make_snapshot(current=11.0), now, settings)
 
-        self.assertEqual(signal.action, "SELL_ALL")
-        self.assertAlmostEqual(signal.quantity, 11)
-        self.assertEqual(signal.diagnostics["sell_rule"], "take_profit_all")
-        self.assertIn("4.00%", signal.reason)
+        self.assertEqual(signal.action, "SELL_HALF")
+        self.assertAlmostEqual(signal.quantity, 5.5)
+        self.assertEqual(signal.diagnostics["sell_rule"], "take_profit_half")
+        self.assertIn("10.00%", signal.reason)
 
-    def test_take_profit_remainder_stop_sells_all_at_4_percent_gain(self):
+    def test_take_profit_remainder_stop_is_disabled(self):
         position = Position("US.TEST", 5, 10.0, "2026-05-28T09:35:00")
         settings = make_settings(Path("."))
         signal = evaluate_take_profit_remainder_stop(position, make_snapshot(current=10.4), settings)
 
-        self.assertEqual(signal.action, "SELL_ALL")
-        self.assertEqual(signal.quantity, 5)
-        self.assertEqual(signal.diagnostics["sell_rule"], "take_profit_remainder_stop")
-        self.assertEqual(signal.diagnostics["take_profit_remainder_stop_price"], 10.4)
-        self.assertEqual(signal.diagnostics["stop_loss_limit_price"], 10.4)
-        self.assertIn("4.00%", signal.reason)
-
-    def test_take_profit_remainder_stop_holds_above_4_percent_gain(self):
-        position = Position("US.TEST", 5, 10.0, "2026-05-28T09:35:00")
-        settings = make_settings(Path("."))
-        signal = evaluate_take_profit_remainder_stop(position, make_snapshot(current=10.5), settings)
-
         self.assertEqual(signal.action, "HOLD")
+        self.assertEqual(signal.diagnostics["sell_rule"], "hold")
+        self.assertIn("不启用", signal.reason)
 
     def test_sell_near_regular_close(self):
         position = Position("US.TEST", 10, 10.0, "2026-05-28T09:35:00")
@@ -997,7 +958,7 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("US.TEST", broker.get_positions())
 
     def test_run_once_places_limit_buy_at_buy_point_when_price_is_nearby(self):
-        """当前价在买点上方 2% 内时，自动监控用买点价提交 BUY LIMIT。"""
+        """当前价在买点上方 3% 内时，自动监控用买点价提交 BUY LIMIT。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1011,10 +972,10 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["buy"], 1)
             self.assertEqual(broker.buy_calls, 1)
             self.assertEqual(broker.last_notional_usd, 1500.0)
-            self.assertAlmostEqual(broker.last_limit_price, 12.3)
+            self.assertAlmostEqual(broker.last_limit_price, 10.78365)
 
     def test_run_once_scales_single_buy_when_cash_is_below_fixed_notional(self):
-        """自动监控不再调小单笔金额；cash 低于 3500 时跳过买入。"""
+        """现金低于单笔上限时，自动监控按可用现金缩小本轮金额。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1103,13 +1064,6 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(settings.max_daily_buys, 2)
         self.assertEqual(settings.buy_notional_usd, 1500.0)
 
-    def test_gap_confirmed_pullback_strategy_stays_selectable(self):
-        settings = build_settings(strategy_name=GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
-
-        self.assertEqual(settings.strategy_name, GAP_CONFIRMED_PULLBACK_STRATEGY_NAME)
-        self.assertEqual(settings.max_daily_buys, MAX_DAILY_BUYS)
-        self.assertEqual(settings.buy_notional_usd, 2_500.0)
-
     def test_old_ma5_dip_watchlist_does_not_require_ma_order(self):
         original = strategy_ma5_dip.MIN_SIGNAL_DAY_GAIN_PCT
         try:
@@ -1168,7 +1122,7 @@ class ServiceTests(unittest.TestCase):
         validate_candidates([candidate_at_limit], rules=rules)
 
     def test_run_once_splits_cash_across_remaining_buy_slots(self):
-        """买入股票数设为 3 时，每只股票仍使用固定 3500。"""
+        """买入股票数设为 3 时，本轮按剩余名额均分可用现金。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = Settings(**{**make_settings(root).__dict__, "max_daily_buys": 3})
@@ -1205,7 +1159,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(broker.notionals, [1500.0])
 
     def test_run_once_reuses_run_notional_after_cash_changes(self):
-        """第一笔下单后 cash 变小，后续订单仍复用固定 3500。"""
+        """第一笔下单后 cash 变小，后续订单仍复用本轮固定金额。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1220,14 +1174,14 @@ class ServiceTests(unittest.TestCase):
 
             summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 10, 0))
 
-            self.assertEqual(summary["buy"], 3)
-            self.assertEqual(summary["hold"], 0)
-            self.assertEqual(broker.buy_calls, 3)
-            self.assertEqual(broker.notionals, [800.0, 800.0, 800.0])
-            self.assertEqual(market_data.calls, ["US.TEST", "US.NEXT", "US.THIRD"])
+            self.assertEqual(summary["buy"], 2)
+            self.assertEqual(summary["hold"], 1)
+            self.assertEqual(broker.buy_calls, 2)
+            self.assertEqual(broker.notionals, [1200.0, 1200.0])
+            self.assertEqual(market_data.calls, ["US.TEST", "US.NEXT"])
 
     def test_run_once_does_not_exclude_symbol_after_non_buy_hold(self):
-        """触达动态MA5但当前跌幅未到8%后，同一天即使再跌也不再买。"""
+        """未触发每日排除的普通 HOLD 不妨碍同日后续有效买点。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1627,9 +1581,9 @@ class ServiceTests(unittest.TestCase):
                     day=date(2026, 5, 28),
                     created_at=datetime(2026, 5, 28, 9, index),
                 )
-            first_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.3)})
+            first_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.1)})
             first = run_once(settings, market_data=first_market_data, broker=broker, now=datetime(2026, 5, 28, 10, 0))
-            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.2)})
+            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.0)})
 
             summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 12, 0))
 
@@ -1638,15 +1592,15 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["hold"], 0)
             self.assertEqual(market_data.calls, ["US.TEST"])
 
-    def test_run_once_stop_loss_uses_limit_sell_at_12_percent_loss_price(self):
-        """止损触发后提交 SELL LIMIT，限价为成本价亏损 12%。"""
+    def test_run_once_stop_loss_uses_limit_sell_at_8_percent_loss_price(self):
+        """止损触发后提交 SELL LIMIT，限价为成本价亏损 8%。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
             settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
             broker = RecordingSellBroker()
-            first_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.3)})
-            second_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.2)})
+            first_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.1)})
+            second_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.0)})
 
             first = run_once(settings, market_data=first_market_data, broker=broker, now=datetime(2026, 5, 28, 10, 0))
             second = run_once(settings, market_data=second_market_data, broker=broker, now=datetime(2026, 5, 28, 10, 1))
@@ -1658,11 +1612,11 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(method, "limit_sell")
             self.assertEqual(symbol, "US.TEST")
             self.assertEqual(quantity, 10.0)
-            self.assertEqual(limit_price, 9.4)
-            self.assertIn("6.00%", reason)
+            self.assertEqual(limit_price, 9.2)
+            self.assertIn("8.00%", reason)
 
     def test_run_once_take_profit_still_uses_market_sell(self):
-        """冻结策略的 4% 全部止盈仍走市价卖出。"""
+        """MA5 策略的 10% 半仓止盈仍走市价卖出。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1677,9 +1631,9 @@ class ServiceTests(unittest.TestCase):
             method, symbol, quantity, price, reason = broker.sell_calls[0]
             self.assertEqual(method, "market_sell")
             self.assertEqual(symbol, "US.TEST")
-            self.assertEqual(quantity, 10.0)
+            self.assertEqual(quantity, 5.0)
             self.assertEqual(price, 11.5)
-            self.assertIn("4.00%", reason)
+            self.assertIn("10.00%", reason)
 
     def test_run_once_close_liquidation_still_uses_market_sell(self):
         """尾盘清仓不受止损限价单改动影响，仍走市价卖出。"""
@@ -1701,8 +1655,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(price, 10.2)
             self.assertIn("临近常规盘收盘", reason)
 
-    def test_run_once_holds_position_already_down_15_at_monitor_start(self):
-        """监控启动第一眼已经亏损 15% 的旧仓，不自动清仓。"""
+    def test_run_once_holds_position_already_below_stop_at_monitor_start(self):
+        """监控启动第一眼已经低于止损线的旧仓，不自动清仓。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1730,7 +1684,7 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("US.TEST", broker.get_positions())
 
     def test_run_once_rearms_grandfathered_position_after_quantity_changes(self):
-        """启动时豁免的旧仓如果后来加仓，成本/数量变化后重新启用 15% 止损。"""
+        """启动时豁免的旧仓如果后来加仓，成本或数量变化后重新启用止损。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1753,16 +1707,16 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(second["sell"], 1)
             self.assertNotIn("US.TEST", broker.get_positions())
 
-    def test_run_once_sells_watch_position_when_loss_reaches_15_after_monitoring_starts(self):
-        """监控启动时未触发止损，后面跌到 15% 会限价清仓。"""
+    def test_run_once_sells_watch_position_when_loss_reaches_10_after_monitoring_starts(self):
+        """监控启动时未触发止损，后面跌到 10% 会限价清仓。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
             settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
             broker = DryRunStockBroker(settings)
             broker.place_market_buy("US.TEST", 300.0, 10.0, "seed")
-            first_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.3)})
-            second_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.2)})
+            first_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.1)})
+            second_market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=9.0)})
 
             first = run_once(
                 settings,
@@ -1781,8 +1735,8 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(second["sell"], 1)
             self.assertNotIn("US.TEST", broker.get_positions())
 
-    def test_run_once_sells_position_outside_watchlist_on_15_percent_loss(self):
-        """监控启动后新出现的非 watchlist 持仓，亏损达到 15% 会限价清仓。"""
+    def test_run_once_sells_position_outside_watchlist_on_10_percent_loss(self):
+        """监控启动后新出现的非 watchlist 持仓，亏损达到 10% 会限价清仓。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1832,7 +1786,7 @@ class ServiceTests(unittest.TestCase):
             self.assertAlmostEqual(broker.get_positions()["US.OLD"].quantity, 30.0)
 
     def test_run_once_sells_fraction_watch_position_on_take_profit(self):
-        """单轮监控会对 watchlist 内收益达到 15% 的持仓卖出 5%。"""
+        """单轮监控会对 watchlist 内收益达到 10% 的持仓卖出一半。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1849,10 +1803,10 @@ class ServiceTests(unittest.TestCase):
             )
 
             self.assertEqual(summary["sell"], 1)
-            self.assertNotIn("US.TEST", broker.get_positions())
+            self.assertAlmostEqual(broker.get_positions()["US.TEST"].quantity, 15.0)
 
     def test_run_once_sells_fraction_only_once_per_day_on_take_profit(self):
-        """15% 分批止盈当天已成交后，后续轮询不重复卖出。"""
+        """10% 半仓止盈当天已成交后，后续轮询不重复卖出。"""
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             settings = make_settings(root)
@@ -1868,35 +1822,7 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(first["sell"], 1)
             self.assertEqual(second["sell"], 0)
             self.assertEqual(second["hold"], 1)
-            self.assertNotIn("US.TEST", broker.get_positions())
-
-    def test_run_once_sells_remaining_position_after_take_profit_retraces_to_4_percent(self):
-        """异常残余仓回落到冻结策略的 +4% 保护线时卖出全部。"""
-        with TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            settings = make_settings(root)
-            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
-            broker = RecordingSellBroker()
-            broker.positions = {"US.TEST": Position("US.TEST", 5.0, 10.0, "alpaca", source="alpaca-paper")}
-            append_order(
-                settings.output_dir,
-                OrderResult("half-1", "US.TEST", "SELL", 5.0, 11.0, "FILLED", "filled"),
-                "持仓收益达到 4.00%，止盈 100%",
-                day=date(2026, 5, 28),
-                created_at=datetime(2026, 5, 28, 12, 0),
-            )
-            market_data = FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=10.4)})
-
-            summary = run_once(settings, market_data=market_data, broker=broker, now=datetime(2026, 5, 28, 12, 1))
-
-            self.assertEqual(summary["sell"], 1)
-            self.assertEqual(len(broker.sell_calls), 1)
-            method, symbol, quantity, limit_price, reason = broker.sell_calls[0]
-            self.assertEqual(method, "market_sell")
-            self.assertEqual(symbol, "US.TEST")
-            self.assertEqual(quantity, 5.0)
-            self.assertEqual(limit_price, 10.4)
-            self.assertIn("4.00%", reason)
+            self.assertAlmostEqual(broker.get_positions()["US.TEST"].quantity, 15.0)
 
     def test_run_once_skips_duplicate_sell_when_same_symbol_order_is_open(self):
         """持仓仍存在但同股卖单开放时，不得在下一轮重复提交卖单。"""
@@ -2943,7 +2869,10 @@ class ServiceTests(unittest.TestCase):
         expected_signature = hmac.new(b"unit-secret", seen["body"], hashlib.sha256).hexdigest()
         self.assertEqual(seen["url"], "http://127.0.0.1:8644/webhooks/local-notify")
         self.assertEqual(seen["timeout"], 30)
-        self.assertEqual(json.loads(seen["body"].decode("utf-8")), {"message": "hello"})
+        self.assertEqual(
+            json.loads(seen["body"].decode("utf-8")),
+            {"event": "alpaca_trade_notify", "message": "hello"},
+        )
         self.assertEqual(seen["signature"], expected_signature)
 
     def test_daily_buy_count_tracks_only_executed_orders(self):
@@ -3296,41 +3225,20 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(next_poll_seconds(settings, near_regular_open), settings.idle_poll_seconds)
 
     def test_watchlist_generator_filters_strategy_rules(self):
-        """选股生成器使用最终策略的涨幅、MA、收盘位置和开盘过滤。"""
+        """MA5 选股要求信号涨幅达标且收盘至少高于 MA5 15%。"""
         now_et = datetime(2026, 1, 21, 10, 0)
-        low_shadow_bars = make_screen_bars("LOW_SHADOW", passes=True)
-        low_shadow_bars[-1] = DailyBar("LOW_SHADOW", date(2026, 1, 20), 19.5, 25.5, 19.5, 25.0)
-        weak_open_bars = make_screen_bars("WEAK_OPEN", passes=True)
-        weak_open_bars[-1] = DailyBar("WEAK_OPEN", date(2026, 1, 20), 18.0, 25.5, 17.8, 25.0)
-        wide_range_bars = make_screen_bars("WIDE_RANGE", passes=True)
-        wide_range_bars[-1] = DailyBar("WIDE_RANGE", date(2026, 1, 20), 20.0, 27.0, 19.0, 25.0)
         candidates = screen_candidates(
             {
-                "LOW_SHADOW": low_shadow_bars,
-                "WEAK_OPEN": weak_open_bars,
-                "WIDE_RANGE": wide_range_bars,
-                "WEAK_SIGNAL_MA5": make_weak_signal_vs_ma5_gain_bars("WEAK_SIGNAL_MA5"),
-                "CLOSE_BELOW_MA5": make_close_below_ma5_bars("CLOSE_BELOW_MA5"),
-                "RED_BODY": make_red_body_bars("RED_BODY"),
-                "WEAK_MA_ORDER": make_weak_ma_order_bars("WEAK_MA_ORDER"),
-                "FAIL": make_screen_bars("FAIL", passes=False),
+                "PASS": make_screen_bars("PASS", passes=True),
+                "CLOSE_NEAR_MA5": make_ma5_dip_close_under_15_pct_bars(),
             },
             now_et,
         )
 
-        self.assertEqual([candidate.symbol for candidate in candidates], ["LOW_SHADOW", "RED_BODY"])
-        low_shadow = next(candidate for candidate in candidates if candidate.symbol == "LOW_SHADOW")
-        red_body = next(candidate for candidate in candidates if candidate.symbol == "RED_BODY")
-        self.assertGreater(low_shadow.gain_pct, 0.12)
-        self.assertGreater(low_shadow.gain_pct - low_shadow.ma5_gain_pct, 0.02)
-        self.assertLess(low_shadow.upper_shadow_pct, 0.05)
-        self.assertGreater(low_shadow.close / low_shadow.ma5, 1.15)
-        self.assertLess(low_shadow.open, low_shadow.ma5)
-        self.assertGreater(low_shadow.open / low_shadow.ma5, 0.95)
-        self.assertGreater(low_shadow.ma5, low_shadow.ma10)
-        self.assertGreater(low_shadow.ma10, low_shadow.ma20)
-        self.assertGreaterEqual((low_shadow.close - low_shadow.low) / (low_shadow.high - low_shadow.low), 0.50)
-        self.assertLess(red_body.body_pct, 0)
+        self.assertEqual([candidate.symbol for candidate in candidates], ["PASS"])
+        candidate = candidates[0]
+        self.assertGreater(candidate.gain_pct, 0.15)
+        self.assertGreaterEqual(candidate.close / candidate.ma5, 1.15)
 
     def test_market_data_defaults_to_sip_daily_and_moomoo_realtime(self):
         """日线默认用全市场 SIP，当前价默认用 Moomoo OpenD。"""
@@ -3921,7 +3829,7 @@ class ServiceTests(unittest.TestCase):
             self.assertIn('data-delete-code="US.DEMO"', html)
             self.assertIn('class="ma-line ma5-line"', html)
             self.assertIn("信号日收盘距MA5", html)
-            self.assertIn("+23.76%", html)
+            self.assertIn("+25.00%", html)
             self.assertIn("/api/watchlist/delete", html)
 
     def test_refresh_watchlist_chart_reads_watch_codes_file(self):
@@ -4111,32 +4019,11 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(port, 8767)
             popen.assert_not_called()
 
-    def test_watchlist_generator_rejects_weak_ma_order_before_write(self):
-        """写入前再次强校验，最终策略要求 MA5>MA10>MA20。"""
-        candidate = WatchCandidate("OK", date(2026, 1, 20), 0.3, 0.1, 8.0, 9.0, 10.0, 8.0, 10.5, 10.0)
-
-        with self.assertRaisesRegex(RuntimeError, "MA5>MA10>MA20"):
-            validate_candidates([candidate])
-
-    def test_watchlist_generator_rejects_weak_open_ratio_before_write(self):
-        """写入前再次强校验，open/MA5 必须大于 0.95。"""
-        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 9.5, 13.0, 12.5)
-
-        with self.assertRaisesRegex(RuntimeError, "open/MA5>0.95"):
-            validate_candidates([candidate])
-
     def test_watchlist_generator_rejects_weak_close_ma5_ratio_before_write(self):
         """写入前再次强校验，信号日收盘价必须比 MA5 高 15 个点以上。"""
         candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 11.0, 13.0, 10.5)
 
-        with self.assertRaisesRegex(RuntimeError, "close/MA5>1.08"):
-            validate_candidates([candidate])
-
-    def test_watchlist_generator_rejects_weak_signal_vs_ma5_gain_before_write(self):
-        """写入前再次强校验，信号日涨幅必须比 MA5 涨幅高 2 个点以上。"""
-        candidate = WatchCandidate("BAD", date(2026, 1, 20), 0.3, 0.1, 10.0, 9.0, 8.0, 11.0, 13.0, 12.5, ma5_gain_pct=0.29)
-
-        with self.assertRaisesRegex(RuntimeError, "MA5 涨幅"):
+        with self.assertRaisesRegex(RuntimeError, "close/MA5>=1.15"):
             validate_candidates([candidate])
 
     def test_watchlist_generator_allows_red_body_before_write(self):

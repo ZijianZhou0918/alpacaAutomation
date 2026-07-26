@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from typing import Callable
 
 
 SPECIAL_US_EQUITY_MARKET_CLOSURES = {
@@ -33,6 +34,35 @@ def trading_day_decision(target_date: date, *, use_alpaca: bool = True) -> Tradi
                 reason=f"{fallback.reason}; Alpaca calendar unavailable: {type(exc).__name__}: {exc}",
             )
     return offline_trading_day_decision(target_date)
+
+
+def trading_day_decisions(
+    start_date: date,
+    end_date: date,
+    *,
+    use_alpaca: bool = True,
+) -> dict[date, TradingDayDecision]:
+    """Resolve an inclusive calendar range with one Alpaca request when possible."""
+    if end_date < start_date:
+        raise ValueError("end_date must not precede start_date")
+    if use_alpaca:
+        try:
+            return alpaca_trading_day_decisions(start_date, end_date)
+        except Exception as exc:
+            decisions = offline_trading_day_decisions(start_date, end_date)
+            return {
+                target_date: TradingDayDecision(
+                    target_date=target_date,
+                    is_trading_day=decision.is_trading_day,
+                    source="offline_after_alpaca_error",
+                    reason=(
+                        f"{decision.reason}; Alpaca calendar unavailable: "
+                        f"{type(exc).__name__}: {exc}"
+                    ),
+                )
+                for target_date, decision in decisions.items()
+            }
+    return offline_trading_day_decisions(start_date, end_date)
 
 
 def alpaca_trading_day_decision(target_date: date) -> TradingDayDecision:
@@ -68,6 +98,75 @@ def alpaca_trading_day_decision(target_date: date) -> TradingDayDecision:
     raise RuntimeError(" | ".join(errors) or "Alpaca calendar request failed")
 
 
+def alpaca_trading_day_decisions(
+    start_date: date,
+    end_date: date,
+    *,
+    client_factory: Callable[[bool], object] | None = None,
+) -> dict[date, TradingDayDecision]:
+    """Fetch an inclusive Alpaca calendar range without one HTTP call per day."""
+    if end_date < start_date:
+        raise ValueError("end_date must not precede start_date")
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import GetCalendarRequest
+
+    from .alpaca_connection import load_alpaca_credentials
+
+    if client_factory is None:
+        api_key, secret_key = load_alpaca_credentials()
+
+        def client_factory(paper: bool) -> object:
+            return TradingClient(api_key, secret_key, paper=paper)
+
+    errors: list[str] = []
+    for paper in (True, False):
+        mode = "paper" if paper else "live"
+        client = client_factory(paper)
+        try:
+            sessions = client.get_calendar(
+                GetCalendarRequest(start=start_date, end=end_date)
+            )
+        except Exception as exc:
+            errors.append(f"{mode}: {type(exc).__name__}: {exc}")
+            continue
+
+        sessions_by_date: dict[date, object] = {}
+        for session in sessions:
+            raw_date = getattr(session, "date", None)
+            if isinstance(raw_date, datetime):
+                session_date = raw_date.date()
+            elif isinstance(raw_date, date):
+                session_date = raw_date
+            else:
+                session_date = date.fromisoformat(str(raw_date))
+            sessions_by_date[session_date] = session
+
+        decisions: dict[date, TradingDayDecision] = {}
+        target_date = start_date
+        while target_date <= end_date:
+            session = sessions_by_date.get(target_date)
+            if session is None:
+                decisions[target_date] = TradingDayDecision(
+                    target_date,
+                    False,
+                    f"alpaca_{mode}",
+                    "Alpaca calendar returned no trading session",
+                )
+            else:
+                decisions[target_date] = TradingDayDecision(
+                    target_date=target_date,
+                    is_trading_day=True,
+                    source=f"alpaca_{mode}",
+                    reason="Alpaca calendar returned a trading session",
+                    open_time=str(getattr(session, "open", "") or ""),
+                    close_time=str(getattr(session, "close", "") or ""),
+                )
+            target_date += timedelta(days=1)
+        return decisions
+
+    raise RuntimeError(" | ".join(errors) or "Alpaca calendar request failed")
+
+
 def offline_trading_day_decision(target_date: date) -> TradingDayDecision:
     if target_date.weekday() >= 5:
         return TradingDayDecision(target_date, False, "offline", "Weekend")
@@ -77,6 +176,20 @@ def offline_trading_day_decision(target_date: date) -> TradingDayDecision:
         return TradingDayDecision(target_date, False, "offline", holiday)
 
     return TradingDayDecision(target_date, True, "offline", "Weekday and not a standard US equity market holiday")
+
+
+def offline_trading_day_decisions(
+    start_date: date,
+    end_date: date,
+) -> dict[date, TradingDayDecision]:
+    if end_date < start_date:
+        raise ValueError("end_date must not precede start_date")
+    decisions: dict[date, TradingDayDecision] = {}
+    target_date = start_date
+    while target_date <= end_date:
+        decisions[target_date] = offline_trading_day_decision(target_date)
+        target_date += timedelta(days=1)
+    return decisions
 
 
 def latest_trading_day_on_or_before(target_date: date) -> date:

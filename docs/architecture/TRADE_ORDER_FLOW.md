@@ -92,7 +92,6 @@ execute_cancel
 ### 2. 策略决策层
 
 - `strategy_ma5_dip.py::evaluate_buy`：动态 MA5 回撤买入判断。
-- `strategy_gap_confirmed_pullback.py::evaluate_buy`：缺口确认回撤买入判断。
 - `strategy.py::evaluate_sell`：尾盘、止损、止盈判断。
 - `strategy.py::evaluate_stop_loss`：观察池外持仓的止损判断。
 - `strategy.py::evaluate_take_profit_remainder_stop`：半仓止盈后的剩余仓保护。

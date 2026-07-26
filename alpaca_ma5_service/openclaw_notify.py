@@ -3,9 +3,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import os
+import re
 import shutil
 import subprocess
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime
 from pathlib import Path
@@ -15,6 +18,40 @@ from .config import Settings
 
 _OPENCLAW_GATEWAY_READY = False
 _HERMES_AGENT_PYTHON = Path.home() / "AppData" / "Local" / "hermes" / "hermes-agent" / "venv" / "Scripts" / "python.exe"
+DEFAULT_NOTIFICATION_EVENT = "alpaca_trade_notify"
+DEFAULT_WINDOWS_NOTIFICATION_TITLE = "Alpaca 自动监控提醒"
+WINDOWS_NOTIFICATION_BODY_LIMIT = 480
+_NOTIFICATION_EVENT_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_.-]{0,63}$")
+_WINDOWS_NOTIFICATION_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+$title = [System.Security.SecurityElement]::Escape($env:ALPACA_NOTIFY_TITLE)
+$body = [System.Security.SecurityElement]::Escape($env:ALPACA_NOTIFY_BODY)
+try {
+    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+    [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml("<toast><visual><binding template='ToastGeneric'><text>$title</text><text>$body</text></binding></visual><audio src='ms-winsoundevent:Notification.Default'/></toast>")
+    $toast = New-Object Windows.UI.Notifications.ToastNotification $xml
+    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Alpaca Automation').Show($toast)
+    exit 0
+} catch {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $icon = New-Object System.Windows.Forms.NotifyIcon
+    try {
+        $icon.Icon = [System.Drawing.SystemIcons]::Information
+        $icon.BalloonTipIcon = [System.Windows.Forms.ToolTipIcon]::Info
+        $icon.BalloonTipTitle = $env:ALPACA_NOTIFY_TITLE
+        $icon.BalloonTipText = $env:ALPACA_NOTIFY_BODY
+        $icon.Visible = $true
+        [System.Media.SystemSounds]::Exclamation.Play()
+        $icon.ShowBalloonTip(8000)
+        Start-Sleep -Seconds 8
+    } finally {
+        $icon.Dispose()
+    }
+}
+"""
 
 
 def send_openclaw_telegram_message(settings: Settings, message: str) -> None:
@@ -37,14 +74,24 @@ def send_openclaw_telegram_message(settings: Settings, message: str) -> None:
     raise RuntimeError("all Telegram notification senders failed: " + " | ".join(errors))
 
 
-def send_trade_notification(settings: Settings, message: str) -> None:
+def send_trade_notification(
+    settings: Settings,
+    message: str,
+    *,
+    event: str = DEFAULT_NOTIFICATION_EVENT,
+) -> None:
     if settings.trade_notify_mode == "cloud":
-        send_cloud_notify_message(settings, message)
+        send_cloud_notify_message(settings, message, event=event)
         return
     send_openclaw_telegram_message(settings, message)
 
 
-def send_cloud_notify_message(settings: Settings, message: str) -> None:
+def send_cloud_notify_message(
+    settings: Settings,
+    message: str,
+    *,
+    event: str = DEFAULT_NOTIFICATION_EVENT,
+) -> None:
     url = settings.cloud_notify_webhook_url.strip()
     secret = settings.cloud_notify_webhook_secret.strip()
     if not url:
@@ -52,7 +99,12 @@ def send_cloud_notify_message(settings: Settings, message: str) -> None:
     if not secret:
         raise RuntimeError("CLOUD_NOTIFY_WEBHOOK_SECRET is empty")
 
-    body = json.dumps({"message": message}, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    event = normalize_notification_event(event)
+    body = json.dumps(
+        {"event": event, "message": message},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
     signature = hmac.new(secret.encode("utf-8"), body, hashlib.sha256).hexdigest()
     request = urllib.request.Request(
         url,
@@ -95,22 +147,169 @@ def send_openclaw_message(settings: Settings, openclaw: str, target: str, messag
         raise RuntimeError(f"openclaw Telegram send failed: {detail}")
 
 
-def safe_send_openclaw_messages(settings: Settings, messages: list[str], *, context: str) -> bool:
-    """Send each notification; failures are logged and do not stop trading."""
+def safe_send_notification(
+    settings: Settings,
+    messages: list[str],
+    *,
+    context: str,
+    event: str = DEFAULT_NOTIFICATION_EVENT,
+    windows_fallback: bool = True,
+    windows_title: str = DEFAULT_WINDOWS_NOTIFICATION_TITLE,
+) -> bool:
+    """通用通知入口：远程发送优先，失败时可回退到当前 Windows 用户桌面。"""
     if not settings.trade_notify_openclaw_enabled:
         return False
-    try:
-        for message in messages:
-            send_trade_notification(settings, message)
-        note = f"Trade notify ({settings.trade_notify_mode}) sent: {context}"
-        print(note, flush=True)
-        write_notify_log(settings, note)
+    if not messages:
         return True
-    except Exception as exc:
-        note = f"Trade notify ({settings.trade_notify_mode}) failed; main flow continues: {context}: {type(exc).__name__}: {exc}"
-        print(note)
-        write_notify_log(settings, note)
+
+    event = normalize_notification_event(event)
+    for index, message in enumerate(messages):
+        try:
+            send_trade_notification(settings, message, event=event)
+        except Exception as exc:
+            note = (
+                f"Notify ({settings.trade_notify_mode}) failed; main flow continues: "
+                f"{context}: {type(exc).__name__}: {exc}"
+            )
+            print(note, flush=True)
+            write_notify_log(settings, note)
+            remaining = messages[index:]
+            if windows_fallback and send_windows_notification_messages(
+                remaining,
+                title=windows_title,
+            ):
+                fallback_note = f"Notify (windows fallback) sent: {context}"
+                write_notify_log(settings, fallback_note)
+                return True
+            return False
+
+    note = (
+        f"Notify ({settings.trade_notify_mode}) sent: "
+        f"{context} event={event}"
+    )
+    print(note, flush=True)
+    write_notify_log(settings, note)
+    return True
+
+
+def validate_notification_configuration(settings: Settings) -> tuple[str, ...]:
+    """启动前验证通知必需项；只检查配置和本机发送器，不发送消息。"""
+    if not settings.trade_notify_openclaw_enabled:
+        raise RuntimeError("TRADE_NOTIFY_OPENCLAW_ENABLED 未启用，提醒监控拒绝启动")
+
+    if settings.trade_notify_mode == "cloud":
+        url = settings.cloud_notify_webhook_url.strip()
+        secret = settings.cloud_notify_webhook_secret.strip()
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError("CLOUD_NOTIFY_WEBHOOK_URL 必须是有效的 http/https URL")
+        if not secret:
+            raise RuntimeError("CLOUD_NOTIFY_WEBHOOK_SECRET 为空")
+        if parsed.scheme != "https":
+            return ("云端通知当前使用明文 HTTP；HMAC 可验签但不能隐藏内容或阻止重放。",)
+        return ()
+
+    commands = messaging_commands()
+    if not commands:
+        raise RuntimeError("本机未找到可用的 OpenClaw/Hermes 通知发送器")
+    target = settings.openclaw_telegram_target.strip()
+    if not target and all(kind == "openclaw" for kind, _command in commands):
+        raise RuntimeError("OPENCLAW_TELEGRAM_TARGET 为空，且没有可直接发送的 Hermes")
+    return ()
+
+
+def safe_send_openclaw_messages(
+    settings: Settings,
+    messages: list[str],
+    *,
+    context: str,
+    event: str = DEFAULT_NOTIFICATION_EVENT,
+    windows_fallback: bool = True,
+    windows_title: str = DEFAULT_WINDOWS_NOTIFICATION_TITLE,
+) -> bool:
+    """兼容旧调用名；所有主项目调用统一委托给通用通知入口。"""
+    return safe_send_notification(
+        settings,
+        messages,
+        context=context,
+        event=event,
+        windows_fallback=windows_fallback,
+        windows_title=windows_title,
+    )
+
+
+def normalize_notification_event(event: str) -> str:
+    value = str(event or "").strip().lower()
+    if not _NOTIFICATION_EVENT_PATTERN.fullmatch(value):
+        raise ValueError(
+            "notification event must match "
+            "[a-z0-9][a-z0-9_.-]{0,63}"
+        )
+    return value
+
+
+def send_windows_notification_messages(
+    messages: list[str],
+    *,
+    title: str = DEFAULT_WINDOWS_NOTIFICATION_TITLE,
+) -> bool:
+    if os.name != "nt" or not messages:
         return False
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        return False
+
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    for message in messages:
+        env = os.environ.copy()
+        env["ALPACA_NOTIFY_TITLE"] = str(title).strip() or DEFAULT_WINDOWS_NOTIFICATION_TITLE
+        env["ALPACA_NOTIFY_BODY"] = compact_notification_message(
+            message,
+            WINDOWS_NOTIFICATION_BODY_LIMIT,
+        )
+        try:
+            result = subprocess.run(
+                [
+                    powershell,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Sta",
+                    "-Command",
+                    _WINDOWS_NOTIFICATION_SCRIPT,
+                ],
+                capture_output=True,
+                encoding="utf-8",
+                errors="replace",
+                text=True,
+                timeout=20,
+                creationflags=creationflags,
+                env=env,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            print(
+                f"Windows 本地提醒失败：{type(exc).__name__}: {exc}",
+                flush=True,
+            )
+            return False
+        if result.returncode != 0:
+            detail = " ".join((result.stderr or result.stdout or "").split())
+            print(f"Windows 本地提醒失败：{detail[:240]}", flush=True)
+            return False
+
+    print("Windows 本地提醒已发送。", flush=True)
+    return True
+
+
+def compact_notification_message(message: str, limit: int) -> str:
+    text = " | ".join(
+        line.strip()
+        for line in str(message).splitlines()
+        if line.strip()
+    )
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
 
 
 def messaging_command() -> tuple[str, list[str]]:

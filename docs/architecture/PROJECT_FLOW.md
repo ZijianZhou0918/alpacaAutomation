@@ -93,7 +93,7 @@ Broker 已在买卖执行阶段内部完成终态等待和自动超时撤单，�
 | 查看每日复盘 | 双击 `open_daily_review.cmd` |
 | 新增或扩展策略 | `alpaca_ma5_service/strategy_framework/README.md` |
 | 定位买入、卖出、撤单实际代码 | `docs/architecture/TRADE_ORDER_FLOW.md` |
-| 运行历史研究 | `run_backtest_*.py`；与实盘账户和下单链路隔离 |
+| 重建正式日线库 | `run_backtest_daily_history_rebuild.py`；与实盘订单链路隔离 |
 
 ## 修改后的检查顺序
 

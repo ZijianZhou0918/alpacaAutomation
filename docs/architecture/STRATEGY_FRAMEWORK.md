@@ -34,9 +34,9 @@
 
 | 分类 | 可选名称 |
 | --- | --- |
-| profile | `ma5_dip`, `gap_confirmed_pullback_g8_r30_b10_st8_tp8` |
-| WatchCode | `ma5_dip`, `gap_confirmed_pullback_g8_r30_b10_st8_tp8` |
-| 买入 | `ma5_dip`, `gap_confirmed_pullback_g8_r30_b10_st8_tp8` |
+| profile | `ma5_dip` |
+| WatchCode | `ma5_dip` |
+| 买入 | `ma5_dip` |
 | 卖出 | `standard_intraday_exit` |
 | 自动撤单 | `timeout_cancel_confirmed` |
 

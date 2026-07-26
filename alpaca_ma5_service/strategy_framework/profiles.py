@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .. import final_strategy, strategy_gap_confirmed_pullback, strategy_ma5_dip
+from .. import strategy_ma5_dip
 from .contracts import StrategyProfile
 from .names import DEFAULT_CANCEL_STRATEGY_NAME, DEFAULT_SELL_STRATEGY_NAME
 from .registry import StrategyRegistry
@@ -27,28 +27,5 @@ def register_builtin_profiles(registry: StrategyRegistry) -> None:
                 "take_profit_remainder_stop_pct": None,
             },
             description="现有 MA5 低吸完整组合",
-        )
-    )
-    registry.register_profile(
-        StrategyProfile(
-            name=strategy_gap_confirmed_pullback.STRATEGY_NAME,
-            watchlist_strategy_name=strategy_gap_confirmed_pullback.STRATEGY_NAME,
-            buy_strategy_name=strategy_gap_confirmed_pullback.STRATEGY_NAME,
-            sell_strategy_name=DEFAULT_SELL_STRATEGY_NAME,
-            cancel_strategy_name=DEFAULT_CANCEL_STRATEGY_NAME,
-            runtime_defaults={
-                "buy_notional_usd": final_strategy.BUY_NOTIONAL_USD,
-                "max_daily_buys": final_strategy.MAX_DAILY_BUYS,
-                "stop_loss_pct": final_strategy.STOP_PARAMS["stop_loss_pct"],
-                "stop_loss_limit_pct": final_strategy.STOP_PARAMS["stop_loss_limit_pct"],
-                "take_profit_half_pct": final_strategy.STOP_PARAMS["take_profit_half_pct"],
-                "take_profit_sell_fraction": final_strategy.STOP_PARAMS[
-                    "take_profit_sell_fraction"
-                ],
-                "take_profit_remainder_stop_pct": final_strategy.STOP_PARAMS[
-                    "take_profit_remainder_stop_pct"
-                ],
-            },
-            description="现有 gap confirmed pullback 完整组合",
         )
     )

@@ -35,7 +35,18 @@ class InteractiveBacktestReportTests(unittest.TestCase):
                 ),
             ),
             datasets={
+                "report_kind": "intraday_breakout_ytd",
                 "equity": [{"timestamp": "2026-01-02", "equity": 100_100, "cash": 95_000}],
+                "equity_series": [
+                    {
+                        "key": "equity",
+                        "name": "Gross",
+                        "value_suffix": "%",
+                    }
+                ],
+                "equity_hover_fields": [
+                    {"key": "session_high", "label": "全天最高涨幅"}
+                ],
                 "details": {},
             },
         )
@@ -51,6 +62,16 @@ class InteractiveBacktestReportTests(unittest.TestCase):
         self.assertIn("bindSymbolFilters", content)
         self.assertIn("TIMEFRAME / DAY DRILLDOWN", content)
         self.assertIn("loadMinuteDetail", content)
+        self.assertIn("embeddedMinuteDetails", content)
+        self.assertIn('reportKind === "kdj_signal"', content)
+        self.assertIn('reportKind === "intraday_breakout_ytd"', content)
+        self.assertIn("configuredEquitySeries", content)
+        self.assertIn("equityHoverFields", content)
+        self.assertIn('"equity_series":[{"key":"equity","name":"Gross"', content)
+        self.assertIn('"equity_hover_fields":[{"key":"session_high"', content)
+        self.assertIn("全天最高涨幅", content)
+        self.assertIn("全天最低涨幅", content)
+        self.assertIn("股票逐笔复合", content)
         self.assertIn("plotly_click", content)
         self.assertIn("resetPlotlyChart", content)
         self.assertIn("window.Plotly.newPlot(chart, traces", content)
