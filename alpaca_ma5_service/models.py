@@ -14,6 +14,8 @@ class MarketSnapshot:
     today_open: float = 0.0
     today_open_source: str = ""
     previous_opens: list[float] = field(default_factory=list)
+    current_price_as_of: datetime | None = None
+    signal_day_gain_pct_override: float | None = None
 
     @property
     def today_ma5(self) -> float:
@@ -23,6 +25,8 @@ class MarketSnapshot:
     @property
     def signal_day_gain_pct(self) -> float:
         """信号日涨幅 = 最近已完成日线收盘价 / 前一日收盘价 - 1。"""
+        if self.signal_day_gain_pct_override is not None:
+            return self.signal_day_gain_pct_override
         if len(self.previous_closes) < 2:
             return 0.0
         previous_close = self.previous_closes[-2]

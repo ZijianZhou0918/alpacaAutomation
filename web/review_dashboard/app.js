@@ -277,18 +277,18 @@ async function loadActionStatus() {
 function renderActionStatus() {
   const status = state.actionStatus || {};
   const watchcode = status.watchcode || {};
-  const premarketWatchcode = status.premarket_watchcode || {};
   const generating = Boolean(status.intraday_generator_running || status.pending_actions?.includes("generate-watchcode"));
-  const premarketGenerating = Boolean(status.premarket_generator_running || status.pending_actions?.includes("generate-premarket-watchcode"));
+  const premarketGenerating = false;
   const anyGenerating = Boolean(status.generator_running || generating || premarketGenerating);
   const startingMonitor = Boolean(status.pending_actions?.includes("start-monitor"));
   const startingPremarketMonitor = Boolean(status.pending_actions?.includes("start-premarket-monitor"));
   const monitorRunning = Boolean(status.monitor_running);
   const premarketMonitorRunning = Boolean(status.premarket_monitor_running);
   const stoppable = monitorRunning || anyGenerating || startingMonitor || startingPremarketMonitor;
-  renderWatchcodeStatus("premarket-watchcode-status", "盘前", premarketWatchcode, premarketGenerating);
+  el["premarket-watchcode-status"].className = "runtime-control-status ready";
+  el["premarket-watchcode-status"].querySelector("span:last-child").textContent = "盘前：仅监控当前持仓，不使用 WatchCode";
   renderWatchcodeStatus("watchcode-status", "盘中", watchcode, generating);
-  el["generate-premarket-watchcode"].disabled = anyGenerating || Boolean(state.actionLoading);
+  el["generate-premarket-watchcode"].disabled = true;
   el["generate-watchcode"].disabled = anyGenerating || Boolean(state.actionLoading);
   el["start-premarket-monitor"].disabled = monitorRunning || startingPremarketMonitor || Boolean(state.actionLoading);
   el["start-monitor"].disabled = monitorRunning || startingMonitor || Boolean(state.actionLoading);
@@ -319,7 +319,6 @@ function renderDailyReadiness() {
   };
   const premarketTask = taskState(["monitor_premarket"]);
   const intradayTask = taskState(["monitor_auto", "monitor_ma5"]);
-  const premarketGenerator = taskState(["watchcode_premarket"]);
   const intradayGenerator = taskState(["watchcode_ma5"]);
   const pendingActions = Array.isArray(status.pending_actions) ? status.pending_actions : [];
   const actionKnown = Boolean(state.actionStatus);
@@ -371,12 +370,6 @@ function renderDailyReadiness() {
     return { label, stateLabel: "未开启", detail: "当前没有运行中的监控进程", tone: "neutral" };
   };
 
-  const premarketGenerating = Boolean(
-    status.premarket_generator_running
-      || pendingActions.includes("generate-premarket-watchcode")
-      || premarketGenerator.running
-      || premarketGenerator.starting
-  );
   const intradayGenerating = Boolean(
     status.intraday_generator_running
       || pendingActions.includes("generate-watchcode")
@@ -392,9 +385,15 @@ function renderDailyReadiness() {
   );
   const intradayMonitorStarting = Boolean(pendingActions.includes("start-monitor") || intradayTask.starting);
   const items = [
-    watchcodeItem("盘前 WatchCode", premarketWatchcode, premarketGenerating),
+    {
+      label: "盘前监控规则",
+      stateLabel: "仅当前持仓",
+      detail: "不使用 WatchCode；滚动 60 秒涨跌 3% 才提醒",
+      done: true,
+      tone: "success",
+    },
     watchcodeItem("盘中 WatchCode", watchcode, intradayGenerating),
-    monitorItem("盘前监控", premarketMonitorRunning, premarketMonitorStarting),
+    monitorItem("盘前持仓监控", premarketMonitorRunning, premarketMonitorStarting),
     monitorItem("盘中监控", intradayMonitorRunning, intradayMonitorStarting),
   ];
   const completed = items.filter((item) => item.done).length;
@@ -422,8 +421,8 @@ function renderDailyReadiness() {
   const weekend = isoWeekday(tomorrow) === 0 || isoWeekday(tomorrow) === 6;
   el["tomorrow-plan-date"].textContent = formatShortDate(tomorrow, true);
   el["tomorrow-plan-text"].textContent = weekend
-    ? "周末通常休市；下一交易日前依次生成盘前 WatchCode、启动盘前监控、生成盘中 WatchCode、启动自动盯盘。"
-    : "生成盘前 WatchCode → 启动盘前监控 → 生成盘中 WatchCode → 启动自动盯盘";
+    ? "周末通常休市；下一交易日前启动盘前持仓监控、生成盘中 WatchCode、启动自动盯盘。"
+    : "启动盘前持仓监控 → 生成盘中 WatchCode → 启动自动盯盘";
 }
 
 function renderWatchcodeStatus(elementId, sessionLabel, watchcode, generating) {
@@ -457,8 +456,7 @@ function beginPendingRuntimeTask(action) {
   const definitions = {
     "generate-watchcode": { taskName: "watchcode_ma5", taskLabel: "生成盘中 WatchCode", phase: "prepare" },
     "start-monitor": { taskName: "monitor_auto", taskLabel: "自动盯盘", phase: "startup" },
-    "generate-premarket-watchcode": { taskName: "watchcode_premarket", taskLabel: "生成盘前 WatchCode", phase: "prepare" },
-    "start-premarket-monitor": { taskName: "monitor_premarket", taskLabel: "盘前 MA5 盯盘", phase: "startup" },
+    "start-premarket-monitor": { taskName: "monitor_premarket", taskLabel: "盘前持仓波动监控", phase: "startup" },
   };
   const definition = definitions[action];
   if (!definition) return;
@@ -536,9 +534,8 @@ function reconcilePendingRuntimeTask(payload) {
   const matchingTask = state.runtimeTasks.find((task) => {
     if (task.status !== "running" || Date.parse(task.started_at || 0) < earliestStart) return false;
     if (state.runtimeBurstAction === "generate-watchcode") return task.task_name === "watchcode_ma5";
-    if (state.runtimeBurstAction === "generate-premarket-watchcode") return task.task_name === "watchcode_premarket";
     if (state.runtimeBurstAction === "start-premarket-monitor") {
-      return ["watchcode_premarket", "monitor_premarket"].includes(task.task_name);
+      return task.task_name === "monitor_premarket";
     }
     return ["watchcode_ma5", "monitor_auto", "monitor_ma5"].includes(task.task_name);
   });
@@ -589,16 +586,14 @@ async function runDashboardAction(action) {
     if (!window.confirm(`${dependency}\n\n即将启动 ${mode} 自动盯盘任务，可能执行真实订单。确认继续？`)) return;
   }
   if (action === "start-premarket-monitor") {
-    const dependency = state.actionStatus?.premarket_watchcode?.ready
-      ? "盘前 WatchCode 已就绪。"
-      : "盘前 WatchCode 尚未就绪，系统会先生成，成功后再启动。";
-    if (!window.confirm(`${dependency}\n\n盘前监控仅在 04:00–09:30 ET 运行，只发送推荐提醒，不会提交买单。确认继续？`)) return;
+    const dependency = "盘前监控不使用 WatchCode，只读取 Alpaca 当前持仓。";
+    if (!window.confirm(`${dependency}\n\n仅当持仓在滚动 60 秒内上涨或下跌达到 3% 时提醒，不会提交订单。确认继续？`)) return;
   }
   if (action === "stop-monitor") {
     if (!window.confirm("确认结束当前 MA5 盯盘任务？\n\n正在生成的 WatchCode 也会停止；已经提交到券商的订单不会被撤销。")) return;
   }
   state.actionLoading = action;
-  if (["generate-watchcode", "start-monitor", "generate-premarket-watchcode", "start-premarket-monitor"].includes(action)) {
+  if (["generate-watchcode", "start-monitor", "start-premarket-monitor"].includes(action)) {
     beginPendingRuntimeTask(action);
   }
   if (action === "stop-monitor") {

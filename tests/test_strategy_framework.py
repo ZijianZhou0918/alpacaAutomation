@@ -6,7 +6,7 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from alpaca_ma5_service import strategy
-from alpaca_ma5_service.config import MA5_DIP_STRATEGY_NAME, build_settings
+from alpaca_ma5_service.config import MA5_DIP_LADDER_STRATEGY_NAME, MA5_DIP_STRATEGY_NAME, build_settings
 from alpaca_ma5_service.models import OrderResult, Signal
 from alpaca_ma5_service.strategy_framework import (
     DEFAULT_CANCEL_STRATEGY_NAME,
@@ -164,7 +164,7 @@ class StrategyConfigurationTests(TestCase):
 
         self.assertEqual(
             registry.available_profile_names(),
-            (MA5_DIP_STRATEGY_NAME,),
+            (MA5_DIP_STRATEGY_NAME, MA5_DIP_LADDER_STRATEGY_NAME),
         )
         settings = build_settings(strategy_name=MA5_DIP_STRATEGY_NAME)
         runtime = resolve_strategy_runtime(settings)
@@ -174,6 +174,15 @@ class StrategyConfigurationTests(TestCase):
         self.assertEqual(runtime.selection.buy_strategy_name, MA5_DIP_STRATEGY_NAME)
         self.assertEqual(runtime.selection.sell_strategy_name, DEFAULT_SELL_STRATEGY_NAME)
         self.assertEqual(runtime.selection.cancel_strategy_name, DEFAULT_CANCEL_STRATEGY_NAME)
+
+        ladder_settings = build_settings(strategy_name=MA5_DIP_LADDER_STRATEGY_NAME)
+        ladder = resolve_strategy_runtime(ladder_settings)
+        self.assertEqual(ladder.selection.profile_name, MA5_DIP_LADDER_STRATEGY_NAME)
+        self.assertEqual(ladder.selection.watchlist_strategy_name, MA5_DIP_STRATEGY_NAME)
+        self.assertEqual(ladder.selection.buy_strategy_name, MA5_DIP_STRATEGY_NAME)
+        self.assertEqual(ladder_settings.take_profit_half_pct, 0.10)
+        self.assertEqual(ladder_settings.take_profit_sell_fraction, 0.50)
+        self.assertEqual(ladder_settings.absolute_stop_loss_pct, -0.10)
 
     def test_invalid_component_is_rejected_while_building_settings(self):
         with self.assertRaisesRegex(ValueError, "Unknown buy strategy"):

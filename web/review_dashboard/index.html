@@ -181,14 +181,14 @@
             <span id="runtime-status" class="status-indicator neutral"><span class="status-dot" aria-hidden="true"></span><span>正在发现本机任务</span></span>
           </div>
           <p id="runtime-summary" class="muted">Python 命令行与 IDE 启动的监控都会自动出现在这里。</p>
-          <p id="premarket-watchcode-status" class="runtime-control-status"><span class="status-dot" aria-hidden="true"></span><span>正在检查盘前 WatchCode…</span></p>
+          <p id="premarket-watchcode-status" class="runtime-control-status ready"><span class="status-dot" aria-hidden="true"></span><span>盘前：仅监控当前持仓，不使用 WatchCode</span></p>
           <p id="watchcode-status" class="runtime-control-status"><span class="status-dot" aria-hidden="true"></span><span>正在检查盘中 WatchCode…</span></p>
         </div>
         <div class="runtime-actions">
           <div class="runtime-action-group" aria-label="盘前任务控制">
-            <span class="runtime-action-label">盘前 · 只提醒</span>
-            <button id="generate-premarket-watchcode" class="button secondary compact-button" type="button">
-              <svg aria-hidden="true"><use href="#icon-database"></use></svg><span>生成盘前 WatchCode</span>
+            <span class="runtime-action-label">盘前 · 持仓波动提醒</span>
+            <button id="generate-premarket-watchcode" class="button secondary compact-button" type="button" disabled>
+              <svg aria-hidden="true"><use href="#icon-database"></use></svg><span>盘前无需 WatchCode</span>
             </button>
             <button id="start-premarket-monitor" class="button info-outline compact-button" type="button">
               <svg aria-hidden="true"><use href="#icon-clock"></use></svg><span>启动盘前监控</span>

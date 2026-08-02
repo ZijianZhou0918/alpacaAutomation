@@ -41,7 +41,7 @@ def is_premarket_time(now_et: datetime) -> bool:
 
 
 def is_premarket_monitor_finished(now_et: datetime) -> bool:
-    """盘前推荐监控到 09:30 ET 后退出。"""
+    """盘前持仓波动监控到 09:30 ET 后退出。"""
     return now_et.time() >= REGULAR_OPEN
 
 

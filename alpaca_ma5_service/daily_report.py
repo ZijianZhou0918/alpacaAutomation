@@ -13,8 +13,7 @@ from .afterhours_monitor import AFTERHOURS_DROP_SIGNAL_THRESHOLD, AFTERHOURS_RAN
 from .config import Settings, build_settings
 from .models import is_executed_order_status
 from .openclaw_notify import safe_send_openclaw_messages
-from .premarket_monitor import PREMARKET_ALERT_DISTANCE_PCT, PREMARKET_MIN_DROP_PCT
-from .premarket_watchlist import premarket_watch_codes_path
+from .premarket_positions import PREMARKET_POSITION_MOVE_PCT, PREMARKET_POSITION_WINDOW_SECONDS
 from .run_lock import acquire_run_lock
 from .state import orders_file
 from .strategy_ma5_dip import MAX_BUY_TODAY_CURRENT_GAIN_PCT
@@ -26,7 +25,7 @@ DAILY_REPORT_LOCK_NAME = "daily_monitor_report.lock"
 REPORT_LINE = "===================="
 SECTION_LINE = "--------------------"
 
-PREMARKET_HEADERS = ["代码", "状态", "当前价", "价格来源", "MA5", "MA5距离", "盘前涨跌幅", "信号日涨幅", "说明"]
+PREMARKET_HEADERS = ["代码", "状态", "当前价", "相对均价", "说明"]
 INTRADAY_HEADERS = ["代码", "动作", "当前价", "开盘", "MA5", "开盘MA5", "信号涨幅", "当前涨幅", "买/卖点", "订单", "原因"]
 AFTERHOURS_HEADERS = ["股票", "当前价", "来源", "收盘", "跌幅", "提醒线", "参考价", "状态", "说明"]
 
@@ -105,20 +104,18 @@ def build_daily_monitor_report(
     intraday_rows = [row for row in parsed_rows if row.kind == "intraday"]
     afterhours_rows = [row for row in parsed_rows if row.kind == "afterhours"]
 
-    premarket_watch_path = premarket_watch_codes_path(settings)
     intraday_watch_path = settings.watch_codes_file
     afterhours_watch_path = afterhours_watch_codes_path(settings)
-    premarket_watch_count = len(read_watch_codes(premarket_watch_path))
     intraday_watch_count = len(read_watch_codes(intraday_watch_path))
     afterhours_watch_count = len(read_watch_codes(afterhours_watch_path))
     afterhours_candidate_count = csv_row_count(settings.output_dir / f"afterhours_candidates_{report_day:%Y-%m-%d}.csv")
 
-    premarket_sent_count = count_lines_containing(log_lines, "premarket MA5 recommendation")
+    premarket_sent_count = count_lines_containing(log_lines, "premarket position movement")
     afterhours_alert_batches = count_lines_containing(log_lines, "afterhours high/low alert signal")
     premarket_alert_symbols = unique_symbols_from_rows(
         premarket_rows,
         symbol_field="代码",
-        predicate=lambda values: values.get("状态", "") not in {"观察", ""},
+        predicate=lambda values: values.get("状态", "") in {"快速上涨", "快速下跌"},
     )
     afterhours_alert_symbols = unique_symbols_from_rows(
         afterhours_rows,
@@ -127,7 +124,11 @@ def build_daily_monitor_report(
     )
     intraday_round_count = count_intraday_rounds(log_lines)
 
-    premarket_closest = closest_premarket_signal(premarket_rows)
+    premarket_position_symbols = unique_symbols_from_rows(
+        premarket_rows,
+        symbol_field="代码",
+        predicate=lambda _values: True,
+    )
     intraday_closest = closest_intraday_buy_signal(intraday_rows)
     afterhours_closest = closest_afterhours_signal(afterhours_rows)
 
@@ -144,13 +145,13 @@ def build_daily_monitor_report(
         f"1. 订单：{order_short}",
         f"2. 盘中未买原因：{intraday_no_buy_short}",
         f"3. 最接近买入：{format_signal_headline(intraday_closest)}",
-        f"4. 盘前/盘后：只提醒，不下单。",
+        f"4. 盘前只监控当前持仓的一分钟 3% 波动；盘后只提醒，均不下单。",
         REPORT_LINE,
         "总览",
         format_report_table(
             ["时段", "模式", "数量", "结果", "重点"],
             [
-                ["盘前", "提醒-only", f"{premarket_watch_count}只", f"提醒{premarket_sent_count}次", format_signal_headline(premarket_closest, limit=44)],
+                ["盘前", "持仓提醒", f"{len(premarket_position_symbols)}只", f"提醒{premarket_sent_count}次", format_symbol_list(premarket_alert_symbols, limit=8)],
                 ["盘中", "可下单", f"{intraday_watch_count}只", order_short, format_signal_headline(intraday_closest, limit=44)],
                 ["盘后", "提醒-only", f"{afterhours_count}只", f"提醒{afterhours_alert_batches}批", format_signal_headline(afterhours_closest, limit=44)],
             ],
@@ -160,11 +161,11 @@ def build_daily_monitor_report(
         format_report_table(
             ["项目", "内容"],
             [
-                ["观察池", f"Top50 / {premarket_watch_count}只"],
-                ["提醒规则", f"跌幅>={PREMARKET_MIN_DROP_PCT:.0%}；低于/上穿/上方{PREMARKET_ALERT_DISTANCE_PCT:.0%}内靠近MA5"],
+                ["监控范围", f"仅 Alpaca 当前持仓；本日日志出现 {len(premarket_position_symbols)} 只"],
+                ["提醒规则", f"滚动 {PREMARKET_POSITION_WINDOW_SECONDS} 秒上涨或下跌达到 {PREMARKET_POSITION_MOVE_PCT:.0%}"],
                 ["提醒结果", f"{premarket_sent_count}次；{format_symbol_list(premarket_alert_symbols, limit=8)}"],
-                ["最接近", format_signal_with_reason(premarket_closest, limit=90)],
-                ["下单", "不下单，只发云端提醒"],
+                ["选股", "不筛选、不读取盘前 WatchCode"],
+                ["下单", "不下单，只发持仓波动提醒"],
             ],
         ),
         SECTION_LINE,
@@ -303,37 +304,24 @@ def unique_symbols_from_rows(rows: list[ParsedRow], *, symbol_field: str, predic
 
 
 def closest_premarket_signal(rows: list[ParsedRow]) -> ClosestSignal | None:
+    """兼容复盘调用：返回日志中幅度最大的持仓快速波动。"""
     best: tuple[float, ClosestSignal] | None = None
     for row in rows:
         values = row.values
         symbol = values.get("代码", "")
         if not symbol:
             continue
-        current_gain = parse_percent(values.get("盘前涨跌幅", ""))
-        ma5_distance = parse_percent(values.get("MA5距离", ""))
         status = values.get("状态", "")
         reason = values.get("说明", "")
-        if current_gain is None:
+        match = re.search(r"一分钟波动\s*([+-]?[0-9.]+)%", reason)
+        if not match:
             continue
-        drop = max(0.0, -current_gain)
-        if status not in {"观察", ""}:
-            priority = 0
-        elif drop >= PREMARKET_MIN_DROP_PCT and ma5_distance is not None and (ma5_distance < 0 or ma5_distance <= PREMARKET_ALERT_DISTANCE_PCT):
-            priority = 1
-        elif drop >= PREMARKET_MIN_DROP_PCT:
-            priority = 2
-        else:
-            priority = 3
-        distance_gap = 0.0 if ma5_distance is None else max(0.0, ma5_distance - PREMARKET_ALERT_DISTANCE_PCT)
-        drop_gap = max(0.0, PREMARKET_MIN_DROP_PCT - drop)
-        score = priority * 100.0 + drop_gap + distance_gap
-        summary = (
-            f"{symbol}，盘前涨跌 {format_pct(current_gain)}，"
-            f"MA5距离 {format_optional_pct(ma5_distance)}"
-        )
-        candidate = ClosestSignal(symbol, summary, reason or "无说明", score)
-        if best is None or score < best[0]:
-            best = (score, candidate)
+        movement = float(match.group(1)) / 100.0
+        magnitude = abs(movement)
+        summary = f"{symbol}，{status or '持仓波动'} {movement:+.2%}"
+        candidate = ClosestSignal(symbol, summary, reason or "无说明", -magnitude)
+        if best is None or magnitude > best[0]:
+            best = (magnitude, candidate)
     return best[1] if best else None
 
 

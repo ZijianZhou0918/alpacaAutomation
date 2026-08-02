@@ -1,7 +1,8 @@
 import hashlib
 import hmac
 import json
-from datetime import date, datetime, time
+from dataclasses import replace
+from datetime import date, datetime, time, timedelta
 from inspect import signature
 from pathlib import Path
 from subprocess import CompletedProcess
@@ -36,10 +37,11 @@ from alpaca_ma5_service.afterhours_high_low import (
     write_afterhours_watch_codes,
 )
 from alpaca_ma5_service.broker import AlpacaStockBroker, DryRunStockBroker
-from alpaca_ma5_service.config import BUY_NOTIONAL_USD, MA5_DIP_STRATEGY_NAME, Settings, build_settings
+from alpaca_ma5_service.config import BUY_NOTIONAL_USD, MA5_DIP_LADDER_STRATEGY_NAME, MA5_DIP_STRATEGY_NAME, Settings, build_settings
 from alpaca_ma5_service.manual_order import build_test_order_preview, discounted_limit_price, place_test_order, quantity_for_notional
-from alpaca_ma5_service.market_data import AlpacaMarketData, build_realtime_price_source, _SnapshotBar, _daily_request_end, _requires_realtime_price, _snapshot_inputs, _snapshot_previous_opens, _snapshot_today_open, _usable_today_open
+from alpaca_ma5_service.market_data import AlpacaMarketData, CorporateActionBasisError, MarketDataSafetyError, SNAPSHOT_PURPOSE_AUTOMATIC, SNAPSHOT_PURPOSE_PREMARKET_OBSERVATION, build_realtime_price_source, _SnapshotBar, _daily_request_end, _requires_realtime_price, _snapshot_inputs, _snapshot_previous_opens, _snapshot_today_open, _usable_today_open, validate_latest_completed_bar_basis, validate_realtime_price_as_of
 from alpaca_ma5_service.market_time import is_buy_order_time, is_premarket_monitor_finished, is_intraday_monitor_finished, is_premarket_time, is_realtime_order_time, is_regular_market_time, next_poll_seconds, regular_open_has_started
+from alpaca_ma5_service.ladder import LadderStateStore
 from alpaca_ma5_service.moomoo_market_data import MoomooRealtimePriceSource, snapshot_open_from_row, snapshot_price_from_row, snapshot_update_time_from_row
 from alpaca_ma5_service.models import MarketSnapshot, OrderResult, Position, has_unconfirmed_order_status
 from alpaca_ma5_service.openclaw_trade_control import execute_trade_command, parse_trade_command, render_trade_command_response
@@ -59,7 +61,7 @@ from alpaca_ma5_service.trade_notifications import render_order_submitted_messag
 from alpaca_ma5_service.trading_calendar import offline_trading_day_decision, us_equity_holiday_name
 from alpaca_ma5_service.watchlist import read_watch_codes
 from alpaca_ma5_service.watchlist_charts import delete_watch_codes_from_watchlist, ensure_watchlist_chart_server_running, write_watchlist_chart_page
-from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, fetch_daily_bars, generate_watch_codes, is_common_stock_asset, refresh_watchlist_chart_from_watch_codes, request_end_datetime, screen_candidates, validate_candidates, watchlist_screen_rules, write_watch_codes
+from alpaca_ma5_service.watchlist_generator import DailyBar, WatchCandidate, fetch_daily_bars, generate_watch_codes, is_common_stock_asset, refresh_watchlist_chart_from_watch_codes, request_end_datetime, screen_candidates, validate_candidates, watchcode_matches_rules, watchlist_rules_header, watchlist_screen_rules, write_watch_codes
 from alpaca_ma5_service.afterhours_monitor import (
     AFTERHOURS_RANGE_RATIO_THRESHOLD,
     afterhours_monitor_settings,
@@ -75,9 +77,11 @@ from monitor_auto import (
     ensure_afterhours_watchcode,
     ensure_current_session_watchcode,
     expected_signal_date,
+    intraday_watchcode_ready_for_session,
     monitor_auto as run_monitor_auto,
     watchcode_ready_for_session,
 )
+from alpaca_ma5_service.workflows.monitoring.intraday import monitor_ma5_forever as run_intraday_monitor
 from tools.serve_watchlist_charts_lan import settings_for_watch_file
 
 
@@ -86,11 +90,26 @@ class FakeMarketData:
         """测试用行情源：按 symbol 返回预设快照。"""
         self.snapshots = snapshots
         self.calls = []
+        self.purposes = []
 
-    def get_snapshot(self, symbol):
+    def get_snapshot(self, symbol, *, purpose=SNAPSHOT_PURPOSE_AUTOMATIC):
         """模拟真实行情源的 get_snapshot 接口。"""
         self.calls.append(symbol)
+        self.purposes.append(purpose)
         return self.snapshots[symbol]
+
+
+class SafetyBlockingMarketData:
+    def __init__(self, message="unit company-action basis mismatch"):
+        """模拟行情口径无法安全确认，所有自动动作都必须失败关闭。"""
+        self.message = message
+        self.calls = []
+        self.purposes = []
+
+    def get_snapshot(self, symbol, *, purpose=SNAPSHOT_PURPOSE_AUTOMATIC):
+        self.calls.append(symbol)
+        self.purposes.append(purpose)
+        raise MarketDataSafetyError(self.message)
 
 
 class FakeRealtimePriceSource:
@@ -495,7 +514,7 @@ class StrategyTests(unittest.TestCase):
         strategy_module.set_active_strategy("ma5_dip")
 
     def test_buy_when_signal_gain_15_to_40_adds_half_percent(self):
-        signal = evaluate_buy(make_snapshot(current=10.65, closes=[10.0, 10.0, 10.0, 13.0]))
+        signal = evaluate_buy(make_buy_snapshot(current=10.65, closes=[10.0, 10.0, 10.0, 13.0]))
         self.assertEqual(signal.action, "BUY")
         self.assertAlmostEqual(signal.diagnostics["today_ma5"], 10.73)
         self.assertAlmostEqual(signal.diagnostics["signal_day_gain_pct"], 0.30)
@@ -505,14 +524,14 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(signal.diagnostics["final_buy_point"], 10.78365)
 
     def test_hold_when_signal_gain_15_to_40_price_is_above_trigger_band(self):
-        signal = evaluate_buy(make_snapshot(current=11.3, closes=[10.0, 10.0, 10.0, 13.0]))
+        signal = evaluate_buy(make_buy_snapshot(current=11.3, closes=[10.0, 10.0, 10.0, 13.0]))
 
         self.assertEqual(signal.action, "HOLD")
         self.assertIn("触发上沿", signal.reason)
         self.assertAlmostEqual(signal.diagnostics["buy_trigger_distance_pct"], 0.03)
 
     def test_buy_when_current_price_is_within_trigger_band_above_buy_point(self):
-        signal = evaluate_buy(make_snapshot(current=11.9, closes=[10.0, 10.0, 10.0, 15.0]))
+        signal = evaluate_buy(make_buy_snapshot(current=11.9, closes=[10.0, 10.0, 10.0, 15.0]))
 
         self.assertEqual(signal.action, "BUY")
         self.assertGreater(signal.diagnostics["current_vs_buy_point_pct"], 0)
@@ -521,7 +540,7 @@ class StrategyTests(unittest.TestCase):
         self.assertIn("3.00% 内", signal.reason)
 
     def test_buy_when_signal_gain_40_to_100_adds_three_percent(self):
-        signal = evaluate_buy(make_snapshot(current=11.5, closes=[10.0, 10.0, 10.0, 15.0]))
+        signal = evaluate_buy(make_buy_snapshot(current=11.5, closes=[10.0, 10.0, 10.0, 15.0]))
 
         self.assertEqual(signal.action, "BUY")
         self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.03)
@@ -529,7 +548,7 @@ class StrategyTests(unittest.TestCase):
         self.assertAlmostEqual(signal.diagnostics["final_buy_point"], 11.639, places=3)
 
     def test_buy_when_signal_gain_above_100_adds_four_percent(self):
-        signal = evaluate_buy(make_snapshot(current=13.4, closes=[10.0, 10.0, 10.0, 22.0]))
+        signal = evaluate_buy(make_buy_snapshot(current=13.4, closes=[10.0, 10.0, 10.0, 22.0]))
 
         self.assertEqual(signal.action, "BUY")
         self.assertAlmostEqual(signal.diagnostics["base_buy_point_pct"], 0.04)
@@ -571,7 +590,7 @@ class StrategyTests(unittest.TestCase):
         self.assertLess(signal.diagnostics["today_open_vs_today_ma5_pct"], 0)
 
     def test_hold_and_exclude_day_when_touch_ma5_before_12_percent_drop(self):
-        signal = evaluate_buy(make_snapshot(current=11.0, closes=[12.0, 12.0, 10.0, 12.1]))
+        signal = evaluate_buy(make_buy_snapshot(current=11.0, closes=[12.0, 12.0, 10.0, 12.1]))
 
         self.assertEqual(signal.action, "HOLD")
         self.assertIn("12.00%", signal.reason)
@@ -583,7 +602,7 @@ class StrategyTests(unittest.TestCase):
         try:
             strategy_ma5_dip.configure(max_buy_today_current_gain_pct=-0.09)
 
-            signal = evaluate_buy(make_snapshot(current=11.05, closes=[12.0, 12.0, 10.0, 12.1]))
+            signal = evaluate_buy(make_buy_snapshot(current=11.05, closes=[12.0, 12.0, 10.0, 12.1]))
 
             self.assertEqual(signal.action, "HOLD")
             self.assertIn("9.00%", signal.reason)
@@ -592,27 +611,27 @@ class StrategyTests(unittest.TestCase):
             strategy_ma5_dip.configure(max_buy_today_current_gain_pct=original)
 
     def test_hold_when_buy_zone_reached_before_12_percent_drop(self):
-        signal = evaluate_buy(make_snapshot(current=11.6, closes=[12.0, 12.0, 10.0, 12.1]))
+        signal = evaluate_buy(make_buy_snapshot(current=11.6, closes=[12.0, 12.0, 10.0, 12.1]))
 
         self.assertEqual(signal.action, "HOLD")
         self.assertIn("12.00%", signal.reason)
         self.assertGreater(signal.diagnostics["today_current_gain_pct"], -0.12)
 
-    def test_missing_today_open_uses_base_buy_point_only(self):
-        signal = evaluate_buy(make_snapshot(current=11.3, closes=[10.0, 10.0, 10.0, 13.0], today_open=0.0))
+    def test_missing_today_open_fails_closed_even_when_other_buy_conditions_match(self):
+        signal = evaluate_buy(make_snapshot(current=11.0, closes=[10.0, 10.0, 10.0, 13.0], today_open=0.0))
 
         self.assertEqual(signal.action, "HOLD")
         self.assertAlmostEqual(signal.diagnostics["open_bonus_pct"], 0.0)
+        self.assertIn("失败关闭", signal.reason)
 
     def test_hold_when_signal_day_gain_is_below_15_percent(self):
-        signal = evaluate_buy(make_snapshot(current=9.8, closes=[10.0, 10.0, 10.0, 11.0]))
+        signal = evaluate_buy(make_buy_snapshot(current=9.8, closes=[10.0, 10.0, 10.0, 11.0]))
 
         self.assertEqual(signal.action, "HOLD")
         self.assertIn("15.00%", signal.reason)
         self.assertIn("动作：观察不买", signal.reason)
         self.assertIn("无有效分段买点", signal.reason)
         self.assertIn("参考动态MA5价", signal.reason)
-        self.assertIn("开盘前", signal.reason)
 
     def test_hold_when_current_price_is_at_today_ma5(self):
         signal = evaluate_buy(make_snapshot(current=10.0, closes=[10.0, 10.0, 10.0, 10.0]))
@@ -750,7 +769,11 @@ class OpenClawTradeCommandTests(unittest.TestCase):
         response = execute_trade_command("帮我买3000刀的AAPL，购买价格固定211", settings=make_settings(Path(".")), broker=RejectBroker())
         text = render_trade_command_response(response)
 
-        self.assertIn("失败原因：Alpaca 拒单: buying power 不足", text)
+        self.assertIn("【Agent 交易指令｜买单】", text)
+        self.assertIn("总览：❌ 请求失败或需要处理", text)
+        self.assertIn("账户：Alpaca PAPER（模拟账户）", text)
+        self.assertIn("【买单｜下单失败】", text)
+        self.assertIn("失败原因\n- Alpaca 拒单: buying power 不足", text)
 
     def test_execute_sell_limit_command_defaults_to_full_position(self):
         """卖出未指定股数时，默认卖出该股票当前全部持仓。"""
@@ -806,6 +829,48 @@ class ServiceTests(unittest.TestCase):
             path = Path(tmp) / "watch_codes.txt"
             path.write_text("# comment\nAAPL\nUS.AAPL\nTSLA, note\n", encoding="utf-8")
             self.assertEqual(read_watch_codes(path), ["US.AAPL", "US.TSLA"])
+
+    def test_market_data_safety_error_blocks_intraday_buy_order(self):
+        """公司行动口径异常必须在策略和券商提交前阻断买入。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            market_data = SafetyBlockingMarketData()
+            broker = RecordingBuyBroker()
+
+            summary = run_once(
+                settings,
+                market_data=market_data,
+                broker=broker,
+                now=datetime(2026, 5, 28, 10, 0),
+            )
+
+            self.assertEqual(summary["errors"], 1)
+            self.assertEqual(summary["buy"], 0)
+            self.assertEqual(broker.buy_calls, 0)
+            self.assertEqual(market_data.calls, ["US.TEST"])
+            self.assertEqual(market_data.purposes, [SNAPSHOT_PURPOSE_AUTOMATIC])
+
+    def test_market_data_safety_error_blocks_intraday_sell_order(self):
+        """异常实时价不得触发止盈、止损或任何其他自动卖单。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.watch_codes_file.write_text("", encoding="utf-8")
+            market_data = SafetyBlockingMarketData("unit stale realtime price")
+            broker = RecordingSellBroker()
+
+            summary = run_once(
+                settings,
+                market_data=market_data,
+                broker=broker,
+                now=datetime(2026, 5, 28, 10, 0),
+            )
+
+            self.assertEqual(summary["errors"], 1)
+            self.assertEqual(summary["sell"], 0)
+            self.assertEqual(broker.sell_calls, [])
+            self.assertEqual(market_data.calls, ["US.TEST"])
+            self.assertEqual(market_data.purposes, [SNAPSHOT_PURPOSE_AUTOMATIC])
 
     def test_run_once_exposes_the_nine_core_trade_phases_in_order(self):
         """核心逐股循环应直接按买入、卖出、撤单各三阶段执行。"""
@@ -974,6 +1039,90 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(broker.last_notional_usd, 1500.0)
             self.assertAlmostEqual(broker.last_limit_price, 10.78365)
 
+    def test_run_once_ladder_dry_run_splits_only_first_half_take_profit(self):
+        """三档 profile 只拆首次半仓止盈额度，不触碰 Alpaca submit_order。"""
+        real_submit = self.enterContext(patch.object(AlpacaStockBroker, "_submit_order"))
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = replace(
+                make_settings(root),
+                strategy_name=MA5_DIP_LADDER_STRATEGY_NAME,
+                strategy_profile_name=MA5_DIP_LADDER_STRATEGY_NAME,
+                take_profit_half_pct=0.10,
+                take_profit_sell_fraction=0.50,
+                absolute_stop_loss_pct=-0.10,
+            )
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            broker = DryRunStockBroker(settings)
+            prices = [10.65, 10.5435, 10.65]
+
+            for minute, price in enumerate(prices):
+                summary = run_once(
+                    settings,
+                    market_data=FakeMarketData({"US.TEST": make_buy_snapshot_for_symbol("US.TEST", current=price)}),
+                    broker=broker,
+                    now=datetime(2026, 5, 28, 10, minute),
+                )
+                self.assertEqual(summary["buy"], 1)
+
+            full_position = broker.get_positions()["US.TEST"]
+            full_quantity = full_position.quantity
+            take_profit_price = full_position.avg_price * 1.10
+            sell_summary = run_once(
+                settings,
+                market_data=FakeMarketData(
+                    {"US.TEST": make_buy_snapshot_for_symbol("US.TEST", current=take_profit_price)}
+                ),
+                broker=broker,
+                now=datetime(2026, 5, 28, 10, 3),
+            )
+            remaining_quantity = broker.get_positions()["US.TEST"].quantity
+            take_profit_target = int(full_quantity * 0.50)
+            base, remainder = divmod(take_profit_target, 3)
+            expected_first_leg = base + (1 if remainder >= 1 else 0)
+
+            self.assertEqual(sell_summary["sell"], 1)
+            self.assertEqual(full_quantity - remaining_quantity, expected_first_leg)
+            state = json.loads((settings.output_dir / "ladder_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(state["plans"]["US.TEST"]["sell_stage"], 1)
+            real_submit.assert_not_called()
+
+    def test_ladder_closed_plan_from_prior_day_allows_new_session_plan(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = replace(
+                make_settings(root),
+                strategy_name=MA5_DIP_LADDER_STRATEGY_NAME,
+                strategy_profile_name=MA5_DIP_LADDER_STRATEGY_NAME,
+            )
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            store = LadderStateStore(settings.output_dir)
+            old_now = datetime(2026, 5, 27, 10, 0)
+            old_plan = store.create(
+                "US.TEST",
+                old_now.date(),
+                1500.0,
+                10.65,
+                settings.buy_ladder_offsets,
+                settings.sell_ladder_offsets,
+                old_now,
+            )
+            old_plan.buy_closed = True
+            old_plan.status = "closed"
+            store.save(old_now)
+
+            summary = run_once(
+                settings,
+                market_data=FakeMarketData({"US.TEST": make_buy_snapshot_for_symbol("US.TEST")}),
+                broker=DryRunStockBroker(settings),
+                now=datetime(2026, 5, 28, 10, 0),
+            )
+
+            current = LadderStateStore(settings.output_dir).get("US.TEST")
+            self.assertEqual(summary["buy"], 1)
+            self.assertEqual(current.session_date, "2026-05-28")
+            self.assertGreater(current.filled_quantity, 0)
+
     def test_run_once_scales_single_buy_when_cash_is_below_fixed_notional(self):
         """现金低于单笔上限时，自动监控按可用现金缩小本轮金额。"""
         with TemporaryDirectory() as tmp:
@@ -1035,6 +1184,9 @@ class ServiceTests(unittest.TestCase):
             order_status_poll_seconds=3,
             realtime_price_source="alpaca",
             trade_notify_mode="cloud",
+            buy_ladder_offsets=(0.0, -0.02, -0.04),
+            sell_ladder_offsets=(0.0, 0.02, 0.04),
+            absolute_stop_loss_pct=-0.20,
         )
 
         self.assertEqual(settings.max_daily_buys, 3)
@@ -1056,6 +1208,17 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(settings.order_status_poll_seconds, 3)
         self.assertEqual(settings.realtime_price_source, "alpaca")
         self.assertEqual(settings.trade_notify_mode, "cloud")
+        self.assertEqual(settings.buy_ladder_offsets, (0.0, -0.02, -0.04))
+        self.assertEqual(settings.sell_ladder_offsets, (0.0, 0.02, 0.04))
+        self.assertEqual(settings.absolute_stop_loss_pct, -0.20)
+
+    def test_build_settings_rejects_invalid_ladder_parameters(self):
+        with self.assertRaises(ValueError):
+            build_settings(buy_ladder_offsets=(0.0, -0.02, -0.01))
+        with self.assertRaises(ValueError):
+            build_settings(sell_ladder_offsets=(0.0, 0.02, 0.01))
+        with self.assertRaises(ValueError):
+            build_settings(absolute_stop_loss_pct=0.15)
 
     def test_build_settings_defaults_to_old_ma5_dip_strategy(self):
         settings = build_settings()
@@ -1322,6 +1485,55 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["hold"], 1)
             self.assertEqual(broker.buy_calls, 1)
             self.assertEqual(broker.cancel_calls[0][0], "submitted-1")
+
+    def test_run_once_does_not_immediately_cancel_broker_managed_order(self):
+        class ManagedSubmittedBuyBroker(RecordingBuyBroker):
+            manages_pending_orders = True
+
+            def __init__(self):
+                super().__init__()
+                self.cancel_calls = 0
+
+            def place_limit_buy_nonblocking(
+                self,
+                symbol,
+                notional_usd,
+                limit_price,
+                reason,
+                *,
+                strategy_action="",
+            ):
+                self.buy_calls += 1
+                return OrderResult(
+                    "managed-1",
+                    symbol,
+                    "BUY",
+                    1.0,
+                    limit_price,
+                    "SUBMITTED",
+                    f"managed {strategy_action}",
+                )
+
+            def cancel_order(self, order_id, reason):
+                self.cancel_calls += 1
+                raise AssertionError("managed order must not be canceled in the submit round")
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            settings = make_settings(root)
+            settings.watch_codes_file.write_text("US.TEST\n", encoding="utf-8")
+            broker = ManagedSubmittedBuyBroker()
+
+            summary = run_once(
+                settings,
+                market_data=FakeMarketData({"US.TEST": make_buy_snapshot_for_symbol("US.TEST")}),
+                broker=broker,
+                now=datetime(2026, 5, 28, 10, 0),
+            )
+
+            self.assertEqual((summary["buy"], summary["hold"]), (0, 1))
+            self.assertEqual(broker.buy_calls, 1)
+            self.assertEqual(broker.cancel_calls, 0)
 
     def test_run_once_does_not_trust_mismatched_cancel_result(self):
         """撤单查询失败返回通用 CANCEL 结果时，保留原买单暴露并阻止下一笔买入。"""
@@ -2653,13 +2865,17 @@ class ServiceTests(unittest.TestCase):
 
         self.assertEqual(len(messages), 1)
         message = messages[0]
-        self.assertIn("【Alpaca 交易结果】US.AAPL", message)
-        self.assertIn("Alpaca交易卖出已成交: US.AAPL", message)
+        self.assertIn("【卖单｜已成交】", message)
+        self.assertIn("股票：US.AAPL", message)
+        self.assertIn("账户：Alpaca LIVE（真实账户）", message)
         self.assertIn("订单信息", message)
-        self.assertIn("- 状态：FILLED", message)
-        self.assertIn("- 数量：0.25", message)
+        self.assertIn("状态：✅ 已成交（FILLED）", message)
+        self.assertIn("- 数量：0.25 股", message)
+        self.assertIn("- 价格：$100.0000", message)
+        self.assertIn("- 估算金额：约 $25.00", message)
         self.assertIn("策略原因", message)
         self.assertIn("- 止损卖出", message)
+        self.assertIn("下一步", message)
 
     def test_submitted_notification_uses_chinese_single_message(self):
         """即时下单通知也用一条中文消息，方便和最终状态区分。"""
@@ -2667,14 +2883,17 @@ class ServiceTests(unittest.TestCase):
 
         message = render_order_submitted_message(result, "unit-test buy", broker_name="alpaca-live")
 
-        self.assertIn("【Alpaca 交易提交】US.AAPL", message)
-        self.assertIn("Alpaca交易买入已提交: US.AAPL", message)
+        self.assertIn("【买单｜等待成交】", message)
+        self.assertIn("股票：US.AAPL", message)
+        self.assertIn("账户：Alpaca LIVE（真实账户）", message)
         self.assertIn("订单信息", message)
-        self.assertIn("- 账户：alpaca-live", message)
-        self.assertIn("- 数量：1.25", message)
-        self.assertIn("- 状态：ACCEPTED", message)
+        self.assertIn("状态：🟡 已提交，等待成交（ACCEPTED）", message)
+        self.assertIn("- 数量：1.25 股", message)
+        self.assertIn("- 价格：$100.0000", message)
+        self.assertIn("- 估算金额：约 $125.00", message)
         self.assertIn("策略原因", message)
         self.assertIn("- unit-test buy", message)
+        self.assertIn("尚未证明成交", message)
 
     def test_trade_notifications_keep_full_reason_and_result(self):
         """通知里的原因和结果不省略，只压缩多余空白。"""
@@ -3111,6 +3330,161 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(current_price, 8.70)
         self.assertEqual(previous_closes[-4:], [4.91, 4.60, 4.70, 4.68])
 
+    def test_latest_completed_bar_basis_rejects_reverse_split_transition(self):
+        """最近完成日线 RAW/SPLIT 倍数异常时，不能混用旧实时价继续决策。"""
+        now_et = datetime(2026, 7, 27, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+        split_bars = [_SnapshotBar(date(2026, 7, 24), 94.18)]
+        raw_bars = [_SnapshotBar(date(2026, 7, 24), 0.4709)]
+
+        with self.assertRaisesRegex(MarketDataSafetyError, "倍数=200.000000") as caught:
+            validate_latest_completed_bar_basis("US.RCON", split_bars, raw_bars, now_et)
+
+        self.assertIsInstance(caught.exception, CorporateActionBasisError)
+        self.assertIn("盘中买入、补仓、止盈、止损", str(caught.exception))
+
+    def test_premarket_observation_falls_back_to_daily_reference_without_session_price(self):
+        """当日盘前完全无成交时，只读观察返回昨收参考值，自动用途仍失败关闭。"""
+        split_bars = [
+            _SnapshotBar(date(2026, 7, 20), 8.0, 7.8),
+            _SnapshotBar(date(2026, 7, 21), 8.5, 8.1),
+            _SnapshotBar(date(2026, 7, 22), 9.0, 8.7),
+            _SnapshotBar(date(2026, 7, 23), 9.5, 9.1),
+            _SnapshotBar(date(2026, 7, 24), 10.0, 9.7),
+        ]
+        raw_bars = [
+            _SnapshotBar(bar.date, bar.close, bar.open)
+            for bar in split_bars
+        ]
+        market_data = object.__new__(AlpacaMarketData)
+        market_data.market_tz = ZoneInfo("America/New_York")
+        market_data._last_daily_feed = "sip"
+        market_data._last_realtime_as_of = None
+        market_data._daily_bars_pair = lambda _symbol, _now: (split_bars, raw_bars)
+        market_data._current_price = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("unit no current-session price")
+        )
+
+        snapshot = market_data.get_snapshot(
+            "US.FEBO",
+            purpose=SNAPSHOT_PURPOSE_PREMARKET_OBSERVATION,
+        )
+
+        self.assertEqual(snapshot.current_price, 10.0)
+        self.assertEqual(snapshot.current_price_source, "alpaca_daily_close:sip")
+        self.assertIsNone(snapshot.current_price_as_of)
+        self.assertAlmostEqual(snapshot.signal_day_gain_pct, 10.0 / 9.5 - 1.0)
+        with self.assertRaisesRegex(RuntimeError, "unit no current-session price"):
+            market_data.get_snapshot("US.FEBO")
+
+    def test_latest_completed_bar_basis_accepts_aligned_prices(self):
+        """同一完成交易日 RAW/SPLIT 口径一致时允许继续读取实时行情。"""
+        now_et = datetime(2026, 7, 27, 8, 0, tzinfo=ZoneInfo("America/New_York"))
+        split_bars = [_SnapshotBar(date(2026, 7, 24), 12.34)]
+        raw_bars = [_SnapshotBar(date(2026, 7, 24), 12.34)]
+
+        validate_latest_completed_bar_basis("US.TEST", split_bars, raw_bars, now_et)
+
+    def test_realtime_price_timestamp_rejects_cross_day_and_stale_prices(self):
+        """实时价必须属于当前市场日，并满足盘中五分钟的新鲜度上限。"""
+        now_et = datetime(2026, 7, 27, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        accepted = validate_realtime_price_as_of(
+            "US.TEST",
+            "moomoo_snapshot:last_price",
+            now_et - timedelta(minutes=1),
+            now_et,
+        )
+        self.assertEqual(accepted, now_et - timedelta(minutes=1))
+
+        with self.assertRaisesRegex(MarketDataSafetyError, "行情日期"):
+            validate_realtime_price_as_of(
+                "US.TEST",
+                "moomoo_snapshot:last_price",
+                now_et - timedelta(days=1),
+                now_et,
+            )
+        with self.assertRaisesRegex(MarketDataSafetyError, "超过 300 秒安全上限"):
+            validate_realtime_price_as_of(
+                "US.TEST",
+                "moomoo_snapshot:last_price",
+                now_et - timedelta(minutes=6),
+                now_et,
+            )
+
+    def test_premarket_observation_accepts_sparse_current_session_trade(self):
+        """只提醒的盘前观察允许使用当日04:00后最后成交，不误伤稀疏股票。"""
+        now_et = datetime(2026, 7, 27, 5, 30, tzinfo=ZoneInfo("America/New_York"))
+        sparse_trade = datetime(2026, 7, 27, 4, 5, tzinfo=ZoneInfo("America/New_York"))
+
+        with self.assertRaisesRegex(MarketDataSafetyError, "超过 1800 秒安全上限"):
+            validate_realtime_price_as_of(
+                "US.NCT",
+                "moomoo_snapshot:pre_price",
+                sparse_trade,
+                now_et,
+            )
+
+        accepted = validate_realtime_price_as_of(
+            "US.NCT",
+            "moomoo_snapshot:pre_price",
+            sparse_trade,
+            now_et,
+            allow_sparse_premarket=True,
+        )
+
+        self.assertEqual(accepted, sparse_trade)
+
+    def test_premarket_observation_still_rejects_pre_session_and_regular_stale_prices(self):
+        """盘前专用放宽不能接受04:00前价格，也不能泄漏到盘中自动动作。"""
+        premarket_now = datetime(2026, 7, 27, 5, 30, tzinfo=ZoneInfo("America/New_York"))
+        regular_now = datetime(2026, 7, 27, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+        with self.assertRaisesRegex(MarketDataSafetyError, "早于当日 04:00 ET"):
+            validate_realtime_price_as_of(
+                "US.ORIC",
+                "moomoo_snapshot:pre_price",
+                datetime(2026, 7, 27, 3, 59, 59, tzinfo=ZoneInfo("America/New_York")),
+                premarket_now,
+                allow_sparse_premarket=True,
+            )
+        with self.assertRaisesRegex(MarketDataSafetyError, "超过 300 秒安全上限"):
+            validate_realtime_price_as_of(
+                "US.ORIC",
+                "moomoo_snapshot:last_price",
+                regular_now - timedelta(minutes=6),
+                regular_now,
+                allow_sparse_premarket=True,
+            )
+
+    def test_stale_moomoo_price_falls_back_to_fresh_alpaca_trade(self):
+        """Moomoo 时间戳过期时只允许切到已证明新鲜的 Alpaca 行情。"""
+        now_et = datetime(2026, 7, 27, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+        market_data = object.__new__(AlpacaMarketData)
+        market_data.realtime_price_source = FakeRealtimePriceSource(
+            price=0.4709,
+            as_of=now_et - timedelta(days=1),
+        )
+        market_data.trade_feed = "iex"
+        market_data._last_realtime_as_of = None
+
+        def fresh_trade(_symbol):
+            market_data._last_realtime_as_of = now_et - timedelta(seconds=20)
+            return 94.20
+
+        market_data._latest_trade_price = fresh_trade
+        market_data._latest_quote_price = lambda _symbol: (_ for _ in ()).throw(RuntimeError("no quote"))
+
+        price, source, _, _ = market_data._current_price(
+            "US.RCON",
+            "RCON",
+            now_et,
+            require_current_session=True,
+        )
+
+        self.assertEqual(price, 94.20)
+        self.assertEqual(source, "alpaca_latest_trade:iex")
+        self.assertEqual(market_data._last_realtime_as_of, now_et - timedelta(seconds=20))
+
     def test_snapshot_previous_opens_uses_completed_days_only(self):
         """开盘MA5 只取今日之前的完成日开盘价。"""
         bars = [
@@ -3373,6 +3747,20 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual([candidate.symbol for candidate in candidates], ["NEW"])
             self.assertEqual(read_watch_codes(path), ["US.NEW"])
 
+    def test_watchlist_atomic_replace_failure_preserves_previous_pool(self):
+        """生成完成前替换失败时，实盘仍只能看到上一份完整 WatchCode。"""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "watch_codes.txt"
+            previous = "# signal_date=2026-01-20\nUS.OLD\n"
+            path.write_text(previous, encoding="utf-8")
+
+            with patch("alpaca_ma5_service.watchlist_generator.os.replace", side_effect=OSError("replace failed")):
+                with self.assertRaisesRegex(OSError, "replace failed"):
+                    write_watch_codes(path, [])
+
+            self.assertEqual(path.read_text(encoding="utf-8"), previous)
+            self.assertEqual(list(path.parent.glob(".watch_codes.txt.*.tmp")), [])
+
     def test_auto_monitor_checks_watchcode_signal_date(self):
         """单一监控入口只复用当前会话对应 signal_date 的 watchcode。"""
         with TemporaryDirectory() as tmp:
@@ -3382,6 +3770,79 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(expected_signal_date(datetime(2026, 5, 28, 8, 0)), date(2026, 5, 27))
             self.assertTrue(watchcode_ready_for_session(path, datetime(2026, 5, 28, 8, 0)))
             self.assertFalse(watchcode_ready_for_session(path, datetime(2026, 5, 29, 8, 0)))
+
+    def test_intraday_watchcode_requires_current_rule_header(self):
+        """日期正确但规则过期的盘中股票池也必须判定为不可用。"""
+        with TemporaryDirectory() as tmp:
+            path = Path(tmp) / "watch_codes.txt"
+            now_et = datetime(2026, 5, 28, 8, 0)
+            path.write_text(
+                f"{watchlist_rules_header()}\n# signal_date=2026-05-27\nUS.TEST\n",
+                encoding="utf-8",
+            )
+
+            self.assertTrue(watchcode_matches_rules(path))
+            self.assertTrue(intraday_watchcode_ready_for_session(path, now_et))
+            changed_rules = replace(watchlist_screen_rules(), min_signal_gain_pct=0.151)
+            self.assertFalse(intraday_watchcode_ready_for_session(path, now_et, rules=changed_rules))
+
+            path.write_text(
+                "# Rules: obsolete strategy\n# signal_date=2026-05-27\nUS.TEST\n",
+                encoding="utf-8",
+            )
+            self.assertFalse(watchcode_matches_rules(path))
+            self.assertFalse(intraday_watchcode_ready_for_session(path, now_et))
+
+    def test_direct_intraday_monitor_rejects_old_rule_watchcode_before_run_loop(self):
+        """绕过 monitor_auto 直启时，也不能让旧规则股票池进入实盘循环。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.watch_codes_file.parent.mkdir(parents=True, exist_ok=True)
+            settings.watch_codes_file.write_text(
+                "# Rules: obsolete strategy\n# signal_date=2026-05-27\nUS.TEST\n",
+                encoding="utf-8",
+            )
+            now_et = datetime(2026, 5, 28, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+            with patch(
+                "alpaca_ma5_service.workflows.monitoring.intraday.build_monitor_settings",
+                return_value=settings,
+            ):
+                with patch(
+                    "alpaca_ma5_service.workflows.monitoring.intraday.now_market_time",
+                    return_value=now_et,
+                ):
+                    with patch("alpaca_ma5_service.workflows.monitoring.intraday.run_forever") as run_loop:
+                        with self.assertRaisesRegex(RuntimeError, "WatchCode"):
+                            run_intraday_monitor()
+
+            run_loop.assert_not_called()
+
+    def test_direct_intraday_monitor_accepts_current_watchcode_and_enters_run_loop(self):
+        """当前日期与规则都匹配时，直接盘中入口可以进入受锁保护的循环。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            settings.watch_codes_file.parent.mkdir(parents=True, exist_ok=True)
+            settings.watch_codes_file.write_text(
+                f"{watchlist_rules_header()}\n# signal_date=2026-05-27\nUS.TEST\n",
+                encoding="utf-8",
+            )
+            now_et = datetime(2026, 5, 28, 10, 0, tzinfo=ZoneInfo("America/New_York"))
+
+            with patch(
+                "alpaca_ma5_service.workflows.monitoring.intraday.build_monitor_settings",
+                return_value=settings,
+            ):
+                with patch(
+                    "alpaca_ma5_service.workflows.monitoring.intraday.now_market_time",
+                    return_value=now_et,
+                ):
+                    with patch("alpaca_ma5_service.workflows.monitoring.intraday.monitor_runtime") as runtime:
+                        with patch("alpaca_ma5_service.workflows.monitoring.intraday.run_forever") as run_loop:
+                            run_intraday_monitor()
+
+            runtime.assert_called_once_with(settings.output_dir, "monitor_ma5", "intraday")
+            run_loop.assert_called_once_with(settings)
 
     def test_auto_monitor_skips_market_holiday_when_resolving_signal_date(self):
         now_et = datetime(2026, 9, 8, 8, 0, tzinfo=ZoneInfo("America/New_York"))
@@ -3422,7 +3883,7 @@ class ServiceTests(unittest.TestCase):
     def test_auto_monitor_prepares_watchcode_for_current_session(self):
         timezone = ZoneInfo("America/New_York")
         cases = [
-            (datetime(2026, 5, 28, 8, 0, tzinfo=timezone), "premarket", "ensure_premarket_watchcode"),
+            (datetime(2026, 5, 28, 8, 0, tzinfo=timezone), "premarket", None),
             (datetime(2026, 5, 28, 10, 0, tzinfo=timezone), "intraday", "ensure_intraday_watchcode"),
             (datetime(2026, 5, 28, 17, 0, tzinfo=timezone), "afterhours", "ensure_afterhours_watchcode"),
         ]
@@ -3438,7 +3899,12 @@ class ServiceTests(unittest.TestCase):
                     "ensure_afterhours_watchcode": afterhours,
                 }
                 self.assertEqual(actual, expected_session)
-                functions[expected_function].assert_called_once_with(now_et)
+                if expected_function is None:
+                    premarket.assert_not_called()
+                    intraday.assert_not_called()
+                    afterhours.assert_not_called()
+                else:
+                    functions[expected_function].assert_called_once_with(now_et)
 
     def test_auto_monitor_routes_afterhours_session(self):
         """16:00-20:00 ET 的统一入口进入盘后 high/low 监控。"""
@@ -3527,6 +3993,24 @@ class ServiceTests(unittest.TestCase):
         self.assertIsNone(evaluate_premarket_ma5_recommendation(high))
         self.assertIsNone(evaluate_premarket_ma5_recommendation(not_dropped))
 
+    def test_premarket_recommendation_reports_actual_realtime_quote_time(self):
+        """Agent 展示的行情时间应来自实时源，而不是程序读取快照的本机时间。"""
+        quote_time = datetime(2026, 5, 28, 7, 59, 30, tzinfo=ZoneInfo("America/New_York"))
+        snapshot = replace(
+            make_snapshot(
+                symbol="US.TEST",
+                current=10.0,
+                closes=[9.0, 9.0, 9.0, 12.0],
+                source="moomoo_snapshot:pre_price",
+            ),
+            current_price_as_of=quote_time,
+        )
+
+        recommendation = evaluate_premarket_ma5_recommendation(snapshot)
+
+        self.assertIsNotNone(recommendation)
+        self.assertEqual(recommendation.as_of, quote_time)
+
     def test_premarket_cloud_recommendation_message_is_readable(self):
         """发给云端 Agent 的盘前提醒要分块展示核心结论和关键数值。"""
         recommendation = evaluate_premarket_ma5_recommendation(
@@ -3586,6 +4070,62 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(duplicate["sent"], 0)
             self.assertEqual(closer["sent"], 1)
             self.assertEqual(fake_send.call_count, 2)
+
+    def test_premarket_market_data_safety_error_never_sends_alert(self):
+        """拆股口径或实时价日期异常时，盘前链路只能报错，不能向 Agent 发推荐。"""
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            watch_path = premarket_watch_codes_path(settings)
+            watch_path.write_text("# signal_date=2026-07-24\nUS.RCON\n", encoding="utf-8")
+            market_data = SafetyBlockingMarketData("unit reverse split transition")
+            output = StringIO()
+
+            with patch("alpaca_ma5_service.premarket_monitor.safe_send_openclaw_messages") as fake_send:
+                with redirect_stdout(output):
+                    summary = run_premarket_recommendation_once(
+                        settings,
+                        market_data=market_data,
+                        now=datetime(2026, 7, 27, 8, 0, tzinfo=ZoneInfo("America/New_York")),
+                        alert_state_path=settings.output_dir / "unit_premarket_alert_state.json",
+                    )
+
+            self.assertEqual(summary["errors"], 1)
+            self.assertEqual(summary["alert"], 0)
+            self.assertEqual(summary["sent"], 0)
+            self.assertEqual(market_data.purposes, [SNAPSHOT_PURPOSE_PREMARKET_OBSERVATION])
+            self.assertIn("错误: MarketDataSafetyError: unit reverse split transition", output.getvalue())
+            self.assertNotIn("MarketDataSafetyError: MarketDataSafetyError", output.getvalue())
+            fake_send.assert_not_called()
+
+    def test_premarket_corporate_action_is_a_safety_hold_not_a_generic_error(self):
+        """拆股切换股票应清晰标成公司行动保护，不污染普通数据错误统计。"""
+        class CorporateActionMarketData:
+            def get_snapshot(self, symbol, *, purpose=SNAPSHOT_PURPOSE_AUTOMATIC):
+                self.purpose = purpose
+                raise CorporateActionBasisError(symbol, date(2026, 7, 24), 0.4709, 94.18, 200.0)
+
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            watch_path = premarket_watch_codes_path(settings)
+            watch_path.write_text("# signal_date=2026-07-24\nUS.RCON\n", encoding="utf-8")
+            market_data = CorporateActionMarketData()
+            output = StringIO()
+
+            with patch("alpaca_ma5_service.premarket_monitor.safe_send_openclaw_messages") as fake_send:
+                with redirect_stdout(output):
+                    summary = run_premarket_recommendation_once(
+                        settings,
+                        market_data=market_data,
+                        now=datetime(2026, 7, 27, 8, 0, tzinfo=ZoneInfo("America/New_York")),
+                        alert_state_path=settings.output_dir / "unit_premarket_alert_state.json",
+                    )
+
+            self.assertEqual(summary["errors"], 0)
+            self.assertEqual(summary["hold"], 1)
+            self.assertEqual(market_data.purpose, SNAPSHOT_PURPOSE_PREMARKET_OBSERVATION)
+            self.assertIn("公司行动保护", output.getvalue())
+            self.assertIn("RAW/SPLIT 200.0000 倍", output.getvalue())
+            fake_send.assert_not_called()
 
     def test_premarket_monitor_limits_below_ma5_alerts_to_two_per_symbol(self):
         """同一股票低于 MA5 时，当天最多发送两次提醒。"""
@@ -3724,11 +4264,25 @@ class ServiceTests(unittest.TestCase):
             watch_path = premarket_watch_codes_path(settings)
             watch_path.write_text("# signal_date=2026-05-27\nUS.TEST\n", encoding="utf-8")
             output = StringIO()
+            quote_time = datetime(2026, 5, 28, 7, 59, 30, tzinfo=ZoneInfo("America/New_York"))
+            market_data = FakeMarketData(
+                {
+                    "US.TEST": replace(
+                        make_snapshot(
+                            "US.TEST",
+                            current=10.5,
+                            closes=[10.0, 10.0, 10.0, 10.0],
+                            source="moomoo_snapshot:pre_price",
+                        ),
+                        current_price_as_of=quote_time,
+                    )
+                }
+            )
 
             with redirect_stdout(output):
                 summary = run_premarket_recommendation_once(
                     settings,
-                    market_data=FakeMarketData({"US.TEST": make_snapshot("US.TEST", current=10.5, closes=[10.0, 10.0, 10.0, 10.0])}),
+                    market_data=market_data,
                     now=datetime(2026, 5, 28, 8, 0, tzinfo=ZoneInfo("America/New_York")),
                     notify=False,
                     alert_state_path=settings.output_dir / "unit_premarket_alert_state.json",
@@ -3739,6 +4293,8 @@ class ServiceTests(unittest.TestCase):
             self.assertIn("10.5000", text)
             self.assertIn("10.1000", text)
             self.assertIn("3.96%", text)
+            self.assertIn("07:59:30", text)
+            self.assertEqual(market_data.purposes, [SNAPSHOT_PURPOSE_PREMARKET_OBSERVATION])
 
     def test_premarket_monitor_explains_alert_not_sent_outside_premarket(self):
         """不在盘前时段时，不用昨收价计算盘前跌幅，也不检测推荐。"""
@@ -3790,7 +4346,9 @@ class ServiceTests(unittest.TestCase):
             self.assertEqual(summary["sent"], 0)
             self.assertEqual(summary["hold"], 1)
             text = output.getvalue()
-            self.assertIn("未取得盘前实时价", text)
+            self.assertIn("无盘前行情", text)
+            self.assertIn("显示最近完成日收盘参考价", text)
+            self.assertIn("不计算盘前涨跌幅、不发送推荐", text)
             self.assertIn("alpaca:daily:sip", text)
             self.assertNotIn("已调用发送", text)
             fake_send.assert_not_called()

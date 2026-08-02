@@ -31,10 +31,10 @@ _LEADING_CONTEXT_PATTERN = re.compile(r"^\[[^\]]+\]\s*")
 TASK_LABELS = {
     "monitor_auto": "自动盯盘",
     "monitor_ma5": "盘中 MA5 盯盘",
-    "monitor_premarket": "盘前 MA5 盯盘",
+    "monitor_premarket": "盘前持仓波动监控",
     "monitor_afterhours": "盘后 High / Low 盯盘",
     "watchcode_ma5": "生成盘中 WatchCode",
-    "watchcode_premarket": "生成盘前 WatchCode",
+    "watchcode_premarket": "已停用的盘前 WatchCode 兼容入口",
 }
 
 PHASE_LABELS = {

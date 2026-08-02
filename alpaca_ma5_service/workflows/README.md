@@ -7,11 +7,11 @@ workflows/
 ├─ monitoring/
 │  ├─ auto.py        # 全天时段路由
 │  ├─ intraday.py    # 盘中配置和监控
-│  ├─ premarket.py   # 盘前推荐监控
+│  ├─ premarket.py   # 盘前仅持仓 60 秒 3% 波动监控
 │  └─ afterhours.py  # 盘后提醒监控
 ├─ watchcode/
 │  ├─ intraday.py    # 盘中 WatchCode
-│  ├─ premarket.py   # 盘前 WatchCode
+│  ├─ premarket.py   # 已停用的盘前 WatchCode 兼容入口
 │  ├─ afterhours.py  # 盘后 WatchCode
 │  └─ chart.py       # 观察池图表刷新
 └─ review/

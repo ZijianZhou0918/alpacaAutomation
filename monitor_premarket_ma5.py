@@ -1,4 +1,4 @@
-"""Public click-run entry for the premarket recommendation monitor."""
+"""Public click-run entry for the positions-only premarket movement monitor."""
 
 import sys
 

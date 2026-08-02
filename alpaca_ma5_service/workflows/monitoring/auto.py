@@ -24,15 +24,15 @@ from alpaca_ma5_service.config import build_settings
 from alpaca_ma5_service.daily_report import send_daily_monitor_report
 from alpaca_ma5_service.market_time import DAILY_BAR_READY, REALTIME_ORDER_CLOSE, REGULAR_CLOSE, REGULAR_OPEN
 from alpaca_ma5_service.monitor_runtime import monitor_runtime
-from alpaca_ma5_service.premarket_watchlist import premarket_watch_codes_path
 from alpaca_ma5_service.run_lock import acquire_run_lock
+from alpaca_ma5_service.strategy_framework import resolve_strategy_runtime
 from alpaca_ma5_service.trading_calendar import latest_trading_day_on_or_before
 from alpaca_ma5_service.watchlist import read_watch_codes
+from alpaca_ma5_service.watchlist_generator import WatchlistScreenRules, watchcode_matches_rules
 from .afterhours import monitor_afterhours
 from .intraday import build_monitor_settings, monitor_ma5_forever
 from .premarket import monitor_premarket_ma5
 from ..watchcode.intraday import generate_ma5_watchcode
-from ..watchcode.premarket import generate_premarket_watchcode
 
 
 class TeeStream:
@@ -90,8 +90,7 @@ def monitor_auto(*, now_provider=None, sleep=time.sleep) -> None:
                 now_time = now_et.time()
 
                 if now_time < REGULAR_OPEN:
-                    ensure_premarket_watchcode(now_et)
-                    print("当前处于盘前准备/盘前时段，进入盘前推荐监控。", flush=True)
+                    print("当前处于盘前准备/盘前时段，只监控 Alpaca 当前持仓的一分钟 3% 波动。", flush=True)
                     monitor_premarket_ma5(sleep=sleep, now_provider=now_provider)
                     continue
 
@@ -119,7 +118,7 @@ def ensure_current_session_watchcode(now_et: datetime) -> str:
     """Prepare the watchcode for the session that monitor_auto will enter."""
     now_time = now_et.time()
     if now_time < REGULAR_OPEN:
-        ensure_premarket_watchcode(now_et)
+        print("盘前持仓监控不需要 WatchCode，不生成盘前股票池。", flush=True)
         return "premarket"
     if now_time < REGULAR_CLOSE:
         ensure_intraday_watchcode(now_et)
@@ -134,21 +133,17 @@ def ensure_current_session_watchcode(now_et: datetime) -> str:
 def ensure_intraday_watchcode(now_et: datetime) -> None:
     settings = build_monitor_settings()
     watch_path = settings.watch_codes_file
-    if watchcode_ready_for_session(watch_path, now_et):
+    rules = resolve_strategy_runtime(settings).watchlist.screen_rules()
+    if intraday_watchcode_ready_for_session(watch_path, now_et, rules=rules):
         print(f"盘中 watchcode 已就绪：{watch_path}", flush=True)
         return
-    print(f"盘中 watchcode 缺失或过期，开始生成：{watch_path}", flush=True)
+    print(f"盘中 watchcode 缺失、过期或规则不匹配，开始生成：{watch_path}", flush=True)
     generate_ma5_watchcode()
 
 
 def ensure_premarket_watchcode(now_et: datetime) -> None:
-    settings = build_settings()
-    watch_path = premarket_watch_codes_path(settings)
-    if watchcode_ready_for_session(watch_path, now_et):
-        print(f"盘前 watchcode 已就绪：{watch_path}", flush=True)
-        return
-    print(f"盘前 watchcode 缺失或过期，开始生成：{watch_path}", flush=True)
-    generate_premarket_watchcode()
+    """兼容旧调用：盘前已改为持仓监控，不再生成或校验任何股票池。"""
+    print("盘前持仓监控不需要 WatchCode；已跳过盘前筛选。", flush=True)
 
 
 def ensure_afterhours_watchcode(now_et: datetime) -> None:
@@ -163,6 +158,16 @@ def ensure_afterhours_watchcode(now_et: datetime) -> None:
 
 def watchcode_ready_for_session(path: Path, now_et: datetime) -> bool:
     return watchcode_ready_for_signal_date(path, expected_signal_date(now_et))
+
+
+def intraday_watchcode_ready_for_session(
+    path: Path,
+    now_et: datetime,
+    *,
+    rules: WatchlistScreenRules | None = None,
+) -> bool:
+    """盘中池必须同时匹配本会话信号日和当前选股规则。"""
+    return watchcode_ready_for_session(path, now_et) and watchcode_matches_rules(path, rules)
 
 
 def watchcode_ready_for_signal_date(path: Path, expected_signal_date_value) -> bool:

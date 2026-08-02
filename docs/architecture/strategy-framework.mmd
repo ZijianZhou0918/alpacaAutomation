@@ -13,10 +13,15 @@ flowchart TD
     G --> U["BuyStrategy"]
     G --> S["SellStrategy"]
     G --> X["CancelStrategy"]
+    G --> L["ma5_dip_ladder 三档建仓 / 首次半仓止盈状态机"]
     RT --> CAND{"当前对象"}
     CAND -->|"WatchCode 内、无持仓"| U
-    CAND -->|"券商当前持仓"| S
+    CAND -->|"活动三档持仓"| L
+    CAND -->|"普通持仓 / 三档退出"| S
     U --> BR["Broker + 统一安全层"]
+    L --> BR
     S --> BR
-    BR --> X
-    X --> O["订单终态、账本、通知、复盘"]
+    BR --> P["自动订单 pending_orders.json<br/>后续轮次按 ID 对账 / 超时撤单"]
+    P --> O["累计成交幂等入账、通知、复盘"]
+    X --> M["手动 / 兼容同步订单"]
+    M --> O

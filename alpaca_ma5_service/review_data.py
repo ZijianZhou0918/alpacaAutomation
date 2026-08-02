@@ -40,11 +40,7 @@ PREMARKET_FIELDS = (
     "symbol",
     "status",
     "current_price",
-    "price_source",
-    "ma5",
-    "ma5_distance_pct",
-    "premarket_gain_pct",
-    "signal_gain_pct",
+    "unrealized_pct",
     "reason",
 )
 AFTERHOURS_FIELDS = (
@@ -64,7 +60,7 @@ _RUN_TIME_RE = re.compile(r"运行时间\s*[:：]\s*(\d{4}-\d{2}-\d{2} \d{2}:\d{
 _PERCENT_RE = re.compile(r"[-+]?\d+(?:\.\d+)?%")
 _TRIGGER_RE = re.compile(r"触发上沿\s*([0-9]+(?:\.[0-9]+)?)")
 _REQUIRED_DROP_RE = re.compile(r"(?:需跌幅\s*>=|跌幅未到|跌幅尚未达到)\s*([0-9]+(?:\.[0-9]+)?)%")
-_NOTIFY_SYMBOL_RE = re.compile(r"premarket MA5 recommendation\s+(US\.[A-Z0-9.]+)", re.IGNORECASE)
+_NOTIFY_SYMBOL_RE = re.compile(r"premarket position movement\s+(US\.[A-Z0-9.]+)", re.IGNORECASE)
 
 _LOG_CACHE_LOCK = threading.Lock()
 _LOG_CACHE: dict[tuple[str, int, int], "ParsedMonitorLog"] = {}
@@ -148,7 +144,6 @@ def build_daily_review(
     parsed = parse_monitor_log(log_path)
     signal_day = previous_trading_day(review_day)
     intraday_candidates_path = output_dir / f"watch_candidates_{signal_day:%Y-%m-%d}.csv"
-    premarket_candidates_path = output_dir / f"premarket_watch_candidates_{signal_day:%Y-%m-%d}.csv"
     afterhours_candidates_path = output_dir / f"afterhours_candidates_{review_day:%Y-%m-%d}.csv"
     exclusion_path = output_dir / f"buy_exclusions_{review_day:%Y-%m-%d}.csv"
     local_orders_path = output_dir / f"orders_{review_day:%Y-%m-%d}.csv"
@@ -156,7 +151,7 @@ def build_daily_review(
 
     load_signal_candidates = has_local_records and trading.is_trading_day
     intraday_candidates = _read_csv(intraday_candidates_path) if load_signal_candidates else []
-    premarket_candidates = _read_csv(premarket_candidates_path) if load_signal_candidates else []
+    premarket_candidates: list[dict[str, str]] = []
     afterhours_candidates = _read_csv(afterhours_candidates_path)
     exclusions = _read_csv(exclusion_path)
     local_orders, local_file_state = _load_local_orders(local_orders_path)
@@ -317,7 +312,6 @@ def build_daily_review(
     }
     if load_signal_candidates:
         source_paths["intraday_candidates"] = intraday_candidates_path
-        source_paths["premarket_candidates"] = premarket_candidates_path
     source_manifest = _source_manifest(
         source_paths,
         parsed,
@@ -485,7 +479,7 @@ def parse_monitor_log(path: Path) -> ParsedMonitorLog:
                     phase_times[current_phase].append(current_time)
         if "盘后提醒信号监控" in line or "盘后 high/low" in line:
             current_phase = "afterhours"
-        elif "盘前 MA5" in line and "表" not in line:
+        elif "盘前持仓" in line:
             current_phase = "premarket"
         elif "盘中 MA5" in line or "盘中时段" in line:
             current_phase = "intraday"
@@ -497,7 +491,7 @@ def parse_monitor_log(path: Path) -> ParsedMonitorLog:
                 phase_markers[current_phase].add(marker)
                 phase_times[current_phase].append(current_time)
 
-        if "Trade notify" in line and "premarket MA5 recommendation" in line and "sent" in line:
+        if "Trade notify" in line and "premarket position movement" in line and "sent" in line:
             notify_count += 1
             notify_match = _NOTIFY_SYMBOL_RE.search(line)
             if notify_match:
@@ -714,7 +708,7 @@ def _detect_table_header(line: str) -> tuple[str, tuple[str, ...]] | None:
     joined = "|".join(cells)
     if all(token in joined for token in ("代码", "动作", "当前价", "买/卖点", "原因")):
         return "intraday", INTRADAY_FIELDS
-    if all(token in joined for token in ("代码", "状态", "价格来源", "MA5距离", "盘前涨跌幅")):
+    if all(token in joined for token in ("代码", "状态", "当前价", "相对均价", "说明")):
         return "premarket", PREMARKET_FIELDS
     if all(token in joined for token in ("股票", "当前价", "提醒线", "参考价", "状态")):
         return "afterhours", AFTERHOURS_FIELDS

@@ -136,6 +136,15 @@ def evaluate_buy(snapshot: MarketSnapshot) -> Signal:
     }
     market_note = _market_open_note(snapshot)
 
+    if snapshot.today_open <= 0:
+        return Signal(
+            snapshot.symbol,
+            "HOLD",
+            "未取得今日常规盘开盘价，所有开盘保护条件均无法验证；失败关闭，不提交买单",
+            snapshot.current_price,
+            diagnostics=diagnostics,
+        )
+
     if snapshot.today_open > 0 and today_open_gain_pct <= MIN_TODAY_OPEN_GAIN_PCT:
         return Signal(
             snapshot.symbol,

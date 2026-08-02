@@ -7,6 +7,7 @@ from .broker import AlpacaStockBroker
 from .config import Settings, build_settings
 from .market_data import build_market_data
 from .models import OrderResult
+from .trade_notifications import format_broker_name, order_kind_text, render_trade_order_messages
 from .watchlist import normalize_symbol
 
 
@@ -278,25 +279,25 @@ def trade_command_response_to_dict(response: TradeCommandResponse) -> dict:
 
 
 def render_trade_command_response(response: TradeCommandResponse) -> str:
-    """生成控制台/聊天里好读的中文摘要。"""
+    """用与订单通知一致的固定字段格式生成 Agent 交易指令回复。"""
+    command_kind = order_kind_text(response.command.action)
+    overview = "✅ 请求已处理" if response.ok else "❌ 请求失败或需要处理"
     lines = [
-        "OpenClaw 交易指令结果",
-        f"通道：{response.broker_name}",
-        f"指令：{response.command.raw_message}",
-        f"解析：{_describe_command(response.command)}",
+        f"【Agent 交易指令｜{command_kind}】",
+        f"总览：{overview}",
+        f"账户：{format_broker_name(response.broker_name)}",
+        f"原始指令：{response.command.raw_message}",
+        f"解析结果：{_describe_command(response.command)}",
+        f"汇总：{response.message}",
     ]
-    for result in response.results:
-        lines.append(
-            "结果："
-            f"{result.symbol or '订单'} | {result.side} | 状态 {result.status} | "
-            f"数量 {result.quantity:.6f} | 价格 {_format_price(result.price)} | {result.message}"
-        )
-        if result.order_id:
-            lines.append(f"订单号：{result.order_id}")
-        if result.message:
-            label = "失败原因" if result.status.upper() in {"REJECTED", "CANCEL_FAILED"} else "执行原因"
-            lines.append(f"{label}：{result.message}")
-    lines.append(f"总结：{response.message}")
+    result_count = len(response.results)
+    for index, result in enumerate(response.results, start=1):
+        detail = render_trade_order_messages(
+            result,
+            f"Agent 手动指令：{response.command.raw_message}",
+            broker_name=response.broker_name,
+        )[0]
+        lines.extend(["", f"订单结果 {index}/{result_count}", detail])
     return "\n".join(lines)
 
 
@@ -383,10 +384,6 @@ def _response_message(results: list[OrderResult]) -> str:
         result = results[0]
         return f"{result.side} {result.symbol or result.order_id} 状态 {result.status}"
     return f"已处理 {len(results)} 笔订单：" + ", ".join(f"{result.symbol}:{result.status}" for result in results)
-
-
-def _format_price(value: float) -> str:
-    return f"{value:.4f}" if value > 0 else "未知"
 
 
 def _parse_limit_price_multiplier(text: str) -> float:

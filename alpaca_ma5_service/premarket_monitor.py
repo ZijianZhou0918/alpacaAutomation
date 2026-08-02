@@ -11,7 +11,11 @@ from zoneinfo import ZoneInfo
 
 from .config import Settings, build_settings
 from .errors import short_error
-from .market_data import build_market_data as build_default_market_data
+from .market_data import (
+    CorporateActionBasisError,
+    SNAPSHOT_PURPOSE_PREMARKET_OBSERVATION,
+    build_market_data as build_default_market_data,
+)
 from .market_time import is_premarket_monitor_finished, is_premarket_time, seconds_until_premarket_monitor_end
 from .models import MarketSnapshot
 from .openclaw_notify import safe_send_openclaw_messages
@@ -59,6 +63,15 @@ class PremarketObservation:
     signal_gain_pct: float
     price_source: str
     reason: str
+    as_of: datetime | None = None
+    status: str = "观察"
+
+
+@dataclass(frozen=True)
+class PremarketSafetyHold:
+    symbol: str
+    status: str
+    reason: str
 
 
 def run_premarket_recommendation_once(
@@ -89,7 +102,7 @@ def run_premarket_recommendation_once(
     state_path = alert_state_path or settings.output_dir / PREMARKET_ALERT_STATE_NAME
     alert_state = load_alert_state(state_path, now_et)
     created_market_data = market_data is None
-    rows: list[PremarketRecommendation | PremarketObservation | tuple[str, str]] = []
+    rows: list[PremarketRecommendation | PremarketObservation | PremarketSafetyHold | tuple[str, str]] = []
     in_premarket = is_premarket_time(now_et)
     can_notify = notify and in_premarket
 
@@ -110,7 +123,10 @@ def run_premarket_recommendation_once(
     try:
         for symbol in watch_codes:
             try:
-                snapshot: MarketSnapshot = market_data.get_snapshot(symbol)
+                snapshot: MarketSnapshot = market_data.get_snapshot(
+                    symbol,
+                    purpose=SNAPSHOT_PURPOSE_PREMARKET_OBSERVATION,
+                )
                 distance = ma5_distance_pct(snapshot)
                 if not has_realtime_price(snapshot):
                     summary["hold"] += 1
@@ -119,11 +135,13 @@ def run_premarket_recommendation_once(
                             symbol=snapshot.symbol,
                             current_price=snapshot.current_price,
                             today_ma5=snapshot.today_ma5,
-                            ma5_distance_pct=distance,
+                            ma5_distance_pct=None,
                             current_gain_pct=None,
                             signal_gain_pct=snapshot.signal_day_gain_pct,
                             price_source=snapshot.current_price_source,
-                            reason=f"未取得盘前实时价；当前价来源 {snapshot.current_price_source or 'unknown'}，不计算盘前跌幅",
+                            reason="当日04:00后没有盘前成交或报价；显示最近完成日收盘参考价，不计算盘前涨跌幅、不发送推荐",
+                            as_of=snapshot.current_price_as_of,
+                            status="无盘前行情",
                         )
                     )
                     continue
@@ -146,6 +164,7 @@ def run_premarket_recommendation_once(
                             signal_gain_pct=snapshot.signal_day_gain_pct,
                             price_source=snapshot.current_price_source,
                             reason=format_hold_reason(snapshot, distance, alert_distance_pct, min_drop_pct),
+                            as_of=snapshot.current_price_as_of,
                         )
                     )
                     update_alert_ma5_position(alert_state, snapshot.symbol, distance)
@@ -171,9 +190,18 @@ def run_premarket_recommendation_once(
                     note = f"已调用发送；{recommendation_alert_note(recommendation)}"
                 update_alert_ma5_position(alert_state, snapshot.symbol, distance)
                 rows.append(replace(recommendation, notification_note=note))
+            except CorporateActionBasisError as exc:
+                summary["hold"] += 1
+                rows.append(
+                    PremarketSafetyHold(
+                        symbol=symbol,
+                        status="公司行动保护",
+                        reason=f"RAW/SPLIT {exc.factor:.4f} 倍，已安全跳过；不提醒、不下单",
+                    )
+                )
             except Exception as exc:
                 summary["errors"] += 1
-                rows.append((symbol, f"错误: {type(exc).__name__}: {short_error(exc)}"))
+                rows.append((symbol, f"错误: {short_error(exc)}"))
     finally:
         if created_market_data and hasattr(market_data, "close"):
             market_data.close()
@@ -306,7 +334,7 @@ def evaluate_premarket_ma5_recommendation(
         signal_gain_pct=snapshot.signal_day_gain_pct,
         price_source=snapshot.current_price_source,
         alert_bucket_pct=bucket,
-        as_of=snapshot.as_of,
+        as_of=snapshot.current_price_as_of or snapshot.as_of,
         alert_type=alert_type,
     )
 
@@ -531,11 +559,11 @@ def print_premarket_header(now_et: datetime, watch_path: Path, signal_day, count
     )
 
 
-def print_premarket_rows(rows: list[PremarketRecommendation | PremarketObservation | tuple[str, str]]) -> None:
+def print_premarket_rows(rows: list[PremarketRecommendation | PremarketObservation | PremarketSafetyHold | tuple[str, str]]) -> None:
     if not rows:
         return
     print("盘前推荐明细：", flush=True)
-    headers = ["代码", "状态", "当前价", "价格来源", "MA5", "MA5距离", "盘前涨跌幅", "信号日涨幅", "说明"]
+    headers = ["代码", "状态", "当前价", "价格来源", "行情时间", "MA5", "MA5距离", "盘前涨跌幅", "信号日涨幅", "说明"]
     table: list[list[str]] = []
     for row in rows:
         if isinstance(row, PremarketRecommendation):
@@ -545,6 +573,7 @@ def print_premarket_rows(rows: list[PremarketRecommendation | PremarketObservati
                     recommendation_status(row),
                     f"{row.current_price:.4f}",
                     short_price_source(row.price_source),
+                    quote_time_text(row.as_of),
                     f"{row.today_ma5:.4f}",
                     f"{row.ma5_distance_pct:.2%}",
                     f"{row.current_gain_pct:.2%}",
@@ -556,9 +585,10 @@ def print_premarket_rows(rows: list[PremarketRecommendation | PremarketObservati
             table.append(
                 [
                     row.symbol,
-                    "观察",
+                    row.status,
                     f"{row.current_price:.4f}" if row.current_price > 0 else "-",
                     short_price_source(row.price_source),
+                    quote_time_text(row.as_of),
                     f"{row.today_ma5:.4f}" if row.today_ma5 > 0 else "-",
                     f"{row.ma5_distance_pct:.2%}" if row.ma5_distance_pct is not None else "-",
                     f"{row.current_gain_pct:.2%}" if row.current_gain_pct is not None else "-",
@@ -566,9 +596,11 @@ def print_premarket_rows(rows: list[PremarketRecommendation | PremarketObservati
                     row.reason,
                 ]
             )
+        elif isinstance(row, PremarketSafetyHold):
+            table.append([row.symbol, row.status, "-", "-", "-", "-", "-", "-", "-", row.reason])
         else:
             symbol, reason = row
-            table.append([symbol, "观察", "-", "-", "-", "-", "-", "-", reason])
+            table.append([symbol, "观察", "-", "-", "-", "-", "-", "-", "-", reason])
 
     widths = [len(header) for header in headers]
     for row in table:
@@ -592,6 +624,11 @@ def short_price_source(source: str) -> str:
         .replace("alpaca_latest_trade:", "alpaca:trade:")
         .replace("alpaca_daily_close:", "alpaca:daily:")
     )
+
+
+def quote_time_text(as_of: datetime | None) -> str:
+    """盘前表格展示真实行情时间；日期已经由行情安全层校验。"""
+    return as_of.strftime("%H:%M:%S") if as_of is not None else "-"
 
 
 def pad_display_width(value: str, width: int) -> str:

@@ -4,7 +4,7 @@
 - ``place_*`` 是业务层调用入口；
 - ``_submit_order`` / ``_submit_fixed_limit_order`` 构造并真实提交订单；
 - ``cancel_order`` 把手动撤单交给可配置撤单策略；
-- 每笔提交后都会等待终态，超时撤单的实际 SDK 调用位于 ``order_guard.py``。
+- 自动监控使用持久化非阻塞订单监督；手动入口仍可同步等待终态。
 """
 
 from __future__ import annotations
@@ -12,17 +12,23 @@ from __future__ import annotations
 import math
 import uuid
 from datetime import datetime
+from decimal import Decimal, ROUND_HALF_UP
 
 from .alpaca_connection import build_trading_connection
 from .config import Settings
 from .errors import short_error
 from .market_time import is_buy_order_time, is_premarket_time, is_realtime_order_time, is_regular_market_time, now_market_time
-from .models import OrderResult, Position
+from .models import OrderResult, Position, has_unconfirmed_order_status
 from .order_guard import FINAL_STATUSES, filled_quantity, normalize_order_status
+from .pending_orders import PendingOrderEvent, PendingOrderStore
 from .state import append_order, load_positions, save_positions
 from .strategy_framework import resolve_strategy_runtime
 from .trade_notifications import notify_order_submitted, record_order_and_notify
 from .watchlist import normalize_symbol, to_alpaca_symbol
+
+
+BROKER_PROTECTIVE_STOP_ACTION = "broker_protective_stop"
+BROKER_PROTECTIVE_STOP_CLIENT_PREFIX = "ma5-stop-"
 
 
 class DryRunStockBroker:
@@ -139,10 +145,14 @@ class AlpacaStockBroker:
     paper/live 由当前 key 自动识别；调用 ``place_*`` 可能产生真实外部写操作。
     """
 
+    manages_pending_orders = True
+
     def __init__(self, settings: Settings):
         """建立交易连接并保存当前账户模式。"""
         self.settings = settings
         self.cancel_strategy = resolve_strategy_runtime(settings).cancel
+        # 必须先校验本地未决订单状态，再连接券商；损坏状态不能在外部 I/O 后才暴露。
+        self.pending_order_store = PendingOrderStore(settings.output_dir)
         connection = build_trading_connection()
         self.client = connection.client
         self.account = connection.account
@@ -153,6 +163,14 @@ class AlpacaStockBroker:
         # submit_order 网络异常时，券商可能已经收单。无法用 client_order_id
         # 查清结果就锁存该风险，禁止后续自动买入扩大未知暴露。
         self.order_safety_error = ""
+        self.protective_stop_error = ""
+        # 每轮刚确认过终态成交的股票继续按开放订单保护一轮，避免持仓接口短暂
+        # 滞后时立刻补买或重复卖出。下一轮 reconcile 会重新清空并按最新状态建立。
+        self.recently_reconciled_buy_symbols: set[str] = set()
+        self.recently_reconciled_sell_symbols: set[str] = set()
+        # 主动退出前已确认撤销保护单的股票，本轮不重新补挂；下一轮由真实持仓和
+        # 普通卖单状态重新决定，避免“刚撤保护单、同轮又补挂”的竞态。
+        self.recently_released_protective_symbols: set[str] = set()
 
     def get_positions(self) -> dict[str, Position]:
         """读取 Alpaca 真实持仓，并转换成策略统一使用的 Position。"""
@@ -168,7 +186,12 @@ class AlpacaStockBroker:
 
     def get_open_buy_order_symbols(self) -> set[str]:
         """读取 Alpaca 当前开放买单，用于自动监控防重复下单。"""
-        symbols: set[str] = set()
+        symbols = {
+            order.symbol
+            for order in self._pending_orders().orders.values()
+            if order.side == "BUY"
+        }
+        symbols.update(getattr(self, "recently_reconciled_buy_symbols", set()))
         for raw in self._get_open_orders(""):
             if _raw_order_side(raw) != "BUY":
                 continue
@@ -179,7 +202,12 @@ class AlpacaStockBroker:
 
     def get_open_sell_order_symbols(self) -> set[str]:
         """读取 Alpaca 当前开放卖单，避免下一轮对同一持仓重复卖出。"""
-        symbols: set[str] = set()
+        symbols = {
+            order.symbol
+            for order in self._pending_orders().orders.values()
+            if order.side == "SELL"
+        }
+        symbols.update(getattr(self, "recently_reconciled_sell_symbols", set()))
         for raw in self._get_open_orders(""):
             if _raw_order_side(raw) != "SELL":
                 continue
@@ -187,6 +215,211 @@ class AlpacaStockBroker:
             if symbol:
                 symbols.add(symbol)
         return symbols
+
+    def get_open_strategy_exit_order_symbols(self) -> set[str]:
+        """返回会阻止新退出单的卖单，正常等待中的保护 STOP 不算主动退出。
+
+        保护单已经部分成交或处于撤单待确认时仍必须阻断新卖单，否则可能卖空。
+        非本程序创建的卖单也始终视为冲突，不能擅自忽略用户手工订单。
+        """
+
+        symbols = set(getattr(self, "recently_reconciled_sell_symbols", set()))
+        protective_ids: set[str] = set()
+        for order in self._pending_orders().orders.values():
+            if order.side != "SELL":
+                continue
+            if order.strategy_action != BROKER_PROTECTIVE_STOP_ACTION:
+                symbols.add(order.symbol)
+                continue
+            protective_ids.add(order.active_order_id)
+            status = str(order.last_status or "").upper()
+            if order.cancel_requested_at or "PARTIALLY_FILLED" in status:
+                symbols.add(order.symbol)
+
+        for raw in self._get_open_orders(""):
+            if _raw_order_side(raw) != "SELL":
+                continue
+            symbol = _raw_order_symbol(raw)
+            if not symbol:
+                continue
+            raw_id = str(getattr(raw, "id", "") or "")
+            if raw_id in protective_ids or _is_managed_protective_raw_order(raw):
+                status = normalize_order_status(raw)
+                if filled_quantity(raw) > 0 or status == "PENDING_CANCEL":
+                    symbols.add(symbol)
+                continue
+            symbols.add(symbol)
+        return symbols
+
+    def ensure_protective_stops(
+        self,
+        positions: dict[str, Position],
+        eligible_symbols: set[str],
+        stop_pct: float,
+        now_et: datetime,
+    ) -> None:
+        """为策略持仓创建或校准唯一的 Alpaca GTC STOP MARKET 保护单。"""
+
+        if not -1.0 < float(stop_pct) < 0.0:
+            raise ValueError("broker protective stop pct must be between -1 and 0")
+        eligible = {normalize_symbol(value) for value in eligible_symbols if normalize_symbol(value)}
+        released = getattr(self, "recently_released_protective_symbols", set())
+        open_orders = list(self._get_open_orders(""))
+        for raw in open_orders:
+            if _is_managed_protective_raw_order(raw):
+                self._adopt_protective_order(raw, now_et)
+
+        # 计划已关闭、持仓已消失或保护功能未启用时，券商端遗留的本程序 STOP
+        # 必须撤掉；否则未来同代码重新持仓时可能被旧单意外卖出。
+        for order in list(self._pending_orders().orders.values()):
+            if order.strategy_action != BROKER_PROTECTIVE_STOP_ACTION or order.symbol in eligible:
+                continue
+            released_ok, release_reason = self.release_protective_stop(order.symbol, now_et)
+            if not released_ok and "撤销处理中" not in release_reason:
+                self._latch_protective_stop_error(order.symbol, release_reason)
+
+        for symbol in sorted(eligible):
+            position = positions.get(symbol)
+            if position is None or float(position.quantity) <= 0 or float(position.avg_price) <= 0:
+                continue
+            if symbol in released:
+                continue
+            managed = self._protective_pending_orders(symbol)
+            if len(managed) > 1:
+                self._latch_protective_stop_error(symbol, "检测到多张托管保护单，已停止自动调整")
+                continue
+
+            conflicting = [
+                raw
+                for raw in open_orders
+                if _raw_order_symbol(raw) == symbol
+                and _raw_order_side(raw) == "SELL"
+                and not _is_managed_protective_raw_order(raw)
+            ]
+            has_pending_exit = any(
+                order.symbol == symbol
+                and order.side == "SELL"
+                and order.strategy_action != BROKER_PROTECTIVE_STOP_ACTION
+                for order in self._pending_orders().orders.values()
+            )
+            if conflicting or has_pending_exit:
+                # 普通卖单可能正在止盈/清仓；此时补一张全仓 STOP 会使总卖量超过持仓。
+                if managed:
+                    self.release_protective_stop(symbol, now_et)
+                continue
+
+            quantity = self._sell_qty(symbol, float(position.quantity))
+            stop_price = normalize_limit_price(float(position.avg_price) * (1.0 + float(stop_pct)))
+            if quantity <= 0 or stop_price <= 0:
+                self._latch_protective_stop_error(symbol, "无法按当前持仓生成有效保护单数量或价格")
+                continue
+            if not managed:
+                self._submit_protective_stop(symbol, quantity, stop_price, now_et)
+                continue
+
+            order = managed[0]
+            try:
+                raw = self.client.get_order_by_id(order.active_order_id)
+            except Exception as exc:
+                self._latch_protective_stop_error(
+                    symbol,
+                    f"无法确认保护单 {order.active_order_id}：{short_error(exc)}",
+                )
+                continue
+            status = normalize_order_status(raw)
+            if status in FINAL_STATUSES or order.cancel_requested_at or filled_quantity(raw) > 0:
+                # 终态/部分成交必须先经过统一对账，不在这里猜测剩余持仓或替换数量。
+                continue
+            current_quantity = _raw_order_quantity(raw) or order.requested_quantity
+            current_stop = _raw_order_stop_price(raw) or order.requested_price
+            if _same_order_quantity(current_quantity, quantity) and math.isclose(
+                current_stop,
+                stop_price,
+                rel_tol=0.0,
+                abs_tol=0.00005,
+            ):
+                continue
+            self._replace_protective_stop(order, quantity, stop_price, now_et)
+
+    def release_protective_stop(self, symbol: str, now_et: datetime) -> tuple[bool, str]:
+        """主动卖出前撤掉保护 STOP；只有确认零成交终态后才允许新卖单。"""
+
+        normalized = normalize_symbol(symbol)
+        managed = self._protective_pending_orders(normalized)
+        if len(managed) > 1:
+            return False, "检测到多张保护单，拒绝再提交主动卖单"
+        if not managed:
+            # 兼容重启后本地状态缺失但券商订单仍存在的情况，先收编再撤。
+            try:
+                raw_orders = [
+                    raw
+                    for raw in self._get_open_orders(normalized)
+                    if _is_managed_protective_raw_order(raw)
+                ]
+            except Exception as exc:
+                return False, f"无法确认券商保护单：{short_error(exc)}"
+            for raw in raw_orders:
+                self._adopt_protective_order(raw, now_et)
+            managed = self._protective_pending_orders(normalized)
+        if not managed:
+            return True, "没有开放保护单"
+        if len(managed) > 1:
+            return False, "检测到多张保护单，拒绝再提交主动卖单"
+
+        order = managed[0]
+        try:
+            raw = self.client.get_order_by_id(order.active_order_id)
+            status = normalize_order_status(raw)
+            if status not in FINAL_STATUSES:
+                self.client.cancel_order_by_id(order.active_order_id)
+                order.cancel_requested_at = now_et.isoformat()
+                order.updated_at = now_et.isoformat()
+                self._pending_orders().save(now_et)
+                raw = self.client.get_order_by_id(order.active_order_id)
+                status = normalize_order_status(raw)
+        except Exception as exc:
+            self._latch_protective_stop_error(
+                normalized,
+                f"保护单撤销结果无法确认：{short_error(exc)}",
+            )
+            return False, "保护单撤销结果无法确认，本轮禁止重复卖出"
+
+        filled = filled_quantity(raw)
+        if status in FINAL_STATUSES and filled <= 0:
+            self._pending_orders().remove(order.tracking_order_id, now_et)
+            released = getattr(self, "recently_released_protective_symbols", None)
+            if released is None:
+                released = set()
+                self.recently_released_protective_symbols = released
+            released.add(normalized)
+            return True, "保护单已确认撤销"
+        if filled > 0:
+            return False, f"保护单已成交 {filled:g} 股，等待持仓对账后再决定"
+        return False, "保护单撤销处理中，等待券商确认后再主动卖出"
+
+    def cancel_managed_buy_orders_for_symbol(self, symbol: str, now_et: datetime) -> None:
+        """保护 STOP 成交后立即请求撤销同股尚未终态的自动买单。"""
+
+        normalized = normalize_symbol(symbol)
+        changed = False
+        for order in self._pending_orders().orders.values():
+            if order.symbol != normalized or order.side != "BUY" or order.cancel_requested_at:
+                continue
+            try:
+                raw = self.client.get_order_by_id(order.active_order_id)
+                if normalize_order_status(raw) in FINAL_STATUSES:
+                    continue
+                self.client.cancel_order_by_id(order.active_order_id)
+                order.cancel_requested_at = now_et.isoformat()
+                order.updated_at = now_et.isoformat()
+                changed = True
+            except Exception as exc:
+                self._latch_protective_stop_error(
+                    normalized,
+                    f"保护单成交后无法撤销买单 {order.active_order_id}：{short_error(exc)}",
+                )
+        if changed:
+            self._pending_orders().save(now_et)
 
     def place_market_buy(
         self,
@@ -220,7 +453,8 @@ class AlpacaStockBroker:
     ) -> OrderResult:
         """提交指定价格的真实 BUY LIMIT；金额先按限价换算为整数股。
 
-        自动监控的买入最终会到这里，再进入 ``_submit_fixed_limit_order``。
+        手动/兼容调用会同步等待终态；自动监控改用
+        ``place_limit_buy_nonblocking``，避免阻塞逐股循环。
         """
         # 【限价买入 1/2：金额转整数股】
         # 自动监控按美元预算下单；这里用限价计算可买整数股，避免提交分数股。
@@ -230,7 +464,7 @@ class AlpacaStockBroker:
             result = OrderResult("", symbol, "BUY", 0, limit_price, "REJECTED", "买入金额不足")
             return self._record_result(result, reason)
 
-        # 【限价买入 2/2：进入统一真实提交与终态保护】
+        # 【限价买入 2/2：进入同步真实提交与终态保护】
         # _submit_fixed_limit_order 负责时间窗复核、构造 Alpaca 请求、submit_order，
         # 以及成交等待/超时撤单；本方法只在其返回后统一记录最终结果。
         result = self._submit_fixed_limit_order(
@@ -241,6 +475,106 @@ class AlpacaStockBroker:
             reason,
             skip_time_validation=skip_time_validation,
         )
+        return self._record_result(result, reason)
+
+    def place_limit_buy_nonblocking(
+        self,
+        symbol: str,
+        notional_usd: float,
+        limit_price: float,
+        reason: str,
+        *,
+        strategy_action: str = "",
+    ) -> OrderResult:
+        """Submit an automatic BUY LIMIT and persist it without waiting in the symbol loop."""
+
+        quantity = self._buy_qty(symbol, notional_usd, limit_price)
+        if quantity <= 0:
+            return self._record_result(
+                OrderResult("", symbol, "BUY", 0, limit_price, "REJECTED", "买入金额不足"),
+                reason,
+            )
+        result = self._submit_fixed_limit_order(
+            symbol,
+            "BUY",
+            quantity,
+            limit_price,
+            reason,
+            wait_for_terminal=False,
+        )
+        self._register_pending_result(
+            result,
+            reason=reason,
+            strategy_action=strategy_action,
+            strategy_notional=notional_usd,
+        )
+        notify_order_submitted(self.settings, result, reason, broker_name=self.source_name())
+        return self._record_result(result, reason)
+
+    def place_market_sell_nonblocking(
+        self,
+        symbol: str,
+        quantity: float,
+        current_price: float,
+        reason: str,
+        *,
+        strategy_action: str = "",
+    ) -> OrderResult:
+        """Submit an automatic market-style SELL and let later rounds supervise it."""
+
+        if quantity <= 0:
+            return self._record_result(
+                OrderResult("", symbol, "SELL", 0, current_price, "REJECTED", "没有可卖持仓"),
+                reason,
+            )
+        result = self._submit_order(
+            symbol,
+            "SELL",
+            quantity,
+            current_price,
+            reason,
+            wait_for_terminal=False,
+        )
+        self._register_pending_result(
+            result,
+            reason=reason,
+            strategy_action=strategy_action,
+            strategy_notional=0.0,
+        )
+        notify_order_submitted(self.settings, result, reason, broker_name=self.source_name())
+        return self._record_result(result, reason)
+
+    def place_limit_sell_nonblocking(
+        self,
+        symbol: str,
+        quantity: float,
+        limit_price: float,
+        reason: str,
+        *,
+        strategy_action: str = "",
+    ) -> OrderResult:
+        """Submit an automatic SELL LIMIT and let later rounds supervise it."""
+
+        if quantity <= 0:
+            return self._record_result(
+                OrderResult("", symbol, "SELL", 0, limit_price, "REJECTED", "没有可卖持仓"),
+                reason,
+            )
+        result = self._submit_fixed_limit_order(
+            symbol,
+            "SELL",
+            quantity,
+            limit_price,
+            reason,
+            wait_for_terminal=False,
+        )
+        self._register_pending_result(
+            result,
+            reason=reason,
+            strategy_action=strategy_action,
+            strategy_notional=0.0,
+        )
+        notify_order_submitted(self.settings, result, reason, broker_name=self.source_name())
         return self._record_result(result, reason)
 
     def place_market_sell(
@@ -403,11 +737,13 @@ class AlpacaStockBroker:
         reason: str = "",
         *,
         skip_time_validation: bool = False,
+        wait_for_terminal: bool = True,
     ) -> OrderResult:
         """根据交易时段构造 MARKET 或 extended-hours LIMIT 并提交。
 
-        这是市价式买卖路径的真实券商写入函数；提交成功后立即进入撤单策略，
-        轮询订单状态，并在配置超时时间到达后请求撤销未成交部分。
+        这是市价式买卖路径的真实券商写入函数。同步调用提交成功后进入撤单
+        策略；自动监控传入 ``wait_for_terminal=False``，由持久化监督器在后续
+        轮次查询状态并在超时后撤销未成交部分。
         """
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
@@ -452,7 +788,8 @@ class AlpacaStockBroker:
             # 【真实券商写入：买入/卖出】
             # 这是 MARKET 或扩展时段保护 LIMIT 最终进入 Alpaca Trading API 的位置。
             # request 已包含股票、方向、数量、订单类型和有效期；此调用成功只代表
-            # 券商接收订单，不代表成交，所以下面必须继续等待并确认最终状态。
+            # 券商接收订单，不代表成交；自动监控会先持久化订单身份，再由后续
+            # 轮次确认最终状态，手动兼容调用则在本函数继续同步等待。
             raw = self.client.submit_order(order_data=request)
         except Exception as exc:
             raw = self._recover_submitted_order(request.client_order_id, exc)
@@ -469,7 +806,11 @@ class AlpacaStockBroker:
             normalize_order_status(raw) or "SUBMITTED",
             f"Alpaca {self.source_name()} order submitted",
         )
-        notify_order_submitted(self.settings, submitted, reason, broker_name=self.source_name())
+        if wait_for_terminal:
+            notify_order_submitted(self.settings, submitted, reason, broker_name=self.source_name())
+
+        if not wait_for_terminal:
+            return _nonblocking_submit_result(raw, submitted, self.source_name())
 
         # 【订单终态/自动撤单】
         # submit_order 返回后立即交给本轮固定的 CancelStrategy：轮询至最终状态；
@@ -509,10 +850,12 @@ class AlpacaStockBroker:
         reason: str = "",
         *,
         skip_time_validation: bool = False,
+        wait_for_terminal: bool = True,
     ) -> OrderResult:
         """构造并提交固定价格的 BUY/SELL LIMIT。
 
         自动监控买入、自动止损卖出以及 OpenClaw 固定限价单都会进入这里。
+        自动监控使用非阻塞模式，OpenClaw/兼容调用默认同步等待终态。
         ``skip_time_validation=True`` 只供明确的手动指令使用，不代表不经过券商校验。
         """
         from alpaca.trading.enums import OrderSide, TimeInForce
@@ -534,12 +877,13 @@ class AlpacaStockBroker:
         if not skip_time_validation and not is_regular_market_time(now_et) and not self.settings.extended_hours_orders_enabled:
             return OrderResult("", symbol, side, quantity, limit_price, "REJECTED", "当前不在常规盘，且未开启盘前/盘后下单")
 
+        broker_limit_price = normalize_limit_price(limit_price)
         request = LimitOrderRequest(
             symbol=alpaca_symbol,
             qty=quantity,
             side=order_side,
             time_in_force=TimeInForce.DAY,
-            limit_price=round(limit_price, 2),
+            limit_price=broker_limit_price,
             extended_hours=not is_regular_market_time(now_et),
             client_order_id=self._new_client_order_id(side),
         )
@@ -559,11 +903,14 @@ class AlpacaStockBroker:
             symbol,
             side,
             quantity,
-            limit_price,
+            broker_limit_price,
             normalize_order_status(raw) or "SUBMITTED",
             f"Alpaca {self.source_name()} fixed limit order submitted",
         )
-        notify_order_submitted(self.settings, submitted, reason, broker_name=self.source_name())
+        if wait_for_terminal:
+            notify_order_submitted(self.settings, submitted, reason, broker_name=self.source_name())
+        if not wait_for_terminal:
+            return _nonblocking_submit_result(raw, submitted, self.source_name())
         # 【订单终态/自动撤单】
         # 固定限价单与 MARKET 路径使用同一终态保护，避免限价单超时后继续裸露；
         # Broker 只有拿到策略确认后的 OrderResult 才返回 service/手动调用方。
@@ -574,7 +921,7 @@ class AlpacaStockBroker:
                 symbol,
                 side,
                 quantity,
-                limit_price,
+                broker_limit_price,
                 self.source_name(),
                 timeout_seconds=self.settings.order_cancel_after_seconds,
                 poll_seconds=self.settings.order_status_poll_seconds,
@@ -599,6 +946,356 @@ class AlpacaStockBroker:
             cancel_strategy = resolve_strategy_runtime(self.settings).cancel
             self.cancel_strategy = cancel_strategy
         return cancel_strategy
+
+    def _pending_orders(self) -> PendingOrderStore:
+        store = getattr(self, "pending_order_store", None)
+        if store is None:
+            store = PendingOrderStore(self.settings.output_dir)
+            self.pending_order_store = store
+        return store
+
+    def _register_pending_result(
+        self,
+        result: OrderResult,
+        *,
+        reason: str,
+        strategy_action: str,
+        strategy_notional: float,
+    ) -> None:
+        if not has_unconfirmed_order_status(result.status):
+            return
+        if not result.order_id:
+            self.order_safety_error = "automatic order returned an unconfirmed status without order_id"
+            return
+        submitted_at = now_market_time(self.settings)
+        try:
+            self._pending_orders().register(
+                order_id=result.order_id,
+                symbol=result.symbol,
+                side=result.side,
+                requested_quantity=result.quantity,
+                requested_price=result.price,
+                reason=reason,
+                strategy_action=strategy_action,
+                strategy_notional=strategy_notional,
+                submitted_at=submitted_at,
+                status=result.status,
+            )
+        except Exception as exc:
+            self.order_safety_error = (
+                f"submitted order {result.order_id} could not be persisted for supervision: {short_error(exc)}"
+            )
+            print(
+                "[严重] 订单已提交但无法写入待确认订单状态；后续自动买入暂停，"
+                f"必须按订单号人工核对：{self.order_safety_error}",
+                flush=True,
+            )
+
+    def _protective_pending_orders(self, symbol: str):
+        normalized = normalize_symbol(symbol)
+        return [
+            order
+            for order in self._pending_orders().orders.values()
+            if order.symbol == normalized
+            and order.side == "SELL"
+            and order.strategy_action == BROKER_PROTECTIVE_STOP_ACTION
+        ]
+
+    def _submit_protective_stop(
+        self,
+        symbol: str,
+        quantity: float,
+        stop_price: float,
+        now_et: datetime,
+    ) -> OrderResult:
+        """提交券商原生 GTC STOP MARKET，并在任何后续动作前持久化订单身份。"""
+
+        from alpaca.trading.enums import OrderSide, OrderType, TimeInForce
+        from alpaca.trading.requests import StopOrderRequest
+
+        client_order_id = f"{BROKER_PROTECTIVE_STOP_CLIENT_PREFIX}{uuid.uuid4().hex}"
+        request = StopOrderRequest(
+            symbol=to_alpaca_symbol(symbol),
+            qty=quantity,
+            side=OrderSide.SELL,
+            type=OrderType.STOP,
+            time_in_force=TimeInForce.GTC,
+            stop_price=stop_price,
+            client_order_id=client_order_id,
+        )
+        reason = f"券商端保护止损：加权成本下方 {abs(self.settings.broker_protective_stop_pct):.2%} STOP MARKET"
+        try:
+            raw = self.client.submit_order(order_data=request)
+        except Exception as exc:
+            raw = self._recover_submitted_order(client_order_id, exc)
+            if raw is None:
+                status = "REJECTED" if self._is_definitive_submit_rejection(exc) else "SUBMIT_UNCONFIRMED"
+                result = OrderResult("", symbol, "SELL", quantity, stop_price, status, short_error(exc))
+                self._latch_protective_stop_error(symbol, f"保护单提交失败：{result.message}")
+                return self._record_result(result, reason)
+
+        result = _nonblocking_submit_result(
+            raw,
+            OrderResult(
+                str(getattr(raw, "id", "") or ""),
+                symbol,
+                "SELL",
+                quantity,
+                stop_price,
+                normalize_order_status(raw) or "SUBMITTED",
+                f"Alpaca {self.source_name()} protective stop submitted",
+            ),
+            self.source_name(),
+        )
+        if not result.order_id:
+            self._latch_protective_stop_error(symbol, "保护单已提交但券商未返回订单号")
+            return self._record_result(result, reason)
+        try:
+            # 即便 submit 响应已是终态也保留一轮，统一对账才能把可能的立即成交
+            # 应用到三档计划，不能因 has_unconfirmed_order_status=False 丢掉成交。
+            self._pending_orders().register(
+                order_id=result.order_id,
+                symbol=symbol,
+                side="SELL",
+                requested_quantity=quantity,
+                requested_price=stop_price,
+                reason=reason,
+                strategy_action=BROKER_PROTECTIVE_STOP_ACTION,
+                strategy_notional=0.0,
+                submitted_at=now_et,
+                status=result.status,
+            )
+        except Exception as exc:
+            self._latch_protective_stop_error(
+                symbol,
+                f"保护单 {result.order_id} 无法写入监督状态：{short_error(exc)}",
+            )
+        notify_order_submitted(self.settings, result, reason, broker_name=self.source_name())
+        return self._record_result(result, reason)
+
+    def _replace_protective_stop(self, order, quantity: float, stop_price: float, now_et: datetime) -> None:
+        """按最新持仓数量和加权成本替换保护单，旧单身份留给替换链对账。"""
+
+        from alpaca.trading.requests import ReplaceOrderRequest
+
+        client_order_id = f"{BROKER_PROTECTIVE_STOP_CLIENT_PREFIX}{uuid.uuid4().hex}"
+        request = ReplaceOrderRequest(
+            qty=quantity,
+            stop_price=stop_price,
+            client_order_id=client_order_id,
+        )
+        try:
+            raw = self.client.replace_order_by_id(order.active_order_id, order_data=request)
+        except Exception as exc:
+            raw = self._recover_submitted_order(client_order_id, exc)
+            if raw is None:
+                self._latch_protective_stop_error(
+                    order.symbol,
+                    f"保护单 {order.active_order_id} 替换结果未知：{short_error(exc)}",
+                )
+                return
+        replacement_id = str(getattr(raw, "id", "") or "")
+        if not replacement_id:
+            self._latch_protective_stop_error(order.symbol, "保护单替换成功但券商未返回新订单号")
+            return
+        # 不直接跳到 replacement_id：下一轮从旧单的 REPLACED/replaced_by 链推进，
+        # 可累计替换瞬间旧订单可能发生的真实成交，避免少算卖出数量。
+        order.requested_quantity = quantity
+        order.requested_price = stop_price
+        order.cancel_requested_at = ""
+        order.updated_at = now_et.isoformat()
+        self._pending_orders().save(now_et)
+        reason = f"按最新持仓更新 -8% 券商保护单；replacement={replacement_id}"
+        result = OrderResult(
+            replacement_id,
+            order.symbol,
+            "SELL",
+            quantity,
+            stop_price,
+            normalize_order_status(raw) or "SUBMITTED",
+            "Alpaca protective stop replaced",
+        )
+        notify_order_submitted(self.settings, result, reason, broker_name=self.source_name())
+        self._record_result(result, reason)
+
+    def _adopt_protective_order(self, raw, now_et: datetime) -> None:
+        """收编券商端仍开放但本地状态缺失的 ma5-stop 订单，支持进程重启恢复。"""
+
+        order_id = str(getattr(raw, "id", "") or "")
+        if not order_id:
+            return
+        store = self._pending_orders()
+        if order_id in store.orders or any(order.active_order_id == order_id for order in store.orders.values()):
+            return
+        symbol = _raw_order_symbol(raw)
+        quantity = _raw_order_quantity(raw)
+        stop_price = _raw_order_stop_price(raw)
+        if not symbol or quantity <= 0 or stop_price <= 0:
+            self._latch_protective_stop_error(symbol or "UNKNOWN", "券商保护单缺少股票、数量或 stop_price")
+            return
+        submitted_at = _raw_order_datetime(raw, "submitted_at") or now_et
+        try:
+            store.register(
+                order_id=order_id,
+                symbol=symbol,
+                side="SELL",
+                requested_quantity=quantity,
+                requested_price=stop_price,
+                reason="重启后收编券商端 -8% 保护 STOP MARKET",
+                strategy_action=BROKER_PROTECTIVE_STOP_ACTION,
+                strategy_notional=0.0,
+                submitted_at=submitted_at,
+                status=normalize_order_status(raw) or "SUBMITTED",
+            )
+        except Exception as exc:
+            self._latch_protective_stop_error(symbol, f"无法收编券商保护单 {order_id}：{short_error(exc)}")
+
+    def _latch_protective_stop_error(self, symbol: str, message: str) -> None:
+        self.protective_stop_error = f"{normalize_symbol(symbol)} protective stop unsafe: {message}"
+        print(f"[严重] {self.protective_stop_error}；后续自动买入暂停，请核对 Alpaca 订单。", flush=True)
+
+    def reconcile_pending_orders(self, now_et: datetime) -> list[PendingOrderEvent]:
+        """Poll every managed order once and request overdue cancellation without blocking."""
+
+        store = self._pending_orders()
+        self.recently_reconciled_buy_symbols = set()
+        self.recently_reconciled_sell_symbols = set()
+        self.recently_released_protective_symbols = set()
+        events: list[PendingOrderEvent] = []
+        changed = False
+        for order in list(store.orders.values()):
+            try:
+                raw = self.client.get_order_by_id(order.active_order_id)
+                raw, replacement_changed = self._follow_pending_replacements(order, raw, now_et)
+                changed = replacement_changed or changed
+            except Exception as exc:
+                print(
+                    f"[提示] 待确认订单 {order.active_order_id} 状态查询失败，保留风险锁：{short_error(exc)}",
+                    flush=True,
+                )
+                continue
+
+            raw_status = normalize_order_status(raw) or order.last_status or "SUBMITTED"
+            terminal = raw_status in FINAL_STATUSES
+            cancel_requested_now = False
+            if (
+                not terminal
+                and order.strategy_action != BROKER_PROTECTIVE_STOP_ACTION
+                and _pending_order_cancel_due(order, now_et, self.settings.order_cancel_after_seconds)
+            ):
+                try:
+                    self.client.cancel_order_by_id(order.active_order_id)
+                    order.cancel_requested_at = now_et.isoformat()
+                    cancel_requested_now = True
+                    changed = True
+                except Exception as exc:
+                    print(
+                        f"[提示] 待确认订单 {order.active_order_id} 自动撤单失败，将继续监督：{short_error(exc)}",
+                        flush=True,
+                    )
+                try:
+                    raw = self.client.get_order_by_id(order.active_order_id)
+                    raw_status = normalize_order_status(raw) or raw_status
+                    terminal = raw_status in FINAL_STATUSES
+                except Exception:
+                    pass
+
+            active_filled_quantity = filled_quantity(raw)
+            active_fill_price = _filled_avg_price(raw, order.requested_price)
+            cumulative_quantity = order.active_order_base_quantity + active_filled_quantity
+            cumulative_value = order.active_order_base_value + active_filled_quantity * active_fill_price
+            cumulative_avg_price = (
+                cumulative_value / cumulative_quantity if cumulative_quantity > 0 else 0.0
+            )
+            effective_status = _pending_effective_status(
+                raw_status,
+                cumulative_quantity,
+                cancel_requested=bool(order.cancel_requested_at) or cancel_requested_now,
+            )
+            event = PendingOrderEvent(
+                tracking_order_id=order.tracking_order_id,
+                active_order_id=order.active_order_id,
+                symbol=order.symbol,
+                side=order.side,
+                requested_quantity=order.requested_quantity,
+                requested_price=order.requested_price,
+                reason=order.reason,
+                strategy_action=order.strategy_action,
+                strategy_notional=order.strategy_notional,
+                status=effective_status,
+                filled_quantity=cumulative_quantity,
+                filled_avg_price=cumulative_avg_price,
+                terminal=terminal,
+            )
+
+            order.last_status = effective_status
+            order.last_filled_quantity = cumulative_quantity
+            order.last_filled_avg_price = cumulative_avg_price
+            order.updated_at = now_et.isoformat()
+            changed = True
+            if event.record_key() != (
+                order.recorded_status,
+                round(float(order.recorded_filled_quantity), 9),
+            ):
+                result_quantity = cumulative_quantity if cumulative_quantity > 0 else order.requested_quantity
+                result_price = cumulative_avg_price if cumulative_avg_price > 0 else order.requested_price
+                self._record_result(
+                    OrderResult(
+                        order.active_order_id,
+                        order.symbol,
+                        order.side,
+                        result_quantity,
+                        result_price,
+                        effective_status,
+                        "Alpaca managed order state reconciled",
+                    ),
+                    order.reason,
+                )
+                if not (getattr(self, "order_safety_error", "") or getattr(self, "order_recording_error", "")):
+                    order.recorded_status, order.recorded_filled_quantity = event.record_key()
+            events.append(event)
+            if (
+                event.strategy_action == BROKER_PROTECTIVE_STOP_ACTION
+                and event.terminal
+                and event.filled_quantity <= 0
+            ):
+                self.recently_released_protective_symbols.add(event.symbol)
+            if event.terminal and event.filled_quantity > 0:
+                recently_reconciled = (
+                    self.recently_reconciled_buy_symbols
+                    if event.side == "BUY"
+                    else self.recently_reconciled_sell_symbols
+                )
+                recently_reconciled.add(event.symbol)
+
+        if changed:
+            store.save(now_et)
+        return events
+
+    def acknowledge_pending_order(self, tracking_order_id: str, now_et: datetime) -> None:
+        """Remove a terminal order only after the service has applied its cumulative fill."""
+
+        self._pending_orders().remove(tracking_order_id, now_et)
+
+    def _follow_pending_replacements(self, order, raw, now_et: datetime):
+        changed = False
+        seen = {order.active_order_id}
+        for _ in range(8):
+            if normalize_order_status(raw) != "REPLACED":
+                return raw, changed
+            replacement_id = str(getattr(raw, "replaced_by", "") or "")
+            if not replacement_id or replacement_id in seen:
+                raise RuntimeError("替换订单链缺少有效 replaced_by")
+            active_quantity = filled_quantity(raw)
+            active_price = _filled_avg_price(raw, order.requested_price)
+            order.active_order_base_quantity += active_quantity
+            order.active_order_base_value += active_quantity * active_price
+            order.active_order_id = replacement_id
+            order.updated_at = now_et.isoformat()
+            seen.add(replacement_id)
+            changed = True
+            raw = self.client.get_order_by_id(replacement_id)
+        raise RuntimeError("替换订单链超过 8 层，停止自动推进")
 
     def _get_open_orders(self, symbol: str):
         """读取 Alpaca open orders，撤单指令会用它按股票代码定位挂单。"""
@@ -718,12 +1415,92 @@ class AlpacaStockBroker:
         """生成盘前/盘后限价单的保护价。"""
         buffer = self.settings.extended_hours_limit_buffer_pct
         if side == "BUY":
-            return round(current_price * (1.0 + buffer), 2)
-        return round(current_price * (1.0 - buffer), 2)
+            return normalize_limit_price(current_price * (1.0 + buffer))
+        return normalize_limit_price(current_price * (1.0 - buffer))
 
     def source_name(self) -> str:
         """返回当前真实交易通道名称。"""
         return "alpaca-paper" if self.paper else "alpaca-live"
+
+
+def normalize_limit_price(price: float) -> float:
+    """Use cents at $1+, and four decimal places below $1, without collapsing low-price tiers."""
+
+    value = Decimal(str(price))
+    if not value.is_finite() or value <= 0:
+        raise ValueError("limit price must be finite and positive")
+    quantum = Decimal("0.01") if value >= Decimal("1") else Decimal("0.0001")
+    return float(value.quantize(quantum, rounding=ROUND_HALF_UP))
+
+
+def _nonblocking_submit_result(raw_order, submitted: OrderResult, source_name: str) -> OrderResult:
+    """Return immediately while preserving an already-terminal fill from the submit response."""
+
+    status = normalize_order_status(raw_order) or submitted.status or "SUBMITTED"
+    if status not in FINAL_STATUSES:
+        return OrderResult(
+            submitted.order_id,
+            submitted.symbol,
+            submitted.side,
+            submitted.quantity,
+            submitted.price,
+            "SUBMITTED",
+            f"Alpaca {source_name} order accepted for non-blocking supervision; broker_status={status}",
+        )
+    quantity = filled_quantity(raw_order)
+    price = _filled_avg_price(raw_order, submitted.price)
+    if quantity > 0 and status != "FILLED":
+        status = f"PARTIALLY_FILLED_{status}"
+    return OrderResult(
+        submitted.order_id,
+        submitted.symbol,
+        submitted.side,
+        quantity if quantity > 0 else submitted.quantity,
+        price,
+        status,
+        f"Alpaca {source_name} order returned terminal status={status} at submit",
+    )
+
+
+def _filled_avg_price(raw_order, fallback: float) -> float:
+    try:
+        value = float(getattr(raw_order, "filled_avg_price", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return value if value > 0 else float(fallback)
+
+
+def _pending_order_cancel_due(order, now_et: datetime, timeout_seconds: int) -> bool:
+    submitted_at = datetime.fromisoformat(order.submitted_at)
+    now_value = _compatible_datetime(now_et, submitted_at)
+    if (now_value - submitted_at).total_seconds() < max(0, timeout_seconds):
+        return False
+    if not order.cancel_requested_at:
+        return True
+    requested_at = datetime.fromisoformat(order.cancel_requested_at)
+    now_value = _compatible_datetime(now_et, requested_at)
+    return (now_value - requested_at).total_seconds() >= 30.0
+
+
+def _compatible_datetime(value: datetime, reference: datetime) -> datetime:
+    if value.tzinfo is None and reference.tzinfo is not None:
+        return value.replace(tzinfo=reference.tzinfo)
+    if value.tzinfo is not None and reference.tzinfo is None:
+        return value.replace(tzinfo=None)
+    return value
+
+
+def _pending_effective_status(raw_status: str, filled_qty: float, *, cancel_requested: bool) -> str:
+    status = str(raw_status or "SUBMITTED").upper()
+    if status in FINAL_STATUSES:
+        if filled_qty > 0 and status != "FILLED":
+            return f"PARTIALLY_FILLED_{status}"
+        return status
+    if cancel_requested:
+        return "PARTIALLY_FILLED_CANCEL_REQUESTED" if filled_qty > 0 else "CANCEL_REQUESTED"
+    if filled_qty > 0:
+        return "PARTIALLY_FILLED"
+    return status
 
 
 def _raw_order_symbol(raw_order) -> str:
@@ -757,3 +1534,38 @@ def _raw_order_price(raw_order) -> float:
         if value > 0:
             return value
     return 0.0
+
+
+def _raw_order_stop_price(raw_order) -> float:
+    try:
+        value = float(getattr(raw_order, "stop_price", 0) or 0)
+    except (TypeError, ValueError):
+        value = 0.0
+    return value if math.isfinite(value) and value > 0 else 0.0
+
+
+def _raw_order_client_order_id(raw_order) -> str:
+    return str(getattr(raw_order, "client_order_id", "") or "")
+
+
+def _is_managed_protective_raw_order(raw_order) -> bool:
+    return (
+        _raw_order_side(raw_order) == "SELL"
+        and _raw_order_client_order_id(raw_order).startswith(BROKER_PROTECTIVE_STOP_CLIENT_PREFIX)
+    )
+
+
+def _same_order_quantity(left: float, right: float) -> bool:
+    return math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-6)
+
+
+def _raw_order_datetime(raw_order, field: str) -> datetime | None:
+    value = getattr(raw_order, field, None)
+    if isinstance(value, datetime):
+        return value
+    if value:
+        try:
+            return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    return None

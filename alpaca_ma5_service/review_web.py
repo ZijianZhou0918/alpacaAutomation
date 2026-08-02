@@ -29,6 +29,7 @@ SCHEMA_VERSION = "1.0"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT_START = 8788
 DEFAULT_PORT_END = 8807
+DEFAULT_IDLE_TIMEOUT_SECONDS = 10 * 60
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 SERVER_STATE_NAME = "review_dashboard_server.json"
 MAX_REQUEST_TARGET_LENGTH = 4096
@@ -56,10 +57,40 @@ class ReviewHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
 
-    def __init__(self, server_address, handler_class, *, base_dir: Path):
+    def __init__(
+        self,
+        server_address,
+        handler_class,
+        *,
+        base_dir: Path,
+        idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
+    ):
+        if not 0.1 <= float(idle_timeout_seconds) <= 24 * 60 * 60:
+            raise ValueError("idle timeout must be between 0.1 seconds and 24 hours")
         self.base_dir = base_dir.resolve()
         self.started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        self.idle_timeout_seconds = float(idle_timeout_seconds)
+        self._activity_lock = threading.Lock()
+        self._active_requests = 0
+        self._last_activity = time.monotonic()
         super().__init__(server_address, handler_class)
+
+    def begin_request_activity(self) -> None:
+        with self._activity_lock:
+            self._active_requests += 1
+            self._last_activity = time.monotonic()
+
+    def end_request_activity(self) -> None:
+        with self._activity_lock:
+            self._active_requests = max(0, self._active_requests - 1)
+            self._last_activity = time.monotonic()
+
+    def idle_shutdown_ready(self) -> bool:
+        with self._activity_lock:
+            return (
+                self._active_requests == 0
+                and time.monotonic() - self._last_activity >= self.idle_timeout_seconds
+            )
 
     def handle_error(self, request, client_address) -> None:
         _error_type, error, _traceback = sys.exc_info()
@@ -75,11 +106,17 @@ def create_review_server(
     port: int = DEFAULT_PORT_START,
     review_api=None,
     action_api=None,
+    idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
 ) -> ReviewHTTPServer:
     """Create one bound server. Tests may use port=0 for an ephemeral port."""
     root = Path(base_dir or PROJECT_ROOT).resolve()
     handler = make_review_handler(root, review_api=review_api, action_api=action_api)
-    return ReviewHTTPServer((host, int(port)), handler, base_dir=root)
+    return ReviewHTTPServer(
+        (host, int(port)),
+        handler,
+        base_dir=root,
+        idle_timeout_seconds=idle_timeout_seconds,
+    )
 
 
 def bind_review_server(
@@ -90,13 +127,21 @@ def bind_review_server(
     port_end: int = DEFAULT_PORT_END,
     review_api=None,
     action_api=None,
+    idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
 ) -> ReviewHTTPServer:
     """Bind the first available port in the configured, bounded range."""
     _validate_port_range(port_start, port_end)
     last_error: OSError | None = None
     for port in range(port_start, port_end + 1):
         try:
-            return create_review_server(base_dir=base_dir, host=host, port=port, review_api=review_api, action_api=action_api)
+            return create_review_server(
+                base_dir=base_dir,
+                host=host,
+                port=port,
+                review_api=review_api,
+                action_api=action_api,
+                idle_timeout_seconds=idle_timeout_seconds,
+            )
         except OSError as exc:
             if not _is_address_in_use(exc):
                 raise
@@ -119,25 +164,36 @@ def make_review_handler(base_dir: Path, *, review_api=None, action_api=None):
             return self.server_version
 
         def do_GET(self) -> None:
-            self._dispatch(send_body=True)
+            self._with_activity(lambda: self._dispatch(send_body=True))
 
         def do_HEAD(self) -> None:
-            self._dispatch(send_body=False)
+            self._with_activity(lambda: self._dispatch(send_body=False))
 
         def do_POST(self) -> None:
-            self._dispatch_post()
+            self._with_activity(self._dispatch_post)
 
         def do_PUT(self) -> None:
-            self._method_not_allowed()
+            self._with_activity(self._method_not_allowed)
 
         def do_PATCH(self) -> None:
-            self._method_not_allowed()
+            self._with_activity(self._method_not_allowed)
 
         def do_DELETE(self) -> None:
-            self._method_not_allowed()
+            self._with_activity(self._method_not_allowed)
 
         def do_OPTIONS(self) -> None:
-            self._method_not_allowed()
+            self._with_activity(self._method_not_allowed)
+
+        def _with_activity(self, operation) -> None:
+            server = self.server
+            if not isinstance(server, ReviewHTTPServer):
+                operation()
+                return
+            server.begin_request_activity()
+            try:
+                operation()
+            finally:
+                server.end_request_activity()
 
         def _dispatch(self, *, send_body: bool) -> None:
             parsed = self._validated_request_target(send_body=send_body)
@@ -601,9 +657,16 @@ def serve_review_dashboard(
     host: str = DEFAULT_HOST,
     port_start: int = DEFAULT_PORT_START,
     port_end: int = DEFAULT_PORT_END,
+    idle_timeout_seconds: float = DEFAULT_IDLE_TIMEOUT_SECONDS,
 ) -> None:
     root = Path(base_dir or PROJECT_ROOT).resolve()
-    server = bind_review_server(base_dir=root, host=host, port_start=port_start, port_end=port_end)
+    server = bind_review_server(
+        base_dir=root,
+        host=host,
+        port_start=port_start,
+        port_end=port_end,
+        idle_timeout_seconds=idle_timeout_seconds,
+    )
     actual_port = int(server.server_address[1])
     url = review_dashboard_url(actual_port, host=host)
     write_review_server_state(
@@ -619,10 +682,30 @@ def serve_review_dashboard(
     )
     print(f"MA5 daily review service: {url}", flush=True)
     print(f"Project root: {root}", flush=True)
+    stop_idle_monitor = start_review_idle_monitor(server)
     try:
         server.serve_forever(poll_interval=0.25)
     finally:
+        stop_idle_monitor.set()
         server.server_close()
+
+
+def start_review_idle_monitor(server: ReviewHTTPServer) -> threading.Event:
+    stop_event = threading.Event()
+    check_interval = max(0.1, min(5.0, server.idle_timeout_seconds / 4))
+
+    def monitor() -> None:
+        while not stop_event.wait(check_interval):
+            if server.idle_shutdown_ready():
+                server.shutdown()
+                return
+
+    threading.Thread(
+        target=monitor,
+        name="ma5-review-idle-shutdown",
+        daemon=True,
+    ).start()
+    return stop_event
 
 
 def _safe_child_file(root: Path, relative: str) -> Path | None:
@@ -799,12 +882,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port-start", type=int, default=DEFAULT_PORT_START)
     parser.add_argument("--port-end", type=int, default=DEFAULT_PORT_END)
+    parser.add_argument(
+        "--idle-timeout-seconds",
+        type=float,
+        default=float(os.environ.get("MA5_REVIEW_IDLE_TIMEOUT_SECONDS", DEFAULT_IDLE_TIMEOUT_SECONDS)),
+    )
     args = parser.parse_args(argv)
     serve_review_dashboard(
         base_dir=args.base_dir,
         host=args.host,
         port_start=args.port_start,
         port_end=args.port_end,
+        idle_timeout_seconds=args.idle_timeout_seconds,
     )
     return 0
 

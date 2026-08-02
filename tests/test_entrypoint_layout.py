@@ -16,6 +16,7 @@ ROOT_PYTHON_ENTRIES = {
     "monitor_premarket_ma5.py",
     "open_daily_review.py",
     "run_backtest_daily_history_rebuild.py",
+    "run_backtest_kdj_volume_reversal.py",
     "watchcode_afterhours.py",
     "watchcode_chart.py",
     "watchcode_ma5.py",

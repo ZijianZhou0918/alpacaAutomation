@@ -12,6 +12,8 @@ WatchCode 选股 -> 买入判断 -> Broker 下单 -> 撤单/终态确认
 
 `StrategyProfile` 是四类组件和运行默认值的组合名。程序启动时先解析并校验整个组合，再创建行情或 Broker；名称错误、组件缺失或接口不完整都会直接终止。
 
+当前盘中入口选择 `ma5_dip_ladder`：复用 `ma5_dip` 的 WatchCode/首次买入信号，在 `service.py` 与 `ladder.py` 中执行有状态三档建仓，以及仅针对首次 `+10%` 半仓止盈额度的三档卖出；整仓 `-10%` 止损以券商实际加权平均成本为基准。`ma5_dip` profile 保留为显式回滚/对照。分档状态和自动未终态订单分别从 `outputs/ladder_state.json`、`outputs/pending_orders.json` 校验装载；自动提交不阻塞逐股循环，后续轮次按订单 ID 对账并幂等应用累计成交。
+
 ## 目录
 
 ```text

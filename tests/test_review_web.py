@@ -19,6 +19,7 @@ from alpaca_ma5_service.review_web import (
     find_running_review_server,
     review_dashboard_url,
     review_server_ready,
+    start_review_idle_monitor,
 )
 
 
@@ -121,6 +122,26 @@ class ReviewWebHTTPTests(TestCase):
         self.server.server_close()
         self.thread.join(timeout=2.0)
         self.temporary.cleanup()
+
+    def test_idle_monitor_closes_listener_after_requests_finish(self):
+        idle_server = create_review_server(
+            base_dir=self.root,
+            host="127.0.0.1",
+            port=0,
+            review_api=self.api,
+            action_api=self.action_api,
+            idle_timeout_seconds=0.2,
+        )
+        idle_thread = threading.Thread(target=idle_server.serve_forever, daemon=True)
+        idle_thread.start()
+        stop_event = start_review_idle_monitor(idle_server)
+        try:
+            idle_thread.join(timeout=2.0)
+            self.assertFalse(idle_thread.is_alive())
+        finally:
+            stop_event.set()
+            idle_server.shutdown()
+            idle_server.server_close()
 
     def request(self, method: str, target: str, *, headers=None, host=_AUTO_HOST):
         connection = HTTPConnection("127.0.0.1", self.port, timeout=3.0)

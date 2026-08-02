@@ -9,6 +9,7 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from alpaca_ma5_service import dashboard_actions
+from alpaca_ma5_service.watchlist_generator import watchlist_rules_header
 
 
 class DashboardActionsTests(TestCase):
@@ -20,16 +21,35 @@ class DashboardActionsTests(TestCase):
             root = Path(tmp)
             watch_path = root / "data" / "watchcodes" / "watch_codes.txt"
             watch_path.parent.mkdir(parents=True)
-            watch_path.write_text("# signal_date=2026-07-10\nUS.HAO\nUS.RNAZ\n", encoding="utf-8")
+            watch_path.write_text(
+                f"{watchlist_rules_header()}\n# signal_date=2026-07-10\nUS.HAO\nUS.RNAZ\n",
+                encoding="utf-8",
+            )
             with patch.object(dashboard_actions, "_expected_signal_date", return_value=date(2026, 7, 10)):
                 with patch.object(dashboard_actions, "_read_watchcode_signal_date", return_value=date(2026, 7, 10)):
                     status = dashboard_actions.action_status(root)
 
         self.assertTrue(status["watchcode"]["ready"])
+        self.assertTrue(status["watchcode"]["rules_match"])
         self.assertEqual(status["watchcode"]["symbol_count"], 2)
         self.assertFalse(status["monitor_running"])
 
-    def test_action_status_reports_premarket_watchcode_separately(self):
+    def test_action_status_rejects_matching_date_with_old_rules(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            watch_path = root / "data" / "watchcodes" / "watch_codes.txt"
+            watch_path.parent.mkdir(parents=True)
+            watch_path.write_text(
+                "# Rules: obsolete strategy\n# signal_date=2026-07-10\nUS.HAO\n",
+                encoding="utf-8",
+            )
+            with patch.object(dashboard_actions, "_expected_signal_date", return_value=date(2026, 7, 10)):
+                status = dashboard_actions.action_status(root)
+
+        self.assertFalse(status["watchcode"]["ready"])
+        self.assertFalse(status["watchcode"]["rules_match"])
+
+    def test_action_status_reports_positions_only_premarket_mode(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             path = root / "data" / "watchcodes" / "watch_codes_premarket.txt"
@@ -39,7 +59,9 @@ class DashboardActionsTests(TestCase):
                 status = dashboard_actions.action_status(root)
 
         self.assertTrue(status["premarket_watchcode"]["ready"])
-        self.assertEqual(status["premarket_watchcode"]["symbol_count"], 2)
+        self.assertEqual(status["premarket_watchcode"]["symbol_count"], 0)
+        self.assertEqual(status["premarket_watchcode"]["mode"], "positions_only")
+        self.assertIsNone(status["premarket_watchcode"]["path"])
         self.assertFalse(status["premarket_monitor_running"])
 
     def test_launch_action_uses_only_allowlisted_module_command(self):
@@ -85,38 +107,32 @@ class DashboardActionsTests(TestCase):
         self.assertLess(calls.index("wait"), calls.index("watchcode"))
         self.assertLess(calls.index("watchcode"), calls.index("monitor"))
 
-    def test_start_premarket_monitor_prepares_premarket_watchcode_first(self):
+    def test_start_premarket_monitor_does_not_generate_or_wait_for_watchcode(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             calls: list[str] = []
-            settings = SimpleNamespace(market_timezone="America/New_York")
             previous = Path.cwd()
             try:
                 with patch("monitor_auto.configure_console_logging", side_effect=lambda: calls.append("logging")):
-                    with patch("monitor_auto.ensure_premarket_watchcode", side_effect=lambda _now: calls.append("premarket_watchcode")):
-                        with patch("monitor_premarket_ma5.monitor_premarket_ma5", side_effect=lambda: calls.append("premarket_monitor")):
-                            with patch("alpaca_ma5_service.config.build_settings", return_value=settings):
-                                with patch.object(dashboard_actions, "_wait_for_watchcode_generation", side_effect=lambda _root: calls.append("wait")):
-                                    dashboard_actions.run_action(dashboard_actions.ACTION_START_PREMARKET_MONITOR, base_dir=root)
+                    with patch("monitor_premarket_ma5.monitor_premarket_ma5", side_effect=lambda: calls.append("premarket_monitor")):
+                        with patch("monitor_auto.ensure_premarket_watchcode", side_effect=AssertionError("must not screen")):
+                            with patch.object(dashboard_actions, "_wait_for_watchcode_generation", side_effect=AssertionError("must not wait")):
+                                dashboard_actions.run_action(dashboard_actions.ACTION_START_PREMARKET_MONITOR, base_dir=root)
             finally:
                 os.chdir(previous)
 
-        self.assertLess(calls.index("wait"), calls.index("premarket_watchcode"))
-        self.assertLess(calls.index("premarket_watchcode"), calls.index("premarket_monitor"))
+        self.assertEqual(calls, ["logging", "premarket_monitor"])
 
-    def test_wait_for_watchcode_generation_tracks_premarket_generator_until_finished(self):
-        running = {
-            "tasks": [
-                {"status": "running", "task_name": "watchcode_premarket", "phase": "screen"},
-            ]
-        }
-        with patch.object(dashboard_actions, "read_monitor_tasks", side_effect=[running, {"tasks": []}]) as reader:
-            with patch.object(dashboard_actions.time, "monotonic", side_effect=[0.0, 0.0, 1.0]):
-                with patch.object(dashboard_actions.time, "sleep") as sleep:
-                    dashboard_actions._wait_for_watchcode_generation(Path("."))
+    def test_generate_premarket_watchcode_dashboard_action_is_disabled(self):
+        with TemporaryDirectory() as tmp:
+            result = dashboard_actions.launch_action(
+                dashboard_actions.ACTION_GENERATE_PREMARKET_WATCHCODE,
+                base_dir=Path(tmp),
+                popen_factory=MagicMock(side_effect=AssertionError("must not launch generator")),
+            )
 
-        self.assertEqual(reader.call_count, 2)
-        sleep.assert_called_once_with(2.0)
+        self.assertEqual(result["status"], "disabled")
+        self.assertEqual(result["watchcode"]["mode"], "positions_only")
 
     def test_stop_monitor_action_ends_tracked_and_runtime_processes(self):
         with TemporaryDirectory() as tmp:

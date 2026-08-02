@@ -14,6 +14,7 @@ from zoneinfo import ZoneInfo
 from .monitor_runtime import read_monitor_tasks
 from .paths import watchcode_dir
 from .watchlist import read_watch_codes
+from .watchlist_generator import watchcode_matches_rules
 
 
 ACTION_GENERATE_WATCHCODE = "generate-watchcode"
@@ -28,8 +29,8 @@ ALLOWED_ACTIONS = {
     ACTION_START_PREMARKET_MONITOR,
     ACTION_STOP_MONITOR,
 }
-STOPPABLE_TASK_NAMES = {"monitor_auto", "monitor_ma5", "monitor_premarket", "watchcode_ma5", "watchcode_premarket"}
-WATCHCODE_TASK_NAMES = {"watchcode_ma5", "watchcode_premarket"}
+STOPPABLE_TASK_NAMES = {"monitor_auto", "monitor_ma5", "monitor_premarket", "watchcode_ma5"}
+WATCHCODE_TASK_NAMES = {"watchcode_ma5"}
 
 _ACTION_LOCK = threading.RLock()
 _ACTION_PROCESSES: dict[str, subprocess.Popen] = {}
@@ -39,36 +40,22 @@ def action_status(base_dir: Path | str) -> dict[str, Any]:
     root = Path(base_dir).resolve()
     watch_dir = watchcode_dir(root)
     watch_path = watch_dir / "watch_codes.txt"
-    premarket_watch_path = watch_dir / "watch_codes_premarket.txt"
     expected = _expected_signal_date()
     signal_date = _read_watchcode_signal_date(watch_path)
-    premarket_signal_date = None
-    premarket_symbols: list[str] = []
-    if premarket_watch_path.is_file():
-        try:
-            from .premarket_watchlist import read_premarket_watch_metadata
-
-            premarket_signal_date, premarket_symbols = read_premarket_watch_metadata(premarket_watch_path)
-        except Exception:
-            premarket_signal_date, premarket_symbols = None, []
     try:
         symbol_count = len(read_watch_codes(watch_path)) if watch_path.is_file() else 0
     except Exception:
         symbol_count = 0
+    try:
+        rules_match = watchcode_matches_rules(watch_path, _current_intraday_watchlist_rules())
+    except Exception:
+        # 策略配置无效时绝不能把股票池标成可启动；具体错误由启动入口报告。
+        rules_match = False
     modified_at = None
     try:
         modified_at = datetime.fromtimestamp(watch_path.stat().st_mtime, ZoneInfo("America/New_York")).isoformat(timespec="seconds")
     except OSError:
         pass
-    premarket_modified_at = None
-    try:
-        premarket_modified_at = datetime.fromtimestamp(
-            premarket_watch_path.stat().st_mtime,
-            ZoneInfo("America/New_York"),
-        ).isoformat(timespec="seconds")
-    except OSError:
-        pass
-
     tasks_payload = read_monitor_tasks(root)
     running_tasks = [task for task in tasks_payload["tasks"] if task["status"] == "running"]
     monitor_running = any(task.get("task_name") in {"monitor_auto", "monitor_ma5", "monitor_premarket"} for task in running_tasks)
@@ -78,8 +65,8 @@ def action_status(base_dir: Path | str) -> dict[str, Any]:
         for task in running_tasks
     )
     intraday_generator_running = any(task.get("task_name") == "watchcode_ma5" for task in running_tasks)
-    premarket_generator_running = any(task.get("task_name") == "watchcode_premarket" for task in running_tasks)
-    generator_running = intraday_generator_running or premarket_generator_running
+    premarket_generator_running = False
+    generator_running = intraday_generator_running
     with _ACTION_LOCK:
         _discard_finished_processes()
         pending_actions = sorted(action for action, process in _ACTION_PROCESSES.items() if process.poll() is None)
@@ -88,20 +75,22 @@ def action_status(base_dir: Path | str) -> dict[str, Any]:
         "watchcode": {
             "path": str(watch_path),
             "exists": watch_path.is_file(),
-            "ready": bool(symbol_count and signal_date == expected),
+            "ready": bool(symbol_count and signal_date == expected and rules_match),
             "expected_signal_date": expected.isoformat(),
             "signal_date": signal_date.isoformat() if signal_date else None,
             "symbol_count": symbol_count,
+            "rules_match": rules_match,
             "modified_at": modified_at,
         },
         "premarket_watchcode": {
-            "path": str(premarket_watch_path),
-            "exists": premarket_watch_path.is_file(),
-            "ready": bool(premarket_symbols) and premarket_signal_date == expected,
-            "expected_signal_date": expected.isoformat(),
-            "signal_date": premarket_signal_date.isoformat() if premarket_signal_date else None,
-            "symbol_count": len(premarket_symbols),
-            "modified_at": premarket_modified_at,
+            "path": None,
+            "exists": False,
+            "ready": True,
+            "expected_signal_date": None,
+            "signal_date": None,
+            "symbol_count": 0,
+            "modified_at": None,
+            "mode": "positions_only",
         },
         "monitor_running": monitor_running,
         "premarket_monitor_running": premarket_monitor_running,
@@ -124,9 +113,17 @@ def launch_action(
     root = Path(base_dir).resolve()
     if action == ACTION_STOP_MONITOR:
         return stop_monitor_tasks(root, stop_process_tree=stop_process_tree)
+    if action == ACTION_GENERATE_PREMARKET_WATCHCODE:
+        return {
+            "ok": True,
+            "status": "disabled",
+            "action": action,
+            "message": "盘前 WatchCode 已停用；盘前只读取 Alpaca 当前持仓。",
+            "watchcode": {"ready": True, "mode": "positions_only", "symbol_count": 0},
+        }
     status = action_status(root)
     start_actions = {ACTION_START_MONITOR, ACTION_START_PREMARKET_MONITOR}
-    generate_actions = {ACTION_GENERATE_WATCHCODE, ACTION_GENERATE_PREMARKET_WATCHCODE}
+    generate_actions = {ACTION_GENERATE_WATCHCODE}
     selected_watchcode = status["premarket_watchcode"] if "premarket" in action else status["watchcode"]
     if action in start_actions and (
         status["monitor_running"] or any(item in status["pending_actions"] for item in start_actions)
@@ -178,6 +175,8 @@ def launch_action(
         if selected_watchcode["ready"]
         else f"{session_label} WatchCode 缺失或过期，将先生成，成功后再启动盯盘。"
     )
+    if action == ACTION_START_PREMARKET_MONITOR:
+        watch_message = "盘前持仓监控将直接启动；不读取或生成任何 WatchCode。"
     message = f"{session_label} WatchCode 生成任务已启动。" if action in generate_actions else watch_message
     return {
         "ok": True,
@@ -289,9 +288,7 @@ def run_action(action: str, *, base_dir: Path | str) -> None:
         generate_ma5_watchcode()
         return
     if action == ACTION_GENERATE_PREMARKET_WATCHCODE:
-        from .workflows.watchcode.premarket import generate_premarket_watchcode
-
-        generate_premarket_watchcode()
+        print("盘前 WatchCode 已停用；盘前只监控 Alpaca 当前持仓。", flush=True)
         return
     if action == ACTION_START_MONITOR:
         from .config import build_settings
@@ -309,18 +306,10 @@ def run_action(action: str, *, base_dir: Path | str) -> None:
         monitor_auto()
         return
     if action == ACTION_START_PREMARKET_MONITOR:
-        from .config import build_settings
-        from .workflows.monitoring.auto import (
-            configure_console_logging,
-            ensure_premarket_watchcode,
-        )
+        from .workflows.monitoring.auto import configure_console_logging
         from .workflows.monitoring.premarket import monitor_premarket_ma5
 
         configure_console_logging()
-        settings = build_settings()
-        now_et = datetime.now(ZoneInfo(settings.market_timezone))
-        _wait_for_watchcode_generation(root)
-        ensure_premarket_watchcode(now_et)
         monitor_premarket_ma5()
         return
     raise ValueError("unsupported dashboard action")
@@ -337,6 +326,15 @@ def _expected_signal_date():
 
     settings = build_settings()
     return expected_signal_date(datetime.now(ZoneInfo(settings.market_timezone)))
+
+
+def _current_intraday_watchlist_rules():
+    """按盘中 workflow 的真实配置解析规则，保持看板与启动入口一致。"""
+    from .strategy_framework import resolve_strategy_runtime
+    from .workflows.monitoring.intraday import build_monitor_settings
+
+    settings = build_monitor_settings()
+    return resolve_strategy_runtime(settings).watchlist.screen_rules()
 
 
 def _read_watchcode_signal_date(path: Path):

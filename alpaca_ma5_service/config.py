@@ -13,6 +13,7 @@ from .paths import BASE_DIR, INTRADAY_WATCH_CODES_PATH
 
 BUY_NOTIONAL_USD = 1_500.0
 MA5_DIP_STRATEGY_NAME = "ma5_dip"
+MA5_DIP_LADDER_STRATEGY_NAME = "ma5_dip_ladder"
 DEFAULT_STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
 DEFAULT_BUY_STOCK_COUNT = 2
 MAX_BUY_STOCK_COUNT = 3
@@ -64,6 +65,10 @@ class Settings:
     buy_strategy_name: str = ""
     sell_strategy_name: str = ""
     cancel_strategy_name: str = ""
+    buy_ladder_offsets: tuple[float, float, float] = (0.0, -0.01, -0.02)
+    sell_ladder_offsets: tuple[float, float, float] = (0.0, 0.01, 0.02)
+    absolute_stop_loss_pct: float = -0.15
+    broker_protective_stop_pct: float = -0.08
 
 
 def build_settings(
@@ -93,6 +98,10 @@ def build_settings(
     order_status_poll_seconds: int | None = None,
     realtime_price_source: str | None = None,
     trade_notify_mode: str | None = None,
+    buy_ladder_offsets: tuple[float, float, float] | None = None,
+    sell_ladder_offsets: tuple[float, float, float] | None = None,
+    absolute_stop_loss_pct: float | None = None,
+    broker_protective_stop_pct: float | None = None,
 ) -> Settings:
     """
     这里集中放运行参数，方便你在 PyCharm 点箭头运行时直接生效。
@@ -206,6 +215,26 @@ def build_settings(
         openclaw_gateway_port=int(env_value(env, "OPENCLAW_GATEWAY_PORT") or "18789"),
         watchlist_chart_lan_host=env_value(env, "WATCHLIST_CHART_LAN_HOST"),
         watchlist_chart_lan_port=int(env_value(env, "WATCHLIST_CHART_LAN_PORT") or "8766"),
+        buy_ladder_offsets=validate_ladder_offsets(
+            "buy_ladder_offsets",
+            (0.0, -0.01, -0.02) if buy_ladder_offsets is None else buy_ladder_offsets,
+            descending=True,
+        ),
+        sell_ladder_offsets=validate_ladder_offsets(
+            "sell_ladder_offsets",
+            (0.0, 0.01, 0.02) if sell_ladder_offsets is None else sell_ladder_offsets,
+            descending=False,
+        ),
+        absolute_stop_loss_pct=validate_negative_fraction(
+            "absolute_stop_loss_pct",
+            defaults.get("absolute_stop_loss_pct", -0.15)
+            if absolute_stop_loss_pct is None
+            else absolute_stop_loss_pct,
+        ),
+        broker_protective_stop_pct=validate_negative_fraction(
+            "broker_protective_stop_pct",
+            -0.08 if broker_protective_stop_pct is None else broker_protective_stop_pct,
+        ),
     )
 
 
@@ -247,6 +276,35 @@ def validate_fraction(name: str, value: float | int) -> float:
     if fraction < 0 or fraction > 1:
         raise ValueError(f"{name} must be between 0 and 1")
     return fraction
+
+
+def validate_negative_fraction(name: str, value: float | int) -> float:
+    number = validate_finite_number(name, value)
+    if not -1.0 < number < 0.0:
+        raise ValueError(f"{name} must be between -1 and 0")
+    return number
+
+
+def validate_ladder_offsets(
+    name: str,
+    values: tuple[float, float, float],
+    *,
+    descending: bool,
+) -> tuple[float, float, float]:
+    if not isinstance(values, tuple) or len(values) != 3:
+        raise ValueError(f"{name} must contain exactly three offsets")
+    normalized = tuple(validate_finite_number(name, value) for value in values)
+    if normalized[0] != 0.0:
+        raise ValueError(f"{name} must start at 0")
+    ordered = normalized[0] > normalized[1] > normalized[2] if descending else normalized[0] < normalized[1] < normalized[2]
+    if not ordered:
+        direction = "descending" if descending else "ascending"
+        raise ValueError(f"{name} must be strictly {direction}")
+    if descending and any(not -1.0 < value <= 0.0 for value in normalized):
+        raise ValueError(f"{name} buy offsets must be greater than -1 and at most 0")
+    if not descending and any(value < 0.0 for value in normalized):
+        raise ValueError(f"{name} sell offsets must be non-negative")
+    return normalized
 
 
 def resolve_optional_number(name: str, default: float | int | None, value: Any) -> float | None:

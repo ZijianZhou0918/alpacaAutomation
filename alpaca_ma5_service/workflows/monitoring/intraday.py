@@ -12,12 +12,14 @@ from alpaca_ma5_service.entrypoint import ensure_local_venv
 ensure_local_venv()
 
 from alpaca_ma5_service import strategy_ma5_dip
-from alpaca_ma5_service.config import MA5_DIP_STRATEGY_NAME, build_settings
+from alpaca_ma5_service.config import MA5_DIP_LADDER_STRATEGY_NAME, MA5_DIP_STRATEGY_NAME, build_settings
+from alpaca_ma5_service.market_time import now_market_time
 from alpaca_ma5_service.monitor_runtime import monitor_runtime
 from alpaca_ma5_service.service import run_forever
 from alpaca_ma5_service.strategy_framework import (
     DEFAULT_CANCEL_STRATEGY_NAME,
     DEFAULT_SELL_STRATEGY_NAME,
+    resolve_strategy_runtime,
 )
 
 
@@ -25,7 +27,7 @@ from alpaca_ma5_service.strategy_framework import (
 # 盘中主流程（完整说明见 docs/architecture/PROJECT_FLOW.md）：
 # 1. 本入口 -> service.run_forever -> service.run_once，常驻入口直接进入核心循环。
 # 2. 核心循环按 check/execute/notify 的买入、卖出、撤单九阶段逐股展开。
-# 3. 默认 Broker 在买卖执行内部完成终态等待/超时撤单，再写订单账本和外部通知。
+# 3. 默认 Broker 提交后持久化订单 ID 并立即返回；后续轮次先对账，超时再撤单。
 #
 # ==============================
 # 常用运行配置：你主要改这里
@@ -35,13 +37,13 @@ from alpaca_ma5_service.strategy_framework import (
 # 2. 百分比都用小数写：0.15 表示 15%，-0.10 表示下跌 10%。
 # 3. 金额单位是美元；时间使用美股东部时间 ET。
 
-# 选择基础策略组合。当前内置组合只有 MA5 低吸。
-STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
+# 选择基础策略组合。当前盘中入口启用 MA5 信号 + 三档买卖。
+STRATEGY_NAME = MA5_DIP_LADDER_STRATEGY_NAME
 
 # 分别选择 WatchCode、买入、卖出和自动撤单策略。
 # 默认保持同一组合；也可以只替换其中一项，启动时会先验证名称和组合是否有效。
-WATCHLIST_STRATEGY_NAME = STRATEGY_NAME
-BUY_STRATEGY_NAME = STRATEGY_NAME
+WATCHLIST_STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
+BUY_STRATEGY_NAME = MA5_DIP_STRATEGY_NAME
 SELL_STRATEGY_NAME = DEFAULT_SELL_STRATEGY_NAME
 CANCEL_STRATEGY_NAME = DEFAULT_CANCEL_STRATEGY_NAME
 
@@ -97,19 +99,30 @@ STOP_LOSS_PCT = -0.10
 
 # 止损卖出限价。
 # 用法：-0.08 表示止损触发后，用成本价下方 8% 的限价卖出；越接近 0 越保守但越可能不成交。
-STOP_LOSS_LIMIT_PCT = -0.08
+STOP_LOSS_LIMIT_PCT = -0.10
 
-# 半仓止盈触发线。
-# 用法：0.10 表示持仓盈利达到 10% 时触发卖出一部分。
+# 相对全部实际成交后的加权平均成本盈利 10% 时，启动首次 50% 半仓止盈。
 TAKE_PROFIT_HALF_PCT = 0.10
 
-# 半仓止盈卖出比例。
-# 用法：0.50 表示止盈时卖出一半；1.0 表示全部卖出；0 表示不卖。
+# 只有首次半仓止盈额度参与三档卖出，剩余 50% 继续持有到尾盘。
 TAKE_PROFIT_SELL_FRACTION = 0.50
 
 # 半仓止盈后，剩余仓的保护卖出线。
 # 用法：None 表示关闭；如果设成 0.05，表示半仓止盈后，剩余仓回落到盈利 5% 时卖出剩余全部。
 TAKE_PROFIT_REMAINDER_STOP_PCT = None
+
+# 三档买入：首次触发价、低 1%、低 2%。每轮只提交一个触价档位。
+BUY_LADDER_OFFSETS = (0.0, -0.01, -0.02)
+
+# 三档卖出：仅拆分首次 50% 止盈额度；锚点、锚点高 1%、锚点高 2%。
+SELL_LADDER_OFFSETS = (0.0, 0.01, 0.02)
+
+# 相对全部实际成交后的券商加权平均成本下跌 10% 时，MARKET 全部止损。
+ABSOLUTE_STOP_LOSS_PCT = -0.10
+
+# 每次买入成交后，按券商最新加权平均成本在 Alpaca 端挂 GTC STOP MARKET。
+# -0.08 表示触及加权成本下方 8% 后，由 Alpaca 把止损单转成 MARKET。
+BROKER_PROTECTIVE_STOP_PCT = -0.08
 
 # 尾盘强制清仓开始时间，东部时间 ET。
 # 用法：time(15, 55) 表示 15:55 开始进入尾盘清仓窗口。
@@ -136,7 +149,7 @@ EXTENDED_HOURS_ORDERS_ENABLED = True
 EXTENDED_HOURS_LIMIT_BUFFER_PCT = 0.003
 
 # 下单后等待成交的最长秒数。
-# 用法：600 表示最多等 10 分钟；到时仍未完全成交会请求撤单。
+# 用法：600 表示订单存续满 10 分钟后由后续监控轮请求撤单；不会阻塞逐股循环。
 ORDER_CANCEL_AFTER_SECONDS = 600
 
 # 查询订单状态的间隔秒数。
@@ -207,6 +220,10 @@ def build_monitor_settings():
         order_status_poll_seconds=ORDER_STATUS_POLL_SECONDS,
         realtime_price_source=REALTIME_PRICE_SOURCE,
         trade_notify_mode=TRADE_NOTIFY_MODE,
+        buy_ladder_offsets=BUY_LADDER_OFFSETS,
+        sell_ladder_offsets=SELL_LADDER_OFFSETS,
+        absolute_stop_loss_pct=ABSOLUTE_STOP_LOSS_PCT,
+        broker_protective_stop_pct=BROKER_PROTECTIVE_STOP_PCT,
     )
 
 
@@ -217,6 +234,18 @@ def monitor_ma5_forever() -> None:
     满足条件时就可能买入、卖出，并按撤单策略处理超时挂单。
     """
     settings = build_monitor_settings()
+    # 延迟导入以避免 auto -> intraday 的模块初始化环；所有公开启动入口都必须
+    # 对当前 WatchCode 做同一套日期 + 规则校验，不能直接拿旧股票池实盘运行。
+    from .auto import expected_signal_date, intraday_watchcode_ready_for_session
+
+    now_et = now_market_time(settings)
+    rules = resolve_strategy_runtime(settings).watchlist.screen_rules()
+    if not intraday_watchcode_ready_for_session(settings.watch_codes_file, now_et, rules=rules):
+        expected = expected_signal_date(now_et)
+        raise RuntimeError(
+            "盘中监控拒绝启动：WatchCode 缺失、股票池为空、信号日期过期或选股规则不匹配；"
+            f"expected_signal_date={expected} path={settings.watch_codes_file}"
+        )
     with monitor_runtime(settings.output_dir, "monitor_ma5", "intraday"):
         run_forever(settings)
 
