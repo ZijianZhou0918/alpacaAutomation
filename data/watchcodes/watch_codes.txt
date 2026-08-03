@@ -3,6 +3,7 @@
 # Rules: gain>15%, signal_gain>ma5_gain+0%, close/MA5>=1.15, close/MA5<=999, open/MA5>0, close_position>=0%, MA order not required
 # signal_date=2026-07-31
 US.FCUV
+US.WETO
 US.REPL
 US.TCX
 US.TGHL
