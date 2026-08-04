@@ -169,6 +169,103 @@ class PremarketPositionMonitorTests(unittest.TestCase):
         self.assertEqual(notify.call_count, 1)
         self.assertIn("快速下跌", notify.call_args.args[1][0])
 
+    def test_continuous_rise_realerts_every_new_three_percent_leg_without_cooldown(self):
+        tracker = PremarketPositionTracker()
+        position = Position("US.TEST", 10, 9.5, "alpaca")
+        first_time = NOW + timedelta(seconds=20)
+        second_time = NOW + timedelta(seconds=40)
+
+        self.assertIsNone(tracker.observe(position, price=10.0, as_of=NOW, price_source="alpaca_latest_quote:iex"))
+        first = tracker.observe(position, price=10.31, as_of=first_time, price_source="alpaca_latest_quote:iex")
+        self.assertIsNotNone(first)
+        self.assertEqual((first.direction, first.leg_number, first.continues_previous_direction), ("UP", 1, False))
+        tracker.acknowledge(first)
+
+        second = tracker.observe(position, price=10.63, as_of=second_time, price_source="alpaca_latest_quote:iex")
+        self.assertIsNotNone(second)
+        self.assertEqual((second.direction, second.leg_number, second.continues_previous_direction), ("UP", 2, True))
+
+    def test_notification_path_sends_continuous_up_legs_and_immediate_reversal(self):
+        with TemporaryDirectory() as tmp:
+            settings = make_settings(Path(tmp))
+            position = Position("US.TEST", 10, 9.5, "alpaca")
+            source = FakePositionSource({"US.TEST": position})
+            tracker = PremarketPositionTracker()
+            times = [NOW + timedelta(seconds=value) for value in (0, 10, 20, 30)]
+            market = SequentialMarketData([
+                snapshot(10.0, times[0]),
+                snapshot(10.31, times[1]),
+                snapshot(10.63, times[2]),
+                snapshot(10.30, times[3]),
+            ])
+            with patch(
+                "alpaca_ma5_service.premarket_positions.safe_send_openclaw_messages",
+                return_value=True,
+            ) as notify:
+                summaries = [
+                    run_premarket_positions_once(
+                        settings,
+                        position_source=source,
+                        market_data=market,
+                        tracker=tracker,
+                        now=as_of,
+                    )
+                    for as_of in times
+                ]
+
+        self.assertEqual([summary["sent"] for summary in summaries], [0, 1, 1, 1])
+        self.assertEqual(notify.call_count, 3)
+        messages = [call.args[1][0] for call in notify.call_args_list]
+        self.assertIn("新方向第 1 段快速上涨", messages[0])
+        self.assertIn("连续第 2 段快速上涨", messages[1])
+        self.assertIn("新方向第 1 段快速下跌", messages[2])
+        self.assertTrue(all("没有冷冻期" in message for message in messages))
+
+    def test_direction_reversal_alerts_immediately_as_new_leg(self):
+        tracker = PremarketPositionTracker()
+        position = Position("US.TEST", 10, 9.5, "alpaca")
+        tracker.observe(position, price=10.0, as_of=NOW, price_source="alpaca_latest_quote:iex")
+        upward = tracker.observe(
+            position,
+            price=10.31,
+            as_of=NOW + timedelta(seconds=20),
+            price_source="alpaca_latest_quote:iex",
+        )
+        tracker.acknowledge(upward)
+
+        downward = tracker.observe(
+            position,
+            price=9.99,
+            as_of=NOW + timedelta(seconds=30),
+            price_source="alpaca_latest_quote:iex",
+        )
+
+        self.assertIsNotNone(downward)
+        self.assertEqual((downward.direction, downward.leg_number, downward.continues_previous_direction), ("DOWN", 1, False))
+
+    def test_price_source_switch_rebuilds_baseline_instead_of_false_alert(self):
+        tracker = PremarketPositionTracker()
+        position = Position("US.TEST", 10, 9.5, "alpaca")
+        tracker.observe(position, price=10.0, as_of=NOW, price_source="moomoo_snapshot:pre_price")
+
+        switched = tracker.observe(
+            position,
+            price=10.5,
+            as_of=NOW + timedelta(seconds=10),
+            price_source="alpaca_latest_quote:iex",
+        )
+        movement = tracker.observe(
+            position,
+            price=10.82,
+            as_of=NOW + timedelta(seconds=20),
+            price_source="alpaca_latest_trade:iex",
+        )
+
+        self.assertIsNone(switched)
+        self.assertIsNotNone(movement)
+        self.assertEqual(movement.anchor_price, 10.5)
+        self.assertEqual(movement.direction, "UP")
+
     def test_move_older_than_sixty_seconds_is_not_compared(self):
         tracker = PremarketPositionTracker()
         position = Position("US.TEST", 10, 10, "alpaca")

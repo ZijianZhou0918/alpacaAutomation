@@ -29,6 +29,7 @@ PREMARKET_WAIT_POLL_SECONDS = 300
 class PositionPriceSample:
     price: float
     as_of: datetime
+    price_source: str
 
 
 @dataclass(frozen=True)
@@ -43,6 +44,8 @@ class PositionMovement:
     price_source: str
     quantity: float
     avg_price: float
+    leg_number: int
+    continues_previous_direction: bool
 
 
 class AlpacaPositionSource:
@@ -79,19 +82,26 @@ class PremarketPositionTracker:
         self.threshold_pct = float(threshold_pct)
         self.window = timedelta(seconds=int(window_seconds))
         self.samples: dict[str, deque[PositionPriceSample]] = {}
+        self.last_alert_direction: dict[str, str] = {}
+        self.direction_leg_counts: dict[str, int] = {}
 
     def retain_symbols(self, symbols: set[str]) -> None:
         normalized = {normalize_symbol(symbol) for symbol in symbols if normalize_symbol(symbol)}
         for symbol in list(self.samples):
             if symbol not in normalized:
                 self.samples.pop(symbol, None)
+                self.last_alert_direction.pop(symbol, None)
+                self.direction_leg_counts.pop(symbol, None)
 
     def acknowledge(self, movement: PositionMovement) -> None:
         """提醒已交付或已明确仅打印后，从当前价格重新累计下一段 3% 波动。"""
 
-        samples = self.samples.setdefault(movement.symbol, deque())
+        symbol = normalize_symbol(movement.symbol)
+        samples = self.samples.setdefault(symbol, deque())
         samples.clear()
-        samples.append(PositionPriceSample(movement.current_price, movement.current_as_of))
+        samples.append(PositionPriceSample(movement.current_price, movement.current_as_of, movement.price_source))
+        self.last_alert_direction[symbol] = movement.direction
+        self.direction_leg_counts[symbol] = movement.leg_number
 
     def observe(
         self,
@@ -108,11 +118,18 @@ class PremarketPositionTracker:
         if samples and as_of <= samples[-1].as_of:
             return None
 
+        # 不同实时源可能存在盘口、时点或复权差异。切源时重新建立基线，避免把
+        # Moomoo/Alpaca 之间的价差误报为持仓瞬时涨跌。
+        if samples and _price_source_family(price_source) != _price_source_family(samples[-1].price_source):
+            samples.clear()
+            samples.append(PositionPriceSample(float(price), as_of, price_source))
+            return None
+
         cutoff = as_of - self.window
         while samples and samples[0].as_of < cutoff:
             samples.popleft()
         previous = list(samples)
-        current = PositionPriceSample(float(price), as_of)
+        current = PositionPriceSample(float(price), as_of, price_source)
         samples.append(current)
         if not previous:
             return None
@@ -131,6 +148,9 @@ class PremarketPositionTracker:
 
         # 剧烈 V 形/倒 V 形可能同时满足两个方向；选择离当前更近的极值，表达最近一段走势。
         _, direction, change_pct, anchor = max(candidates, key=lambda item: item[0])
+        previous_direction = self.last_alert_direction.get(symbol, "")
+        continues_previous_direction = previous_direction == direction
+        leg_number = self.direction_leg_counts.get(symbol, 0) + 1 if continues_previous_direction else 1
         return PositionMovement(
             symbol=symbol,
             direction=direction,
@@ -142,6 +162,8 @@ class PremarketPositionTracker:
             price_source=price_source,
             quantity=float(position.quantity),
             avg_price=float(position.avg_price),
+            leg_number=leg_number,
+            continues_previous_direction=continues_previous_direction,
         )
 
 
@@ -233,7 +255,8 @@ def run_premarket_positions_once(
                         "快速上涨" if movement.direction == "UP" else "快速下跌",
                         f"{movement.current_price:.4f}",
                         f"{unrealized_pct:+.2%}",
-                        f"一分钟波动 {movement.change_pct:+.2%}"
+                        f"一分钟波动 {movement.change_pct:+.2%}；"
+                        + (f"连续第 {movement.leg_number} 段" if movement.continues_previous_direction else "新方向第 1 段")
                         + ("；已提醒" if delivered else "；发送失败，下一条新行情重试" if notify else "；仅打印"),
                     )
                 )
@@ -279,7 +302,8 @@ def run_premarket_positions_forever(
     loop_count = 0
     try:
         print(
-            "盘前持仓波动监控启动：只读取 Alpaca 当前持仓；滚动 60 秒涨跌达到 3% 才提醒；不筛选股票、不下单。",
+            "盘前持仓波动监控启动：只读取 Alpaca 当前持仓；滚动 60 秒每累计一段 3% 就提醒，"
+            "同方向连续提醒、反转独立提醒、没有冷冻期；不筛选股票、不下单。",
             flush=True,
         )
         while True:
@@ -322,11 +346,17 @@ def render_position_movement_message(movement: PositionMovement) -> str:
         else 0.0
     )
     elapsed = max(0.0, (movement.current_as_of - movement.anchor_as_of).total_seconds())
+    leg_text = (
+        f"连续第 {movement.leg_number} 段{direction_text}"
+        if movement.continues_previous_direction
+        else f"新方向第 {movement.leg_number} 段{direction_text}"
+    )
     return "\n".join(
         [
             f"【盘前持仓｜{direction_text}】{movement.symbol}",
-            f"结论：{elapsed:.0f} 秒内变动 {movement.change_pct:+.2%}，达到 3% 提醒线。",
+            f"结论：{leg_text}；{elapsed:.0f} 秒内变动 {movement.change_pct:+.2%}，达到 3% 提醒线。",
             "动作：仅提醒持仓波动，不提交任何 Alpaca 订单。",
+            "提醒机制：没有冷冻期；本段提醒成功后以当前价为新起点，每再累计 3% 会继续提醒，方向反转也独立提醒。",
             "",
             f"- 当前价：${movement.current_price:.4f}",
             f"- 起点价：${movement.anchor_price:.4f}",
@@ -363,6 +393,15 @@ def _has_premarket_realtime_price(source: str, as_of: datetime | None) -> bool:
         return False
     normalized = str(source or "").lower()
     return normalized.startswith(("moomoo_snapshot:", "alpaca_latest_quote:", "alpaca_latest_trade:"))
+
+
+def _price_source_family(source: str) -> str:
+    normalized = str(source or "").lower()
+    if normalized.startswith("moomoo_snapshot:"):
+        return "moomoo"
+    if normalized.startswith(("alpaca_latest_quote:", "alpaca_latest_trade:")):
+        return "alpaca"
+    return normalized.split(":", 1)[0]
 
 
 def _positive_float(value) -> float:
